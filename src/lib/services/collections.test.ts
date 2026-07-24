@@ -96,7 +96,6 @@ const baseCollection = {
   description: null,
   published: false,
   publishedAt: null,
-  submissions: 'closed' as const,
   visibility: 'private',
   orgDefaultRole: 'viewer',
   createdAt: new Date(),
@@ -124,19 +123,18 @@ describe('createCollection', () => {
     expect(call.name).toBe('Bookmarks')
   })
 
-  it('passes through schema, unique_key, published, and submissions', async () => {
+  it('passes through schema, unique_key, and published', async () => {
     vi.mocked(createCollectionWithOwner).mockResolvedValue(baseCollection)
     await createCollection('user-test', 'org-test', {
       name: 'Bookmarks',
       schema: { fields: [{ name: 'url', type: 'text' }] },
       unique_key: ['url'],
       published: true,
-      submissions: 'open',
     })
     const call = vi.mocked(createCollectionWithOwner).mock.calls[0][0]
+    expect(call.schema).toEqual({ fields: [{ name: 'url', type: 'text' }] })
     expect(call.uniqueKey).toEqual(['url'])
     expect(call.published).toBe(true)
-    expect(call.submissions).toBe('open')
   })
 
   it('does NOT call seedAutoViews when no schema is supplied', async () => {

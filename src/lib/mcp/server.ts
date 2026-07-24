@@ -183,14 +183,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_update_collection",
     {
-      description: "Update a collection's name, description, unique_key (for upsert dedup), published flag, or submissions setting. Example: use when the user wants to publish a collection or set a dedup key.",
+      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Example: use when the user wants to publish a collection or set a dedup key.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
         name: z.string().optional().describe("New collection name"),
         description: z.string().optional().describe("Collection description"),
         unique_key: z.array(z.string()).optional().describe("Fields that form the unique key for upsert (e.g. [\"url\"] or [\"email\", \"date\"])"),
         published: z.boolean().optional().describe("Whether the collection is publicly viewable"),
-        submissions: z.enum(["open", "closed"]).optional().describe("Whether public submissions are accepted"),
       },
       // destructiveHint: true because `published: true` exposes the collection to the public web.
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
