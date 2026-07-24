@@ -169,7 +169,6 @@ export async function listCollections(userId: string, organizationId?: string) {
       schema: collections.schema,
       uniqueKey: collections.uniqueKey,
       published: collections.published,
-      submissions: collections.submissions,
       createdAt: collections.createdAt,
       updatedAt: collections.updatedAt,
       role: collectionMembers.role,
@@ -218,9 +217,8 @@ export async function createCollection(userId: string, organizationId: string, p
   schema?: unknown;
   unique_key?: unknown;
   published?: boolean;
-  submissions?: string;
 }) {
-  const { name, description, schema: schemaVal, unique_key, published, submissions } = params;
+  const { name, description, schema: schemaVal, unique_key, published } = params;
 
   const slug = uniqueSlug(name);
 
@@ -233,7 +231,6 @@ export async function createCollection(userId: string, organizationId: string, p
     schema: schemaVal ?? { fields: [] },
     uniqueKey: unique_key ?? [],
     published: published ?? false,
-    submissions: submissions ?? "closed",
   });
 
   if (schemaVal && (schemaVal as CollectionSchema)?.fields?.length) {
@@ -275,7 +272,6 @@ export async function updateCollection(slug: string, userId: string, updates: Re
   if (updates.description !== undefined) dbUpdates.description = updates.description;
   if (updates.schema !== undefined) dbUpdates.schema = updates.schema;
   if (updates.unique_key !== undefined) dbUpdates.uniqueKey = updates.unique_key;
-  if (updates.submissions !== undefined) dbUpdates.submissions = updates.submissions;
   if (updates.published !== undefined) {
     dbUpdates.published = updates.published;
     if (updates.published && !collection.publishedAt) {

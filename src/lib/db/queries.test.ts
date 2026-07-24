@@ -45,7 +45,6 @@ const collectionRow = {
   uniqueKey: null,
   published: false,
   publishedAt: null,
-  submissions: 'closed' as const,
   visibility: 'private',
   orgDefaultRole: 'viewer',
   createdAt: new Date(),

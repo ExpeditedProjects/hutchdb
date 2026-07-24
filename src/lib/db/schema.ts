@@ -140,7 +140,6 @@ export const collections = pgTable("collections", {
   uniqueKey: jsonb("unique_key").default([]),
   published: boolean("published").default(false),
   publishedAt: timestamp("published_at", { withTimezone: true }),
-  submissions: text("submissions").default("closed"),
   visibility: text("visibility").notNull().default("private"),
   orgDefaultRole: text("org_default_role").notNull().default("viewer"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),

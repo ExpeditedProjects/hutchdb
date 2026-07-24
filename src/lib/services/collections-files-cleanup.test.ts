@@ -82,7 +82,6 @@ const baseCollection = {
   description: null,
   published: false,
   publishedAt: null,
-  submissions: 'closed' as const,
   visibility: 'private',
   orgDefaultRole: 'viewer',
   createdAt: new Date(),
