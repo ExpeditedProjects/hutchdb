@@ -9,6 +9,7 @@ import { seedAutoViews } from "./views";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
+import { isPlainObject } from "@/lib/validation";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -199,17 +200,22 @@ export async function createRecords(userId: string, organizationId: string, para
   };
 }
 
-function buildSaveSummary(
-  collectionName: string,
-  results: { action: string }[],
-  collectionWasCreated: boolean,
-): string {
+function tallyActions(results: { action: string }[]): { created: number; updated: number; skipped: number } {
   const counts = { created: 0, updated: 0, skipped: 0 };
   for (const r of results) {
     if (r.action === "created") counts.created++;
     else if (r.action === "updated") counts.updated++;
     else if (r.action === "skipped") counts.skipped++;
   }
+  return counts;
+}
+
+function buildSaveSummary(
+  collectionName: string,
+  results: { action: string }[],
+  collectionWasCreated: boolean,
+): string {
+  const counts = tallyActions(results);
   const total = counts.created + counts.updated + counts.skipped;
   const noun = total === 1 ? "record" : "records";
 
@@ -265,19 +271,20 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId'>) {
+export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
   if (!access) return null;
 
   return queryRecordsEngine({ ...params, collectionId: access.collection.id });
 }
 
-export const EXPORT_DEFAULT_LIMIT = 1000;
-export const EXPORT_MAX_LIMIT = 10000;
+const EXPORT_DEFAULT_LIMIT = 1000;
+const EXPORT_MAX_LIMIT = 10000;
+const IMPORT_MAX_CONTENT_BYTES = 10 * 1024 * 1024; // 10MB — mirrored by the MCP zod schema
+const EXPORT_MAX_CONTENT_BYTES = 50 * 1024 * 1024; // 50MB
 
-function toIso(value: Date | string | null | undefined): string {
-  if (!value) return "";
-  return value instanceof Date ? value.toISOString() : String(value);
+function toIso(value: Date | null): string {
+  return value ? value.toISOString() : "";
 }
 
 /**
@@ -309,6 +316,9 @@ export async function exportRecords(slug: string, userId: string, params: {
     limitCap: EXPORT_MAX_LIMIT,
   });
 
+  // Type-narrowing assertion: exportRecords never passes aggregation params,
+  // so the engine always returns the records shape. This narrows the union
+  // for TypeScript; it is not a supported input path.
   if (!("records" in result)) {
     return { error: "Export does not support aggregation queries", status: 400 };
   }
@@ -317,12 +327,14 @@ export async function exportRecords(slug: string, userId: string, params: {
     id: r.id,
     created_at: toIso(r.createdAt),
     updated_at: toIso(r.updatedAt),
-    data: (typeof r.data === "object" && r.data !== null && !Array.isArray(r.data)
-      ? r.data
-      : {}) as Record<string, unknown>,
+    data: isPlainObject(r.data) ? r.data : {},
   }));
 
-  const content = format === "csv" ? recordsToCsv(rows) : JSON.stringify(rows, null, 2);
+  const content = format === "csv" ? recordsToCsv(rows) : JSON.stringify(rows);
+
+  if (content.length > EXPORT_MAX_CONTENT_BYTES) {
+    return { error: "Export exceeds 50MB — narrow with filter, fields, or a lower limit", status: 400 };
+  }
 
   return {
     collection: { name: access.collection.name, slug: access.collection.slug },
@@ -347,6 +359,10 @@ export async function importRecords(userId: string, organizationId: string, para
 }) {
   const { collection, format = "csv", content, on_conflict } = params;
 
+  if (content.length > IMPORT_MAX_CONTENT_BYTES) {
+    return { error: "Import content exceeds 10MB limit", status: 400 };
+  }
+
   let recordsToStore: Record<string, unknown>[];
 
   if (format === "json") {
@@ -357,15 +373,14 @@ export async function importRecords(userId: string, organizationId: string, para
       return { error: "Invalid JSON content", status: 400 };
     }
     const items = Array.isArray(parsed) ? parsed : [parsed];
-    if (!items.every((item) => typeof item === "object" && item !== null && !Array.isArray(item))) {
+    if (!items.every(isPlainObject)) {
       return { error: "JSON content must be an object or an array of objects", status: 400 };
     }
     // Unwrap hutch_export_records output ({id, created_at, updated_at, data})
     // so exports round-trip without nesting the data under a `data` key.
-    recordsToStore = (items as Record<string, unknown>[]).map((item) =>
-      "id" in item && "created_at" in item && "updated_at" in item &&
-      typeof item.data === "object" && item.data !== null && !Array.isArray(item.data)
-        ? (item.data as Record<string, unknown>)
+    recordsToStore = items.map((item) =>
+      "id" in item && "created_at" in item && "updated_at" in item && isPlainObject(item.data)
+        ? item.data
         : item
     );
   } else {
@@ -378,6 +393,10 @@ export async function importRecords(userId: string, organizationId: string, para
     return { error: "No records found in content", status: 400 };
   }
 
+  if (recordsToStore.length > EXPORT_MAX_LIMIT) {
+    return { error: `Import is limited to ${EXPORT_MAX_LIMIT} records per call`, status: 400 };
+  }
+
   const result = await createRecords(userId, organizationId, {
     collection,
     records: recordsToStore,
@@ -385,7 +404,6 @@ export async function importRecords(userId: string, organizationId: string, para
   });
   if ("error" in result) return result;
 
-  // We always pass `records`, so createRecords took the bulk branch.
   const bulk = result as {
     collection: { name: string; slug: string };
     results?: { action: string }[];
@@ -393,12 +411,7 @@ export async function importRecords(userId: string, organizationId: string, para
     summary?: string;
   };
 
-  const counts = { created: 0, updated: 0, skipped: 0 };
-  for (const r of bulk.results ?? []) {
-    if (r.action === "created") counts.created++;
-    else if (r.action === "updated") counts.updated++;
-    else if (r.action === "skipped") counts.skipped++;
-  }
+  const counts = tallyActions(bulk.results ?? []);
 
   return {
     collection: bulk.collection,

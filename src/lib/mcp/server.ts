@@ -5,6 +5,7 @@ import * as recordService from "@/lib/services/records";
 import * as fileService from "@/lib/services/files";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
+import { FILTER_OPERATORS } from "@/lib/db/queries";
 
 const SERVER_INSTRUCTIONS = `Hutch Core stores structured data for a single AI agent user. Records are arbitrary JSON, grouped into collections.
 
@@ -33,10 +34,10 @@ type McpToolResponse = { content: { type: "text"; text: string }[]; isError?: bo
 // filter param flows to the same query engine in both.
 const FILTER_DESCRIPTION =
   "Filter on record fields. Plain values are JSONB containment (exact) matches, e.g. {\"status\": \"active\"}. " +
-  "A field value that is an object whose keys all start with $ applies operators instead: " +
-  "$gt/$gte/$lt/$lte (number operands compare numerically, string operands — including ISO dates — compare lexicographically as text), " +
-  "$ne (not equal, also matches records missing the field), $in/$nin (array of values), $exists (boolean), " +
-  "$contains (case-insensitive substring match on string fields). " +
+  `A field value that is an object whose keys all start with $ applies operators instead: ${FILTER_OPERATORS.join(", ")}. ` +
+  "$gt/$gte/$lt/$lte compare (number operands numerically, string operands — including ISO dates — lexicographically as text); " +
+  "$ne is not-equal (also matches records missing the field); $in/$nin take an array of values; $exists takes a boolean; " +
+  "$contains is a case-insensitive substring match on string fields. " +
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
 
 function textResponse(text: string): McpToolResponse {
@@ -49,6 +50,18 @@ function errorResponse(text: string): McpToolResponse {
 
 function jsonResponse(value: unknown): McpToolResponse {
   return textResponse(JSON.stringify(value, null, 2));
+}
+
+/**
+ * Shared by hutch_store_records and hutch_import_records: attach the
+ * collection URL and lead with the human-readable summary when present.
+ */
+function summarizedWriteResponse(result: object, collectionUrl: (slug: string) => string): McpToolResponse {
+  const slug = (result as { collection?: { slug?: string } }).collection?.slug;
+  const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
+  const json = JSON.stringify(enriched, null, 2);
+  const summary = (result as { summary?: string }).summary;
+  return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
 
 function collectionNotFound(slug: string): McpToolResponse {
@@ -131,11 +144,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       if ('error' in result) {
         return errorResponse(result.error as string);
       }
-      const slug = (result as { collection?: { slug?: string } }).collection?.slug;
-      const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
-      const json = JSON.stringify(enriched, null, 2);
-      const summary = (result as { summary?: string }).summary;
-      return { content: [{ type: "text", text: summary ? `${summary}\n\n${json}` : json }] };
+      return summarizedWriteResponse(result, collectionUrl);
     }
   );
 
@@ -197,7 +206,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_collection_stats",
     {
-      description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
+      description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Fill rates are exact counts over all records (hutch_describe_collection's frequency is sampled). Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
       inputSchema: { slug: z.string().describe("Collection slug") },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -211,7 +220,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_export_records",
     {
-      description: "Export a collection's records as JSON or CSV text. Accepts the same filter/search/sort/fields params as hutch_query_records, plus limit (default 1000, max 10000). Returns count, total, a truncated flag, and the serialized content. CSV columns are id, created_at, updated_at, then the union of top-level record fields; nested objects/arrays are JSON-stringified into their cell. Example: use when the user says 'give me my contacts as a CSV' or when handing data to a tool that wants a flat file.",
+      description: "Export a collection's records as JSON or CSV text. Accepts the same filter/search/sort/fields params as hutch_query_records, plus limit (default 1000, max 10000). Returns count, total, a truncated flag, and the serialized content. CSV columns are id, created_at, updated_at, then the union of top-level record fields; nested objects/arrays are JSON-stringified into their cell. CSV cells are written verbatim (no spreadsheet formula-escaping) so exports round-trip. Example: use when the user says 'give me my contacts as a CSV' or when handing data to a tool that wants a flat file.",
       inputSchema: {
         collection: z.string().describe("Collection slug"),
         format: z.enum(["json", "csv"]).optional().describe("Output format. Default: json"),
@@ -245,7 +254,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       inputSchema: {
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
         format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
-        content: z.string().describe("Raw CSV text (header row required) or a JSON array of objects"),
+        content: z.string().max(10 * 1024 * 1024).describe("Raw CSV text (header row required) or a JSON array of objects. Max 10MB."),
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do when a record matches an existing unique key. Default: replace"),
       },
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -258,11 +267,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         on_conflict: params.on_conflict,
       });
       if ('error' in result) return errorResponse(result.error as string);
-      const slug = (result as { collection?: { slug?: string } }).collection?.slug;
-      const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
-      const json = JSON.stringify(enriched, null, 2);
-      const summary = (result as { summary?: string }).summary;
-      return { content: [{ type: "text", text: summary ? `${summary}\n\n${json}` : json }] };
+      return summarizedWriteResponse(result, collectionUrl);
     }
   );
 

@@ -7,7 +7,7 @@ import { describeCollection as describeCollectionFields } from "@/lib/describe";
 import { uniqueSlug } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectableField, MAX_OPTION_VALUE_LENGTH, MAX_OPTIONS_PER_FIELD } from "@/lib/schema-inference";
-import { FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
+import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
 import { cleanupCollectionBlobs } from "./files";
@@ -526,7 +526,7 @@ export async function getCollectionStats(slug: string, userId: string) {
 
   const byStatus: Record<string, number> = {};
   for (const row of statusResult.rows as { status: string | null; count: number }[]) {
-    byStatus[row.status ?? "active"] = row.count;
+    byStatus[row.status ?? DEFAULT_RECORD_STATUS] = row.count;
   }
 
   const fields = (fieldResult.rows as { key: string; count: number }[]).map((row) => ({

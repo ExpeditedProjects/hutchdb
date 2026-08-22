@@ -226,6 +226,17 @@ describe('buildFilterConditions', () => {
     it('rejects non-array operands', () => {
       expect(() => buildFilterConditions({ f: { $in: 'active' } })).toThrow(/array/)
     })
+
+    it('rejects arrays with more than 1000 elements', () => {
+      const big = Array.from({ length: 1001 }, (_, i) => i)
+      expect(() => buildFilterConditions({ f: { $in: big } })).toThrow(/limited to 1000 elements/)
+      expect(() => buildFilterConditions({ f: { $nin: big } })).toThrow(/limited to 1000 elements/)
+    })
+
+    it('accepts arrays at exactly 1000 elements', () => {
+      const atLimit = Array.from({ length: 1000 }, (_, i) => i)
+      expect(() => buildFilterConditions({ f: { $in: atLimit } })).not.toThrow()
+    })
   })
 
   describe('$exists', () => {
@@ -340,6 +351,26 @@ describe('queryRecords aggregation', () => {
       .rejects.toThrow(/Invalid field name/)
   })
 
+  it('rejects a groupBy field with any invalid character, naming the field', async () => {
+    await expect(queryRecords({ collectionId: 1, groupBy: 'name; DROP TABLE records--' }))
+      .rejects.toThrow(/Invalid field name 'name; DROP TABLE records--'/)
+  })
+
+  it('rejects an unknown aggregation op with the supported list', async () => {
+    await expect(queryRecords({ collectionId: 1, aggregate: { m: { median: 'price' } } }))
+      .rejects.toThrow(/Unsupported aggregation 'median'\. Supported: count, min, max, distinct, sum, avg/)
+  })
+
+  it('rejects a bare string aggregation spec other than count', async () => {
+    await expect(queryRecords({ collectionId: 1, aggregate: { total: 'sum' } }))
+      .rejects.toThrow(/Unsupported aggregation 'sum'/)
+  })
+
+  it('rejects an empty object aggregation spec', async () => {
+    await expect(queryRecords({ collectionId: 1, aggregate: { x: {} } }))
+      .rejects.toThrow(/Unsupported aggregation '\{\}'/)
+  })
+
   describe('sum and avg', () => {
     async function aggregationSql(aggregate: Record<string, Record<string, string>>): Promise<string> {
       dbExecute.mockResolvedValue({ rows: [] })
@@ -357,10 +388,11 @@ describe('queryRecords aggregation', () => {
       expect(sql).toContain(`avg(CASE WHEN jsonb_typeof(data->'price') = 'number' THEN (data->>'price')::numeric END) as "mean"`)
     })
 
-    it('sanitizes field and alias names in sum/avg specs', async () => {
-      const sql = await aggregationSql({ 'x"; DROP TABLE records--': { sum: "a'; --" } })
-      expect(sql).not.toContain('DROP TABLE')
-      expect(sql).not.toContain("'; --")
+    it('rejects field and alias names with invalid characters instead of stripping them', async () => {
+      await expect(queryRecords({ collectionId: 1, aggregate: { 'x"; DROP TABLE records--': { sum: 'amount' } } }))
+        .rejects.toThrow(/Invalid field name 'x"; DROP TABLE records--'/)
+      await expect(queryRecords({ collectionId: 1, aggregate: { revenue: { sum: "a'; --" } } }))
+        .rejects.toThrow(/Invalid field name 'a'; --'/)
     })
 
     it('existing min/max/distinct specs are unchanged', async () => {

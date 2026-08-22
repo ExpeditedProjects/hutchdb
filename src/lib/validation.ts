@@ -1,5 +1,10 @@
 export type ValidationError = { error: string; status: 400 };
 
+/** True for plain objects only — rejects null, arrays, and primitives. */
+export function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * Validate that `value`, after trim, is non-empty and ≤ `max` characters.
  *

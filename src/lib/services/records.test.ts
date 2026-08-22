@@ -620,11 +620,14 @@ describe('exportRecords', () => {
       truncated: false,
       collection: { name: 'Users', slug: 'users' },
     }))
-    const parsed = JSON.parse((result as { content: string }).content)
+    const content = (result as { content: string }).content
+    const parsed = JSON.parse(content)
     expect(parsed).toEqual([
       { id: 1, created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-02T00:00:00.000Z', data: { title: 'First', tags: ['a', 'b'] } },
       { id: 2, created_at: '2026-01-03T00:00:00.000Z', updated_at: '2026-01-04T00:00:00.000Z', data: { title: 'Second' } },
     ])
+    // Machine round-trip data: serialized compact, not pretty-printed.
+    expect(content).toBe(JSON.stringify(parsed))
   })
 
   it('serializes CSV with system columns first and nested values JSON-stringified', async () => {
@@ -765,6 +768,26 @@ describe('importRecords', () => {
     expect(insertValues).toHaveBeenCalledWith([
       expect.objectContaining({ data: { title: 'Hello' } }),
     ])
+  })
+
+  it('returns 400 when content exceeds the 10MB limit before parsing', async () => {
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      content: 'a'.repeat(10 * 1024 * 1024 + 1),
+    })
+    expect(result).toEqual({ error: 'Import content exceeds 10MB limit', status: 400 })
+    expect(insertValues).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when the parsed content exceeds 10000 records', async () => {
+    const content = JSON.stringify(Array.from({ length: 10001 }, (_, i) => ({ n: i })))
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      format: 'json',
+      content,
+    })
+    expect(result).toEqual({ error: 'Import is limited to 10000 records per call', status: 400 })
+    expect(insertValues).not.toHaveBeenCalled()
   })
 
   it('returns 400 for invalid JSON content', async () => {

@@ -1,13 +1,15 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { registeredTools } = vi.hoisted(() => ({
+const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
   registeredTools: new Map<string, (params: unknown) => Promise<unknown>>(),
+  registeredConfigs: new Map<string, Record<string, unknown>>(),
 }))
 
 vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => {
   class McpServer {
-    registerTool(name: string, _config: unknown, handler: (params: unknown) => Promise<unknown>) {
+    registerTool(name: string, config: Record<string, unknown>, handler: (params: unknown) => Promise<unknown>) {
       registeredTools.set(name, handler)
+      registeredConfigs.set(name, config)
     }
   }
   return { McpServer }
@@ -49,6 +51,7 @@ vi.mock('@/lib/db', () => ({
 }))
 
 import { createMcpServer } from './server'
+import { FILTER_OPERATORS } from '@/lib/db/queries'
 import * as collectionService from '@/lib/services/collections'
 import * as recordService from '@/lib/services/records'
 import { createView } from '@/lib/services/views'
@@ -56,6 +59,7 @@ import { createView } from '@/lib/services/views'
 beforeEach(() => {
   vi.clearAllMocks()
   registeredTools.clear()
+  registeredConfigs.clear()
 })
 
 describe('createMcpServer tool registration', () => {
@@ -89,6 +93,27 @@ describe('createMcpServer tool registration', () => {
     ]
     for (const name of removed) {
       expect(registeredTools.has(name), `${name} should NOT be registered in Core`).toBe(false)
+    }
+  })
+})
+
+describe('tool input schemas and descriptions', () => {
+  it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const schema = (registeredConfigs.get('hutch_import_records')!.inputSchema as {
+      content: { safeParse: (v: unknown) => { success: boolean } }
+    }).content
+    expect(schema.safeParse('a'.repeat(100)).success).toBe(true)
+    expect(schema.safeParse('a'.repeat(10 * 1024 * 1024 + 1)).success).toBe(false)
+  })
+
+  it('enumerates every FILTER_OPERATORS entry in the filter description', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const filter = (registeredConfigs.get('hutch_query_records')!.inputSchema as {
+      filter: { description?: string }
+    }).filter
+    for (const op of FILTER_OPERATORS) {
+      expect(filter.description, `expected filter description to mention ${op}`).toContain(op)
     }
   })
 })

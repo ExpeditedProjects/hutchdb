@@ -9,6 +9,8 @@
 /** System columns emitted first on export and ignored on import. */
 export const CSV_SYSTEM_COLUMNS = ["id", "created_at", "updated_at"] as const;
 
+const CSV_SYSTEM_COLUMN_SET = new Set<string>(CSV_SYSTEM_COLUMNS);
+
 /** A record row shaped for export. */
 export type ExportRow = {
   id: number;
@@ -166,7 +168,6 @@ export function csvToRecords(content: string): { records: Record<string, unknown
     return { error: "CSV header row is empty — column names are required" };
   }
 
-  const systemColumns = new Set<string>(CSV_SYSTEM_COLUMNS);
   const records: Record<string, unknown>[] = [];
 
   for (const cells of rows.slice(1)) {
@@ -174,7 +175,7 @@ export function csvToRecords(content: string): { records: Record<string, unknown
     const record: Record<string, unknown> = {};
     for (let c = 0; c < headers.length; c++) {
       const header = headers[c];
-      if (header === "" || systemColumns.has(header)) continue;
+      if (header === "" || CSV_SYSTEM_COLUMN_SET.has(header)) continue;
       const value = coerceCsvValue(cells[c] ?? "");
       if (value !== undefined) record[header] = value;
     }
