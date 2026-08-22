@@ -476,6 +476,79 @@ export async function addFieldOption(
   }
 }
 
+/** Cap on how many distinct top-level keys the fill-rate report returns. */
+const STATS_MAX_FIELDS = 50;
+
+/**
+ * Collection statistics: record count, counts by status, first/last
+ * created/updated timestamps, approximate storage bytes, and per-field
+ * fill rates for top-level keys (most common first, capped at 50).
+ */
+export async function getCollectionStats(slug: string, userId: string) {
+  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  if (!access) return null;
+  const collection = access.collection;
+
+  const [summaryResult, statusResult, fieldResult] = await Promise.all([
+    db.execute(sql`
+      SELECT count(*)::int AS record_count,
+             min(created_at)::text AS first_created_at,
+             max(created_at)::text AS last_created_at,
+             min(updated_at)::text AS first_updated_at,
+             max(updated_at)::text AS last_updated_at,
+             coalesce(sum(pg_column_size(data)), 0)::bigint AS approx_storage_bytes
+      FROM records
+      WHERE collection_id = ${collection.id} AND deleted_at IS NULL`),
+    db.execute(sql`
+      SELECT status, count(*)::int AS count
+      FROM records
+      WHERE collection_id = ${collection.id} AND deleted_at IS NULL
+      GROUP BY status`),
+    db.execute(sql`
+      SELECT key, count(*)::int AS count
+      FROM records, LATERAL jsonb_object_keys(data) AS key
+      WHERE collection_id = ${collection.id} AND deleted_at IS NULL
+        AND jsonb_typeof(data) = 'object'
+      GROUP BY key
+      ORDER BY count DESC, key ASC
+      LIMIT ${STATS_MAX_FIELDS}`),
+  ]);
+
+  const summary = (summaryResult.rows[0] ?? {}) as {
+    record_count?: number;
+    first_created_at?: string | null;
+    last_created_at?: string | null;
+    first_updated_at?: string | null;
+    last_updated_at?: string | null;
+    approx_storage_bytes?: string | number | null;
+  };
+  const recordCount = summary.record_count ?? 0;
+
+  const byStatus: Record<string, number> = {};
+  for (const row of statusResult.rows as { status: string | null; count: number }[]) {
+    byStatus[row.status ?? "active"] = row.count;
+  }
+
+  const fields = (fieldResult.rows as { key: string; count: number }[]).map((row) => ({
+    name: row.key,
+    count: row.count,
+    percent: recordCount > 0 ? Math.round((row.count / recordCount) * 1000) / 10 : 0,
+  }));
+
+  return {
+    name: collection.name,
+    slug: collection.slug,
+    record_count: recordCount,
+    by_status: byStatus,
+    first_created_at: summary.first_created_at ?? null,
+    last_created_at: summary.last_created_at ?? null,
+    first_updated_at: summary.first_updated_at ?? null,
+    last_updated_at: summary.last_updated_at ?? null,
+    approx_storage_bytes: Number(summary.approx_storage_bytes ?? 0),
+    fields,
+  };
+}
+
 export async function describeCollection(slug: string, userId: string) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
   if (!access) return null;

@@ -8,6 +8,7 @@ import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, Collect
 import { seedAutoViews } from "./views";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
+import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -269,6 +270,142 @@ export async function queryRecords(slug: string, userId: string, params: Omit<Qu
   if (!access) return null;
 
   return queryRecordsEngine({ ...params, collectionId: access.collection.id });
+}
+
+export const EXPORT_DEFAULT_LIMIT = 1000;
+export const EXPORT_MAX_LIMIT = 10000;
+
+function toIso(value: Date | string | null | undefined): string {
+  if (!value) return "";
+  return value instanceof Date ? value.toISOString() : String(value);
+}
+
+/**
+ * Export a collection's records as serialized JSON or CSV text. Honors the
+ * same filter/search/sort/fields params as queryRecords; limit defaults to
+ * 1000 and caps at 10000. Returns the content plus count/truncated metadata.
+ */
+export async function exportRecords(slug: string, userId: string, params: {
+  format?: "json" | "csv";
+  filter?: Record<string, unknown>;
+  search?: string;
+  sort?: string;
+  fields?: string[];
+  limit?: number;
+}) {
+  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  if (!access) return null;
+
+  const format = params.format ?? "json";
+  const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
+
+  const result = await queryRecordsEngine({
+    collectionId: access.collection.id,
+    filter: params.filter,
+    search: params.search,
+    sort: params.sort,
+    fields: params.fields,
+    limit,
+    limitCap: EXPORT_MAX_LIMIT,
+  });
+
+  if (!("records" in result)) {
+    return { error: "Export does not support aggregation queries", status: 400 };
+  }
+
+  const rows: ExportRow[] = result.records.map((r) => ({
+    id: r.id,
+    created_at: toIso(r.createdAt),
+    updated_at: toIso(r.updatedAt),
+    data: (typeof r.data === "object" && r.data !== null && !Array.isArray(r.data)
+      ? r.data
+      : {}) as Record<string, unknown>,
+  }));
+
+  const content = format === "csv" ? recordsToCsv(rows) : JSON.stringify(rows, null, 2);
+
+  return {
+    collection: { name: access.collection.name, slug: access.collection.slug },
+    format,
+    count: rows.length,
+    total: result.total,
+    truncated: result.has_more,
+    content,
+  };
+}
+
+/**
+ * Import records from CSV or JSON text. Parsing happens here; storage goes
+ * through createRecords so unique_key/on_conflict/quota logic is honored.
+ * The bulky per-record results array is summarized down to counts.
+ */
+export async function importRecords(userId: string, organizationId: string, params: {
+  collection: string;
+  format?: "csv" | "json";
+  content: string;
+  on_conflict?: string;
+}) {
+  const { collection, format = "csv", content, on_conflict } = params;
+
+  let recordsToStore: Record<string, unknown>[];
+
+  if (format === "json") {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { error: "Invalid JSON content", status: 400 };
+    }
+    const items = Array.isArray(parsed) ? parsed : [parsed];
+    if (!items.every((item) => typeof item === "object" && item !== null && !Array.isArray(item))) {
+      return { error: "JSON content must be an object or an array of objects", status: 400 };
+    }
+    // Unwrap hutch_export_records output ({id, created_at, updated_at, data})
+    // so exports round-trip without nesting the data under a `data` key.
+    recordsToStore = (items as Record<string, unknown>[]).map((item) =>
+      "id" in item && "created_at" in item && "updated_at" in item &&
+      typeof item.data === "object" && item.data !== null && !Array.isArray(item.data)
+        ? (item.data as Record<string, unknown>)
+        : item
+    );
+  } else {
+    const parsed = csvToRecords(content);
+    if ("error" in parsed) return { error: parsed.error, status: 400 };
+    recordsToStore = parsed.records;
+  }
+
+  if (recordsToStore.length === 0) {
+    return { error: "No records found in content", status: 400 };
+  }
+
+  const result = await createRecords(userId, organizationId, {
+    collection,
+    records: recordsToStore,
+    on_conflict,
+  });
+  if ("error" in result) return result;
+
+  // We always pass `records`, so createRecords took the bulk branch.
+  const bulk = result as {
+    collection: { name: string; slug: string };
+    results?: { action: string }[];
+    count?: number;
+    summary?: string;
+  };
+
+  const counts = { created: 0, updated: 0, skipped: 0 };
+  for (const r of bulk.results ?? []) {
+    if (r.action === "created") counts.created++;
+    else if (r.action === "updated") counts.updated++;
+    else if (r.action === "skipped") counts.skipped++;
+  }
+
+  return {
+    collection: bulk.collection,
+    count: bulk.count ?? 0,
+    ...counts,
+    summary: bulk.summary,
+  };
 }
 
 export async function searchGlobal(userId: string, search: string, limit: number = 10) {

@@ -22,6 +22,7 @@ vi.mock('@/lib/services/collections', () => ({
   deleteCollection: vi.fn(),
   inferCollectionSchema: vi.fn(),
   updateFieldDefinition: vi.fn(),
+  getCollectionStats: vi.fn(),
 }))
 
 vi.mock('@/lib/services/records', () => ({
@@ -33,6 +34,8 @@ vi.mock('@/lib/services/records', () => ({
   updateRecordStatus: vi.fn(),
   deleteRecord: vi.fn(),
   searchGlobal: vi.fn(),
+  exportRecords: vi.fn(),
+  importRecords: vi.fn(),
 }))
 
 vi.mock('@/lib/services/views', () => ({
@@ -63,6 +66,7 @@ describe('createMcpServer tool registration', () => {
       'hutch_store_records', 'hutch_query_records', 'hutch_search', 'hutch_update_collection',
       'hutch_delete_collection', 'hutch_delete_record', 'hutch_update_record', 'hutch_transform_records',
       'hutch_set_record_status', 'hutch_infer_schema', 'hutch_update_schema', 'hutch_create_view',
+      'hutch_collection_stats', 'hutch_export_records', 'hutch_import_records',
     ]
     for (const name of expected) {
       expect(registeredTools.has(name), `expected tool ${name} to be registered`).toBe(true)
@@ -145,6 +149,149 @@ describe('store_records tool', () => {
       summary: 'Saved 1 record to Users',
       action: 'created',
     }))
+  })
+})
+
+describe('query_records tool', () => {
+  it('forwards operator filters and the fields projection param to the service', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ records: [], total: 0 } as never)
+
+    await registeredTools.get('hutch_query_records')!({
+      slug: 'products',
+      filter: { price: { $gte: 10 }, status: 'active' },
+      fields: ['title', 'price'],
+    })
+
+    expect(recordService.queryRecords).toHaveBeenCalledWith('products', 'user-1', expect.objectContaining({
+      filter: { price: { $gte: 10 }, status: 'active' },
+      fields: ['title', 'price'],
+    }))
+  })
+})
+
+describe('collection_stats tool', () => {
+  it('returns the stats payload as JSON text', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollectionStats).mockResolvedValue({
+      name: 'Users',
+      slug: 'users',
+      record_count: 4,
+      by_status: { active: 4 },
+      first_created_at: '2026-01-01',
+      last_created_at: '2026-02-01',
+      first_updated_at: '2026-01-01',
+      last_updated_at: '2026-02-02',
+      approx_storage_bytes: 2048,
+      fields: [{ name: 'email', count: 4, percent: 100 }],
+    })
+
+    const result = await registeredTools.get('hutch_collection_stats')!({ slug: 'users' }) as { content: { text: string }[] }
+
+    expect(collectionService.getCollectionStats).toHaveBeenCalledWith('users', 'user-1')
+    expect(JSON.parse(result.content[0].text)).toEqual(expect.objectContaining({
+      record_count: 4,
+      by_status: { active: 4 },
+      approx_storage_bytes: 2048,
+      fields: [{ name: 'email', count: 4, percent: 100 }],
+    }))
+  })
+
+  it('returns isError when the collection is not found', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollectionStats).mockResolvedValue(null)
+
+    const result = await registeredTools.get('hutch_collection_stats')!({ slug: 'missing' }) as { isError?: boolean }
+    expect(result.isError).toBe(true)
+  })
+})
+
+describe('export_records tool', () => {
+  it('forwards format/filter/search/sort/fields/limit and returns metadata + content', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.exportRecords).mockResolvedValue({
+      collection: { name: 'Users', slug: 'users' },
+      format: 'csv',
+      count: 1,
+      total: 1,
+      truncated: false,
+      content: 'id,created_at,updated_at,name\r\n1,2026-01-01,2026-01-02,Alice\r\n',
+    } as never)
+
+    const result = await registeredTools.get('hutch_export_records')!({
+      collection: 'users',
+      format: 'csv',
+      filter: { active: true },
+      fields: ['name'],
+      limit: 5,
+    }) as { content: { text: string }[] }
+
+    expect(recordService.exportRecords).toHaveBeenCalledWith('users', 'user-1', expect.objectContaining({
+      format: 'csv',
+      filter: { active: true },
+      fields: ['name'],
+      limit: 5,
+    }))
+    expect(JSON.parse(result.content[0].text)).toEqual(expect.objectContaining({
+      format: 'csv',
+      count: 1,
+      truncated: false,
+      content: expect.stringContaining('id,created_at,updated_at,name'),
+    }))
+  })
+
+  it('returns isError when the collection is not found', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.exportRecords).mockResolvedValue(null)
+
+    const result = await registeredTools.get('hutch_export_records')!({ collection: 'missing' }) as { isError?: boolean }
+    expect(result.isError).toBe(true)
+  })
+})
+
+describe('import_records tool', () => {
+  it('forwards content and on_conflict, prepends the summary, and includes the collection url', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.importRecords).mockResolvedValue({
+      collection: { name: 'Users', slug: 'users' },
+      count: 2,
+      created: 2,
+      updated: 0,
+      skipped: 0,
+      summary: 'Saved 2 records to Users',
+    } as never)
+
+    const result = await registeredTools.get('hutch_import_records')!({
+      collection: 'users',
+      content: 'name\r\nAlice\r\nBob\r\n',
+      on_conflict: 'skip',
+    }) as { content: { text: string }[] }
+
+    expect(recordService.importRecords).toHaveBeenCalledWith('user-1', 'org-test', expect.objectContaining({
+      collection: 'users',
+      content: 'name\r\nAlice\r\nBob\r\n',
+      on_conflict: 'skip',
+    }))
+    const text = result.content[0].text
+    expect(text).toMatch(/^Saved 2 records to Users\n\n\{/)
+    const parsed = JSON.parse(text.slice(text.indexOf('{')))
+    expect(parsed).toEqual(expect.objectContaining({
+      count: 2,
+      created: 2,
+      url: 'https://example.test/c/users',
+    }))
+  })
+
+  it('returns isError when the service reports a parse error', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.importRecords).mockResolvedValue({ error: 'CSV content is empty — a header row is required', status: 400 } as never)
+
+    const result = await registeredTools.get('hutch_import_records')!({ collection: 'users', content: '' }) as {
+      isError?: boolean
+      content: { text: string }[]
+    }
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toMatch(/header row/)
   })
 })
 

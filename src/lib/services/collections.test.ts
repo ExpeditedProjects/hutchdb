@@ -80,6 +80,7 @@ import {
   addFieldOption,
   addFieldDefinition,
   describeCollection,
+  getCollectionStats,
 } from './collections'
 import { sortCollections } from '@/lib/collections/sort'
 import { findAccessibleCollectionBySlug, createCollectionWithOwner } from '@/lib/db/queries'
@@ -539,5 +540,94 @@ describe('sortCollections', () => {
     const before = input.slice()
     sortCollections(input, 'name', 'asc')
     expect(input).toEqual(before)
+  })
+})
+
+describe('getCollectionStats', () => {
+  function mockStatsQueries() {
+    // Order matches the Promise.all in getCollectionStats: summary, status, fields.
+    dbExecute
+      .mockResolvedValueOnce({
+        rows: [{
+          record_count: 4,
+          first_created_at: '2026-01-01 00:00:00+00',
+          last_created_at: '2026-02-01 00:00:00+00',
+          first_updated_at: '2026-01-01 00:00:00+00',
+          last_updated_at: '2026-02-02 00:00:00+00',
+          approx_storage_bytes: '2048', // pg returns bigint as string
+        }],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          { status: 'active', count: 3 },
+          { status: 'archived', count: 1 },
+        ],
+      })
+      .mockResolvedValueOnce({
+        rows: [
+          { key: 'url', count: 4 },
+          { key: 'title', count: 3 },
+          { key: 'notes', count: 1 },
+        ],
+      })
+  }
+
+  it('returns null when the caller has no access', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
+    const result = await getCollectionStats('bookmarks', 'user-test')
+    expect(result).toBeNull()
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('returns counts, timestamps, storage bytes, and per-field fill rates', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'viewer' })
+    mockStatsQueries()
+
+    const result = await getCollectionStats('bookmarks', 'user-test')
+
+    expect(result).toEqual({
+      name: 'Bookmarks',
+      slug: 'bookmarks',
+      record_count: 4,
+      by_status: { active: 3, archived: 1 },
+      first_created_at: '2026-01-01 00:00:00+00',
+      last_created_at: '2026-02-01 00:00:00+00',
+      first_updated_at: '2026-01-01 00:00:00+00',
+      last_updated_at: '2026-02-02 00:00:00+00',
+      approx_storage_bytes: 2048,
+      fields: [
+        { name: 'url', count: 4, percent: 100 },
+        { name: 'title', count: 3, percent: 75 },
+        { name: 'notes', count: 1, percent: 25 },
+      ],
+    })
+  })
+
+  it('handles an empty collection without dividing by zero', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'viewer' })
+    dbExecute
+      .mockResolvedValueOnce({
+        rows: [{
+          record_count: 0,
+          first_created_at: null,
+          last_created_at: null,
+          first_updated_at: null,
+          last_updated_at: null,
+          approx_storage_bytes: '0',
+        }],
+      })
+      .mockResolvedValueOnce({ rows: [] })
+      .mockResolvedValueOnce({ rows: [] })
+
+    const result = await getCollectionStats('bookmarks', 'user-test')
+
+    expect(result).toEqual(expect.objectContaining({
+      record_count: 0,
+      by_status: {},
+      first_created_at: null,
+      last_created_at: null,
+      approx_storage_bytes: 0,
+      fields: [],
+    }))
   })
 })
