@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { insertReturning, updateReturning, selectLimit, dbExecute, mockBeforeCreateRecord } = vi.hoisted(() => ({
-  insertReturning: vi.fn(),
-  updateReturning: vi.fn(),
-  selectLimit: vi.fn(),
-  dbExecute: vi.fn(),
-  mockBeforeCreateRecord: vi.fn(),
-}))
+const { insertReturning, insertValues, updateReturning, selectLimit, dbExecute, mockBeforeCreateRecord } = vi.hoisted(() => {
+  const insertReturning = vi.fn()
+  return {
+    insertReturning,
+    insertValues: vi.fn(() => ({ returning: insertReturning })),
+    updateReturning: vi.fn(),
+    selectLimit: vi.fn(),
+    dbExecute: vi.fn(),
+    mockBeforeCreateRecord: vi.fn(),
+  }
+})
 
 // Partial mock: replace the beforeCreateRecord hook so tests can make it
 // reject, but keep the module's other exports (notably the real
@@ -19,7 +23,7 @@ vi.mock('@/lib/quota', async (importOriginal) => ({
 vi.mock('@/lib/db', () => ({
   db: {
     insert: vi.fn(() => ({
-      values: vi.fn(() => ({ returning: insertReturning })),
+      values: insertValues,
     })),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
@@ -84,6 +88,8 @@ import {
   transformRecords,
   updateRecordStatus,
   deleteRecord,
+  exportRecords,
+  importRecords,
 } from './records'
 import {
   findCollectionByNameInOrg,
@@ -557,5 +563,269 @@ describe('deleteRecord', () => {
     selectLimit.mockResolvedValue([{ id: 5 }])
     const result = await deleteRecord('users', 'user-test', 5)
     expect(result).toEqual({ deleted: true, id: 5 })
+  })
+})
+
+describe('exportRecords', () => {
+  const engineRows = [
+    {
+      id: 1,
+      collectionId: 1,
+      status: 'active',
+      source: 'api',
+      deletedAt: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+      data: { title: 'First', tags: ['a', 'b'] },
+    },
+    {
+      id: 2,
+      collectionId: 1,
+      status: 'active',
+      source: 'api',
+      deletedAt: null,
+      createdAt: new Date('2026-01-03T00:00:00.000Z'),
+      updatedAt: new Date('2026-01-04T00:00:00.000Z'),
+      data: { title: 'Second' },
+    },
+  ]
+
+  function grantAccess() {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({
+      organization: mockOrg,
+      collection: baseCollection,
+      role: 'viewer',
+    })
+  }
+
+  it('returns null when the caller has no access to the collection', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
+    const result = await exportRecords('users', 'user-test', {})
+    expect(result).toBeNull()
+    expect(queryRecordsEngine).not.toHaveBeenCalled()
+  })
+
+  it('defaults to JSON with count/total/truncated metadata', async () => {
+    grantAccess()
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: engineRows, total: 2, count: 2, limit: 1000, offset: 0, has_more: false, next_offset: null,
+    } as never)
+
+    const result = await exportRecords('users', 'user-test', {})
+
+    expect(result).toEqual(expect.objectContaining({
+      format: 'json',
+      count: 2,
+      total: 2,
+      truncated: false,
+      collection: { name: 'Users', slug: 'users' },
+    }))
+    const content = (result as { content: string }).content
+    const parsed = JSON.parse(content)
+    expect(parsed).toEqual([
+      { id: 1, created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-02T00:00:00.000Z', data: { title: 'First', tags: ['a', 'b'] } },
+      { id: 2, created_at: '2026-01-03T00:00:00.000Z', updated_at: '2026-01-04T00:00:00.000Z', data: { title: 'Second' } },
+    ])
+    // Machine round-trip data: serialized compact, not pretty-printed.
+    expect(content).toBe(JSON.stringify(parsed))
+  })
+
+  it('serializes CSV with system columns first and nested values JSON-stringified', async () => {
+    grantAccess()
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: engineRows, total: 2, count: 2, limit: 1000, offset: 0, has_more: false, next_offset: null,
+    } as never)
+
+    const result = await exportRecords('users', 'user-test', { format: 'csv' })
+
+    const content = (result as { content: string }).content
+    expect(content.startsWith('id,created_at,updated_at,title,tags\r\n')).toBe(true)
+    expect(content).toContain('1,2026-01-01T00:00:00.000Z,2026-01-02T00:00:00.000Z,First,"[""a"",""b""]"')
+  })
+
+  it('forwards filter/search/sort/fields to the engine and clamps limit to 10000', async () => {
+    grantAccess()
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: [], total: 0, count: 0, limit: 10000, offset: 0, has_more: false, next_offset: null,
+    } as never)
+
+    await exportRecords('users', 'user-test', {
+      filter: { status: { $ne: 'archived' } },
+      search: 'foo',
+      sort: '-created_at',
+      fields: ['title'],
+      limit: 99999,
+    })
+
+    expect(queryRecordsEngine).toHaveBeenCalledWith(expect.objectContaining({
+      collectionId: baseCollection.id,
+      filter: { status: { $ne: 'archived' } },
+      search: 'foo',
+      sort: '-created_at',
+      fields: ['title'],
+      limit: 10000,
+      limitCap: 10000,
+    }))
+  })
+
+  it('defaults limit to 1000', async () => {
+    grantAccess()
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: [], total: 0, count: 0, limit: 1000, offset: 0, has_more: false, next_offset: null,
+    } as never)
+
+    await exportRecords('users', 'user-test', {})
+    expect(queryRecordsEngine).toHaveBeenCalledWith(expect.objectContaining({ limit: 1000 }))
+  })
+
+  it('sets truncated=true when the query has more rows than the limit', async () => {
+    grantAccess()
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: engineRows, total: 5000, count: 2, limit: 2, offset: 0, has_more: true, next_offset: 2,
+    } as never)
+
+    const result = await exportRecords('users', 'user-test', { limit: 2 })
+    expect(result).toEqual(expect.objectContaining({ count: 2, total: 5000, truncated: true }))
+  })
+})
+
+describe('importRecords', () => {
+  beforeEach(() => {
+    // createRecords path: collection exists, no unique key, batch insert.
+    vi.mocked(findCollectionByNameInOrg).mockResolvedValue(baseCollection)
+    insertReturning.mockResolvedValue([{ id: 1 }, { id: 2 }])
+  })
+
+  it('parses CSV (with type inference) and routes through createRecords', async () => {
+    const content = 'name,age,active\r\nAlice,30,true\r\nBob,forty,false\r\n'
+    const result = await importRecords('user-test', 'org-test', { collection: 'Users', content })
+
+    expect(insertValues).toHaveBeenCalledWith([
+      expect.objectContaining({ collectionId: 1, data: { name: 'Alice', age: 30, active: true } }),
+      expect.objectContaining({ collectionId: 1, data: { name: 'Bob', age: 'forty', active: false } }),
+    ])
+    expect(result).toEqual(expect.objectContaining({
+      collection: { name: 'Users', slug: 'users' },
+      count: 2,
+      created: 2,
+      updated: 0,
+      skipped: 0,
+      summary: 'Saved 2 records to Users',
+    }))
+  })
+
+  it('honors the quota hook via the shared createRecords path', async () => {
+    const { QuotaExceededError } = await import('@/lib/quota')
+    mockBeforeCreateRecord.mockRejectedValueOnce(new QuotaExceededError('quota exceeded'))
+
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      content: 'a\r\n1\r\n',
+    })
+    expect(result).toEqual(expect.objectContaining({ status: 413 }))
+  })
+
+  it('passes on_conflict through to createRecords upsert handling', async () => {
+    vi.mocked(findCollectionByNameInOrg).mockResolvedValue({ ...baseCollection, uniqueKey: ['name'] })
+    selectLimit.mockResolvedValue([{ id: 7, data: { name: 'Alice', age: 1 } }])
+
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      content: 'name,age\r\nAlice,30\r\n',
+      on_conflict: 'skip',
+    })
+
+    expect(result).toEqual(expect.objectContaining({ count: 1, created: 0, updated: 0, skipped: 1 }))
+  })
+
+  it('returns 400 for CSV without a header row', async () => {
+    const result = await importRecords('user-test', 'org-test', { collection: 'Users', content: '' })
+    expect(result).toEqual(expect.objectContaining({ status: 400 }))
+  })
+
+  it('accepts a JSON array of objects', async () => {
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      format: 'json',
+      content: JSON.stringify([{ name: 'Alice' }, { name: 'Bob' }]),
+    })
+
+    expect(insertValues).toHaveBeenCalledWith([
+      expect.objectContaining({ data: { name: 'Alice' } }),
+      expect.objectContaining({ data: { name: 'Bob' } }),
+    ])
+    expect(result).toEqual(expect.objectContaining({ count: 2 }))
+  })
+
+  it('unwraps hutch_export_records JSON output so exports round-trip', async () => {
+    insertReturning.mockResolvedValue([{ id: 1 }])
+    const exported = JSON.stringify([
+      { id: 9, created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-02T00:00:00.000Z', data: { title: 'Hello' } },
+    ])
+
+    await importRecords('user-test', 'org-test', { collection: 'Users', format: 'json', content: exported })
+
+    expect(insertValues).toHaveBeenCalledWith([
+      expect.objectContaining({ data: { title: 'Hello' } }),
+    ])
+  })
+
+  it('returns 400 when content exceeds the 10MB limit before parsing', async () => {
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      content: 'a'.repeat(10 * 1024 * 1024 + 1),
+    })
+    expect(result).toEqual({ error: 'Import content exceeds 10MB limit', status: 400 })
+    expect(insertValues).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 when the parsed content exceeds 10000 records', async () => {
+    const content = JSON.stringify(Array.from({ length: 10001 }, (_, i) => ({ n: i })))
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      format: 'json',
+      content,
+    })
+    expect(result).toEqual({ error: 'Import is limited to 10000 records per call', status: 400 })
+    expect(insertValues).not.toHaveBeenCalled()
+  })
+
+  it('returns 400 for invalid JSON content', async () => {
+    const result = await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      format: 'json',
+      content: 'not json',
+    })
+    expect(result).toEqual(expect.objectContaining({ status: 400 }))
+  })
+
+  it('CSV export content round-trips through CSV import', async () => {
+    // Export side
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({
+      organization: mockOrg, collection: baseCollection, role: 'viewer',
+    })
+    vi.mocked(queryRecordsEngine).mockResolvedValue({
+      records: [{
+        id: 3,
+        createdAt: new Date('2026-02-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-02-02T00:00:00.000Z'),
+        data: { title: 'Widget, "deluxe"', price: 19.99, in_stock: true, meta: { color: 'red' }, notes: 'a\nb' },
+      }],
+      total: 1, count: 1, limit: 1000, offset: 0, has_more: false, next_offset: null,
+    } as never)
+    const exported = await exportRecords('users', 'user-test', { format: 'csv' })
+
+    // Import side
+    insertReturning.mockResolvedValue([{ id: 4 }])
+    await importRecords('user-test', 'org-test', {
+      collection: 'Users',
+      content: (exported as { content: string }).content,
+    })
+
+    expect(insertValues).toHaveBeenCalledWith([
+      expect.objectContaining({
+        data: { title: 'Widget, "deluxe"', price: 19.99, in_stock: true, meta: { color: 'red' }, notes: 'a\nb' },
+      }),
+    ])
   })
 })

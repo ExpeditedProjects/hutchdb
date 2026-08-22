@@ -2,6 +2,8 @@ import { cache } from "react";
 import { db } from "./index";
 import { collections, records, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
 import { eq, and, sql, desc, asc, isNull, SQL } from "drizzle-orm";
+import { FIELD_NAME_RE } from "@/lib/constants";
+import { isPlainObject } from "@/lib/validation";
 
 export const notDeleted = isNull(records.deletedAt);
 
@@ -217,6 +219,7 @@ export type QueryParams = {
   search?: string;
   searchFields?: string[];
   sort?: string;
+  fields?: string[];
   groupBy?: string;
   aggregate?: Record<string, string | Record<string, string>>;
   timeBucket?: string;
@@ -224,7 +227,114 @@ export type QueryParams = {
   createdBefore?: string;
   limit?: number;
   offset?: number;
+  /** Internal: raises the 1000-row limit ceiling (used by export). Not exposed via MCP. */
+  limitCap?: number;
 };
+
+export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
+export type FilterOperator = (typeof FILTER_OPERATORS)[number];
+
+type ComparisonOp = Extract<FilterOperator, "$gt" | "$gte" | "$lt" | "$lte">;
+const COMPARISON_OPS: Record<ComparisonOp, string> = { $gt: ">", $gte: ">=", $lt: "<", $lte: "<=" };
+
+const IN_ARRAY_LIMIT = 1000;
+
+/**
+ * An operator spec is an object value whose keys ALL start with `$`
+ * (e.g. {"$gte": 10, "$lt": 100}). Anything else — plain values, arrays,
+ * nested objects, mixed keys — falls back to JSONB containment, which
+ * keeps existing filter call shapes byte-for-byte compatible.
+ */
+function isOperatorSpec(value: unknown): value is Record<string, unknown> {
+  if (!isPlainObject(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length > 0 && keys.every((k) => k.startsWith("$"));
+}
+
+/**
+ * Build WHERE conditions for a filter object. Plain (non-operator) pairs
+ * are collected into a single JSONB containment condition, exactly as
+ * before; operator pairs each compile to a guarded, fully parameterized
+ * comparison. Numeric comparisons only apply where
+ * jsonb_typeof(data->field) = 'number' so mixed-type fields can't raise
+ * cast errors; string operands compare lexicographically as text (which
+ * also works for ISO-8601 date strings).
+ */
+export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
+  const conditions: SQL[] = [];
+  const containment: Record<string, unknown> = {};
+
+  for (const [field, value] of Object.entries(filter)) {
+    if (isOperatorSpec(value)) {
+      for (const [op, operand] of Object.entries(value)) {
+        conditions.push(buildOperatorCondition(field, op, operand));
+      }
+    } else {
+      containment[field] = value;
+    }
+  }
+
+  if (Object.keys(containment).length > 0) {
+    conditions.unshift(sql`${records.data} @> ${JSON.stringify(containment)}::jsonb`);
+  }
+
+  return conditions;
+}
+
+function buildOperatorCondition(field: string, op: string, operand: unknown): SQL {
+  if (Object.hasOwn(COMPARISON_OPS, op)) {
+    const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
+    if (typeof operand === "number") {
+      return sql`(jsonb_typeof(${records.data}->${field}) = 'number' AND (${records.data}->>${field})::numeric ${cmp} ${operand})`;
+    }
+    if (typeof operand === "string") {
+      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ${cmp} ${operand})`;
+    }
+    throw new Error(`${op} requires a number or string operand`);
+  }
+
+  switch (op) {
+    case "$ne":
+      // Mongo semantics: matches records where the field differs OR is absent.
+      return sql`NOT (${records.data} @> ${JSON.stringify({ [field]: operand })}::jsonb)`;
+    case "$in":
+    case "$nin": {
+      if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
+      if (operand.length > IN_ARRAY_LIMIT) {
+        throw new Error(`$in/$nin arrays are limited to ${IN_ARRAY_LIMIT} elements`);
+      }
+      if (operand.length === 0) {
+        // $in [] matches nothing; $nin [] matches everything.
+        return op === "$in" ? sql`false` : sql`true`;
+      }
+      const list = sql.join(operand.map((v) => sql`${JSON.stringify(v)}::jsonb`), sql`, `);
+      const inCondition = sql`${records.data}->${field} = ANY(ARRAY[${list}])`;
+      return op === "$in"
+        ? inCondition
+        : sql`(${records.data}->${field} IS NULL OR NOT (${inCondition}))`;
+    }
+    case "$exists":
+      if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+      return operand ? sql`${records.data} ? ${field}` : sql`NOT (${records.data} ? ${field})`;
+    case "$contains": {
+      if (typeof operand !== "string") throw new Error("$contains requires a string operand");
+      const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ILIKE ${pattern})`;
+    }
+    default:
+      throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
+  }
+}
+
+/** Keep only the requested top-level keys of a record's data (projection). */
+function projectData(data: unknown, fields: string[]): unknown {
+  if (!isPlainObject(data)) return data;
+  const projected: Record<string, unknown> = {};
+  for (const field of fields) {
+    if (Object.hasOwn(data, field)) projected[field] = data[field];
+  }
+  return projected;
+}
 
 export async function queryRecords(params: QueryParams) {
   const {
@@ -232,10 +342,12 @@ export async function queryRecords(params: QueryParams) {
     filter,
     search,
     sort,
+    fields,
     createdAfter,
     createdBefore,
     limit = 50,
     offset = 0,
+    limitCap = 1000,
     groupBy,
     aggregate,
     timeBucket,
@@ -244,7 +356,7 @@ export async function queryRecords(params: QueryParams) {
   const conditions: SQL[] = [eq(records.collectionId, collectionId), notDeleted];
 
   if (filter && Object.keys(filter).length > 0) {
-    conditions.push(sql`${records.data} @> ${JSON.stringify(filter)}::jsonb`);
+    conditions.push(...buildFilterConditions(filter));
   }
 
   if (search) {
@@ -290,7 +402,7 @@ export async function queryRecords(params: QueryParams) {
     orderBy = desc(records.createdAt);
   }
 
-  const clampedLimit = Math.min(Math.max(limit, 1), 1000);
+  const clampedLimit = Math.min(Math.max(limit, 1), limitCap);
 
   const selectQuery = db
     .select()
@@ -314,9 +426,13 @@ export async function queryRecords(params: QueryParams) {
     total = count;
   }
 
+  const projected = fields && fields.length > 0
+    ? results.map((r) => ({ ...r, data: projectData(r.data, fields) }))
+    : results;
+
   const hasMore = offset + results.length < total;
   return {
-    records: results,
+    records: projected,
     total,
     count: results.length,
     limit: clampedLimit,
@@ -337,6 +453,8 @@ async function runCount(whereClause: SQL): Promise<number> {
   const [{ count }] = await runCountQuery(whereClause);
   return count;
 }
+
+const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
 
 async function queryWithAggregation(
   whereClause: SQL,
@@ -359,23 +477,36 @@ async function queryWithAggregation(
 
   if (aggregate) {
     for (const [alias, spec] of Object.entries(aggregate)) {
-      if (spec === "count" || (typeof spec === "object" && "count" in spec)) {
+      if (spec === "count" || (isPlainObject(spec) && "count" in spec)) {
         selectParts.push(`count(*)::int as "${escapeField(alias)}"`);
-      } else if (typeof spec === "object") {
-        const [op, field] = Object.entries(spec)[0];
-        const safeField = escapeField(field);
-        const safeAlias = escapeField(alias);
-        switch (op) {
-          case "min":
-            selectParts.push(`min(data->>'${safeField}') as "${safeAlias}"`);
-            break;
-          case "max":
-            selectParts.push(`max(data->>'${safeField}') as "${safeAlias}"`);
-            break;
-          case "distinct":
-            selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
-            break;
-        }
+        continue;
+      }
+      const specEntry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
+      if (!specEntry) {
+        const label = typeof spec === "string" ? spec : JSON.stringify(spec);
+        throw new Error(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
+      }
+      const [op, field] = specEntry;
+      const safeField = escapeField(field);
+      const safeAlias = escapeField(alias);
+      switch (op) {
+        case "min":
+          selectParts.push(`min(data->>'${safeField}') as "${safeAlias}"`);
+          break;
+        case "max":
+          selectParts.push(`max(data->>'${safeField}') as "${safeAlias}"`);
+          break;
+        case "distinct":
+          selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
+          break;
+        case "sum":
+        case "avg":
+          // Aggregate only numeric values (jsonb_typeof guard) so mixed-type
+          // fields can't raise cast errors; NULL when no numeric values exist.
+          selectParts.push(`${op}(CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END) as "${safeAlias}"`);
+          break;
+        default:
+          throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
       }
     }
   } else {
@@ -400,9 +531,10 @@ async function queryWithAggregation(
 }
 
 function escapeField(field: string): string {
-  const sanitized = field.replace(/[^a-zA-Z0-9_]/g, "");
-  if (!sanitized) throw new Error("Invalid field name");
-  return sanitized;
+  if (!FIELD_NAME_RE.test(field)) {
+    throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
+  }
+  return field;
 }
 
 function escapeBucket(bucket: string): string {

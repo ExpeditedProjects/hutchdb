@@ -5,6 +5,7 @@ import * as recordService from "@/lib/services/records";
 import * as fileService from "@/lib/services/files";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
+import { FILTER_OPERATORS } from "@/lib/db/queries";
 
 const SERVER_INSTRUCTIONS = `Hutch Core stores structured data for a single AI agent user. Records are arbitrary JSON, grouped into collections.
 
@@ -15,7 +16,9 @@ Workflow for answering questions about stored data:
 
 Collections auto-create on the first hutch_store_records. No setup step.
 
-Use filter for exact/numeric/enum matches, search for free-text across string fields, or combine both. Run hutch_describe_collection first when you don't know a field's type.
+Use filter for exact/numeric/enum matches, search for free-text across string fields, or combine both. Run hutch_describe_collection first when you don't know a field's type. Filters also accept Mongo-style operator objects per field: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains (e.g. {"price": {"$gte": 10}}).
+
+Use hutch_collection_stats for a quick overview of a collection's size and field coverage, and hutch_export_records / hutch_import_records to move data in and out as CSV or JSON.
 
 For deduplication: set unique_key via hutch_update_collection, then hutch_store_records honors on_conflict (default: replace).
 
@@ -27,6 +30,16 @@ This is the headless single-user Core. Multi-user sharing, organizations, invita
 
 type McpToolResponse = { content: { type: "text"; text: string }[]; isError?: boolean };
 
+// Shared between hutch_query_records and hutch_export_records — the same
+// filter param flows to the same query engine in both.
+const FILTER_DESCRIPTION =
+  "Filter on record fields. Plain values are JSONB containment (exact) matches, e.g. {\"status\": \"active\"}. " +
+  `A field value that is an object whose keys all start with $ applies operators instead: ${FILTER_OPERATORS.join(", ")}. ` +
+  "$gt/$gte/$lt/$lte compare (number operands numerically, string operands — including ISO dates — lexicographically as text); " +
+  "$ne is not-equal (also matches records missing the field); $in/$nin take an array of values; $exists takes a boolean; " +
+  "$contains is a case-insensitive substring match on string fields. " +
+  "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
+
 function textResponse(text: string): McpToolResponse {
   return { content: [{ type: "text", text }] };
 }
@@ -37,6 +50,18 @@ function errorResponse(text: string): McpToolResponse {
 
 function jsonResponse(value: unknown): McpToolResponse {
   return textResponse(JSON.stringify(value, null, 2));
+}
+
+/**
+ * Shared by hutch_store_records and hutch_import_records: attach the
+ * collection URL and lead with the human-readable summary when present.
+ */
+function summarizedWriteResponse(result: object, collectionUrl: (slug: string) => string): McpToolResponse {
+  const slug = (result as { collection?: { slug?: string } }).collection?.slug;
+  const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
+  const json = JSON.stringify(enriched, null, 2);
+  const summary = (result as { summary?: string }).summary;
+  return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
 
 function collectionNotFound(slug: string): McpToolResponse {
@@ -119,11 +144,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       if ('error' in result) {
         return errorResponse(result.error as string);
       }
-      const slug = (result as { collection?: { slug?: string } }).collection?.slug;
-      const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
-      const json = JSON.stringify(enriched, null, 2);
-      const summary = (result as { summary?: string }).summary;
-      return { content: [{ type: "text", text: summary ? `${summary}\n\n${json}` : json }] };
+      return summarizedWriteResponse(result, collectionUrl);
     }
   );
 
@@ -133,11 +154,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       description: "Fetch records from a collection with filter, search, sort, group_by, aggregate, time_bucket, and pagination. Example: use when the user asks 'show me bookmarks tagged work from last week'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
-        filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter (e.g. {\"status\": \"active\"}). Use for exact/numeric/enum matches."),
+        filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
         search: z.string().optional().describe("Full-text search query. Use for free-text across string fields."),
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
+        fields: z.array(z.string()).optional().describe("Projection: top-level data keys to include in each returned record's data (e.g. [\"title\", \"url\"]). System fields id/status/created_at/updated_at are always returned."),
         group_by: z.string().optional().describe("Field to group by for aggregation (e.g. \"status\")"),
-        aggregate: z.record(z.string(), z.unknown()).optional().describe("Aggregation spec mapping result alias to \"count\" or {op: field} where op is min/max/distinct (e.g. {\"total\": \"count\", \"latest\": {\"max\": \"created_at\"}})"),
+        aggregate: z.record(z.string(), z.unknown()).optional().describe("Aggregation spec mapping result alias to \"count\" or {op: field} where op is min/max/distinct/sum/avg (e.g. {\"total\": \"count\", \"revenue\": {\"sum\": \"amount\"}}). sum/avg only aggregate numeric values and return null when a field has none."),
         time_bucket: z.string().optional().describe("Time bucket (hour, day, week, month, year)"),
         created_after: z.string().optional().describe("Filter records created after this ISO date (e.g. \"2026-07-01\" or \"2026-07-01T12:00:00Z\")"),
         created_before: z.string().optional().describe("Filter records created before this ISO date (e.g. \"2026-07-18\")"),
@@ -151,6 +173,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         filter: params.filter as Record<string, unknown> | undefined,
         search: params.search,
         sort: params.sort,
+        fields: params.fields,
         groupBy: params.group_by,
         aggregate: params.aggregate as Record<string, string | Record<string, string>> | undefined,
         timeBucket: params.time_bucket,
@@ -177,6 +200,74 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     async (params) => {
       const result = await recordService.searchGlobal(userId, params.search, params.limit);
       return jsonResponse(result);
+    }
+  );
+
+  server.registerTool(
+    "hutch_collection_stats",
+    {
+      description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Fill rates are exact counts over all records (hutch_describe_collection's frequency is sampled). Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
+      inputSchema: { slug: z.string().describe("Collection slug") },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ slug }) => {
+      const result = await collectionService.getCollectionStats(slug, userId);
+      if (!result) return collectionNotFound(slug);
+      return jsonResponse(result);
+    }
+  );
+
+  server.registerTool(
+    "hutch_export_records",
+    {
+      description: "Export a collection's records as JSON or CSV text. Accepts the same filter/search/sort/fields params as hutch_query_records, plus limit (default 1000, max 10000). Returns count, total, a truncated flag, and the serialized content. CSV columns are id, created_at, updated_at, then the union of top-level record fields; nested objects/arrays are JSON-stringified into their cell. CSV cells are written verbatim (no spreadsheet formula-escaping) so exports round-trip. Example: use when the user says 'give me my contacts as a CSV' or when handing data to a tool that wants a flat file.",
+      inputSchema: {
+        collection: z.string().describe("Collection slug"),
+        format: z.enum(["json", "csv"]).optional().describe("Output format. Default: json"),
+        filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
+        search: z.string().optional().describe("Full-text search query applied before export"),
+        sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
+        fields: z.array(z.string()).optional().describe("Top-level data keys to include (CSV data columns / JSON data keys). Omit for all fields."),
+        limit: z.number().optional().describe("Max records to export (default 1000, max 10000). Check the truncated flag in the response."),
+      },
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      const result = await recordService.exportRecords(params.collection, userId, {
+        format: params.format,
+        filter: params.filter as Record<string, unknown> | undefined,
+        search: params.search,
+        sort: params.sort,
+        fields: params.fields,
+        limit: params.limit,
+      });
+      if (!result) return collectionNotFound(params.collection);
+      if ('error' in result) return errorResponse(result.error as string);
+      return jsonResponse(result);
+    }
+  );
+
+  server.registerTool(
+    "hutch_import_records",
+    {
+      description: "Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.",
+      inputSchema: {
+        collection: z.string().describe("Collection name or slug (created automatically if new)"),
+        format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
+        content: z.string().max(10 * 1024 * 1024).describe("Raw CSV text (header row required) or a JSON array of objects. Max 10MB."),
+        on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do when a record matches an existing unique key. Default: replace"),
+      },
+      annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async (params) => {
+      const result = await recordService.importRecords(userId, organizationId, {
+        collection: params.collection,
+        format: params.format,
+        content: params.content,
+        on_conflict: params.on_conflict,
+      });
+      if ('error' in result) return errorResponse(result.error as string);
+      return summarizedWriteResponse(result, collectionUrl);
     }
   );
 

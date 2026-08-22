@@ -20,8 +20,8 @@ Hutch is a standard Next.js + Postgres app. Nothing forces a specific host — p
 Brings up Hutch and Postgres together with one command.
 
 ```bash
-git clone https://github.com/ExpeditedProjects/hutch-core
-cd hutch-core
+git clone https://github.com/ExpeditedProjects/hutchdb
+cd hutchdb
 
 export HUTCH_ADMIN_PASSWORD="change-me"
 export HUTCH_SESSION_SECRET="$(openssl rand -hex 32)"
@@ -56,8 +56,8 @@ If you'd rather run Postgres separately (managed RDS, Supabase, Neon, your own s
 For VPS or homelab deployments without Docker.
 
 ```bash
-git clone https://github.com/ExpeditedProjects/hutch-core
-cd hutch-core
+git clone https://github.com/ExpeditedProjects/hutchdb
+cd hutchdb
 npm ci
 
 # Set env vars however your platform expects (export, .env.local,
