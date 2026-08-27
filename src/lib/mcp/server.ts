@@ -84,6 +84,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_list_collections",
     {
+      title: "List Collections",
       description: "List every collection the user has stored, with id, name, slug, and record count. Example: use when the user asks 'what data do I have in Hutch?'.",
       inputSchema: {},
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -97,6 +98,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_get_collection",
     {
+      title: "Get Collection",
       description: "Get one collection's metadata, settings, and record count by slug. Example: use when the user asks 'how big is my bookmarks collection?'.",
       inputSchema: { slug: z.string().describe("Collection slug") },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -111,6 +113,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_describe_collection",
     {
+      title: "Describe Collection",
       description: "Describe a collection's field names, types, and sample values. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.",
       inputSchema: { slug: z.string().describe("Collection slug") },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -125,6 +128,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_store_records",
     {
+      title: "Store Records",
       description: "Save one or many records to a collection (auto-creates the collection if new). Example: use when the user says 'save this' or has just produced structured output worth keeping for later.",
       inputSchema: {
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
@@ -151,6 +155,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_query_records",
     {
+      title: "Query Records",
       description: "Fetch records from a collection with filter, search, sort, group_by, aggregate, time_bucket, and pagination. Example: use when the user asks 'show me bookmarks tagged work from last week'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -190,6 +195,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_search",
     {
+      title: "Search Records",
       description: "Full-text search across every collection the user has access to. Example: use when the user is looking for something but doesn't know which collection holds it.",
       inputSchema: {
         search: z.string().describe("What to search for — matches against all fields in all collections"),
@@ -206,6 +212,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_collection_stats",
     {
+      title: "Collection Stats",
       description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Fill rates are exact counts over all records (hutch_describe_collection's frequency is sampled). Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
       inputSchema: { slug: z.string().describe("Collection slug") },
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
@@ -220,6 +227,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_export_records",
     {
+      title: "Export Records",
       description: "Export a collection's records as JSON or CSV text. Accepts the same filter/search/sort/fields params as hutch_query_records, plus limit (default 1000, max 10000). Returns count, total, a truncated flag, and the serialized content. CSV columns are id, created_at, updated_at, then the union of top-level record fields; nested objects/arrays are JSON-stringified into their cell. CSV cells are written verbatim (no spreadsheet formula-escaping) so exports round-trip. Example: use when the user says 'give me my contacts as a CSV' or when handing data to a tool that wants a flat file.",
       inputSchema: {
         collection: z.string().describe("Collection slug"),
@@ -250,6 +258,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_import_records",
     {
+      title: "Import Records",
       description: "Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.",
       inputSchema: {
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
@@ -274,6 +283,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_update_collection",
     {
+      title: "Update Collection",
       description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Example: use when the user wants to publish a collection or set a dedup key.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -296,6 +306,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_delete_collection",
     {
+      title: "Delete Collection",
       description: "Permanently delete a collection and all of its records. Example: use when the user says 'drop the test collection' or 'delete bookmarks'.",
       inputSchema: { slug: z.string().describe("Collection slug to delete") },
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -310,6 +321,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_update_record",
     {
+      title: "Update Record",
       description: "Replace one record's data by ID (full overwrite, not a partial merge). Example: use when the user wants to fix a typo or change a value in a saved record.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -329,6 +341,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_transform_records",
     {
+      title: "Transform Records",
       description: "Bulk rename, remove, or set fields across records in a collection (optionally filtered). Example: use when the user says 'rename status to state across all tasks' or 'clear the legacy field'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -357,6 +370,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_delete_record",
     {
+      title: "Delete Record",
       description: "Soft-delete one record by ID. Example: use when the user says 'remove this bookmark' or 'drop record 42'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -376,9 +390,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_infer_schema",
     {
+      title: "Infer Schema",
       description: "Analyze existing records to detect field types and save the inferred schema on the collection. Example: use when the user has stored records and asks Hutch to figure out the shape.",
       inputSchema: { slug: z.string().describe("Collection slug") },
-      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // Saves the inferred schema over any manually-set field types — destructive
+      // by the same logic as hutch_update_schema.
+      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
       const result = await collectionService.inferCollectionSchema(slug, userId);
@@ -391,6 +408,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_update_schema",
     {
+      title: "Update Schema",
       description: "Set a field's type, options, position, or visibility on a collection's schema. Example: use when the user says 'make status a select with options todo/done'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -414,13 +432,15 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_set_record_status",
     {
+      title: "Set Record Status",
       description: "Set one record's status to active, pending, flagged, or archived. Example: use when the user says 'archive this one' or 'flag for review'.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
         record_id: z.number().describe("Record ID"),
         status: z.enum(["active","pending","flagged","archived"]).describe("New status"),
       },
-      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // destructiveHint: true — overwrites an existing record's status.
+      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id, status }) => {
       const result = await recordService.updateRecordStatus(slug, userId, record_id, status);
@@ -433,6 +453,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_create_view",
     {
+      title: "Create View",
       description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted.",
       inputSchema: {
         slug: z.string().describe("Collection slug"),
@@ -483,6 +504,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_put_file",
     {
+      title: "Upload File",
       description: "Store a file at a path inside a collection (upserts on path; the collection auto-creates if new). Small UTF-8 text is kept inline; binary or large content (use content_base64) goes to blob storage. Max 4MB. Example: use when the user says 'save this file' or the agent wants to persist a prompt, config, or image.",
       inputSchema: {
         collection: z.string().describe("Collection name or slug (auto-created with upsert-on-path if new)"),
@@ -491,7 +513,8 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         content_base64: z.string().optional().describe("Base64-encoded bytes for binary content"),
         mime_type: z.string().optional().describe("MIME type (e.g. 'text/markdown', 'image/png'). Text-like types stay inline when small."),
       },
-      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // destructiveHint: true — upserts on path, so it can overwrite an existing file's content.
+      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
       const result = await fileService.putFile(userId, organizationId, {
@@ -509,6 +532,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_get_file",
     {
+      title: "Get File",
       description: "Read a file from a collection by path. Inline text files return their content; blob files return a time-limited download_url instead. Example: use when the user asks for a stored file's contents.",
       inputSchema: {
         collection: z.string().describe("Collection slug"),
@@ -527,6 +551,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
   server.registerTool(
     "hutch_list_files",
     {
+      title: "List Files",
       description: "List the files in a collection — path, filename, mime_type, size, and content_hash (no content). Example: use when the user asks 'what files are stored in agent-files?'.",
       inputSchema: {
         collection: z.string().describe("Collection slug"),
