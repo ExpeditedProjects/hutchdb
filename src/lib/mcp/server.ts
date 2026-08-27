@@ -1,4 +1,5 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { DrizzleQueryError } from "drizzle-orm";
 import { z } from "zod";
 import * as collectionService from "@/lib/services/collections";
 import * as recordService from "@/lib/services/records";
@@ -61,6 +62,22 @@ function summarizedWriteResponse(result: object, collectionUrl: (slug: string) =
   return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
 
+/**
+ * Database-layer failures whose messages leak driver internals (SQL text,
+ * bound params) and must never reach the MCP client verbatim.
+ *
+ * drizzle-orm 0.45 throws DrizzleQueryError with message
+ * "Failed query: <sql>\nparams: <params>". Note the class never assigns
+ * `this.name`, so at runtime `err.name` is plain "Error" — the instanceof
+ * and message checks are the ones that actually fire; the name check is
+ * kept for errors crossing realm/bundle boundaries where instanceof fails.
+ */
+function isDatabaseError(err: unknown): boolean {
+  if (err instanceof DrizzleQueryError) return true;
+  if (!(err instanceof Error)) return false;
+  return err.name === "DrizzleQueryError" || /^Failed query/i.test(err.message);
+}
+
 function collectionNotFound(slug: string): McpToolResponse {
   return errorResponse(
     `Collection '${slug}' not found. Call hutch_list_collections to see available slugs, or use hutch_store_records to create a new one by writing to it.`
@@ -78,7 +95,33 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
 
   const collectionUrl = (slug: string) => `${baseUrl}/c/${slug}`;
 
-  server.registerTool(
+  /**
+   * Error-hygiene chokepoint for every tool registration. If a handler
+   * throws a database-layer error, the MCP SDK would otherwise stringify
+   * it into the tool output — leaking raw SQL and bound params to the
+   * client. Catch those here: log the real error server-side, return a
+   * generic isError response. Every OTHER throw is rethrown unchanged so
+   * intentional validation errors (e.g. "Unsupported filter operator …"
+   * from the query engine) still reach the client verbatim via the SDK.
+   */
+  const registerTool: McpServer["registerTool"] = (name, config, handler) => {
+    const wrapped = async (...args: unknown[]) => {
+      try {
+        return await (handler as (...a: unknown[]) => Promise<McpToolResponse>)(...args);
+      } catch (err) {
+        if (isDatabaseError(err)) {
+          console.error(`[mcp] ${name} database error:`, err);
+          return errorResponse(
+            `${name} failed while accessing the database. Try again or adjust the inputs.`
+          );
+        }
+        throw err;
+      }
+    };
+    return server.registerTool(name, config, wrapped as typeof handler);
+  };
+
+  registerTool(
     "hutch_list_collections",
     {
       title: "List Collections",
@@ -107,7 +150,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_get_collection",
     {
       title: "Get Collection",
@@ -122,7 +165,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_describe_collection",
     {
       title: "Describe Collection",
@@ -137,7 +180,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_store_records",
     {
       title: "Store Records",
@@ -164,7 +207,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_query_records",
     {
       title: "Query Records",
@@ -204,7 +247,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_search",
     {
       title: "Search Records",
@@ -221,7 +264,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_collection_stats",
     {
       title: "Collection Stats",
@@ -236,7 +279,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_export_records",
     {
       title: "Export Records",
@@ -267,7 +310,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_import_records",
     {
       title: "Import Records",
@@ -292,7 +335,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_update_collection",
     {
       title: "Update Collection",
@@ -315,7 +358,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_delete_collection",
     {
       title: "Delete Collection",
@@ -330,7 +373,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_update_record",
     {
       title: "Update Record",
@@ -350,7 +393,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_transform_records",
     {
       title: "Transform Records",
@@ -379,7 +422,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_delete_record",
     {
       title: "Delete Record",
@@ -399,7 +442,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_infer_schema",
     {
       title: "Infer Schema",
@@ -417,7 +460,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_update_schema",
     {
       title: "Update Schema",
@@ -441,7 +484,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_set_record_status",
     {
       title: "Set Record Status",
@@ -462,7 +505,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  server.registerTool(
+  registerTool(
     "hutch_create_view",
     {
       title: "Create View",

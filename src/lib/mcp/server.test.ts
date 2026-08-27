@@ -107,6 +107,188 @@ describe('createMcpServer tool registration', () => {
   })
 })
 
+describe('tool surface snapshot', () => {
+  // Deliberate-drift gate for the connectors directory: any change to a tool
+  // name, title, safety annotations, or input keys must update this literal.
+  it('matches the pinned 18-tool connector surface exactly', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    const surface = [...registeredConfigs.entries()]
+      .map(([name, config]) => {
+        const annotations = (config.annotations ?? {}) as {
+          readOnlyHint?: boolean
+          destructiveHint?: boolean
+          idempotentHint?: boolean
+        }
+        return {
+          name,
+          title: config.title as string,
+          readOnlyHint: annotations.readOnlyHint,
+          destructiveHint: annotations.destructiveHint,
+          idempotentHint: annotations.idempotentHint,
+          inputKeys: Object.keys((config.inputSchema ?? {}) as Record<string, unknown>).sort(),
+        }
+      })
+      .sort((a, b) => a.name.localeCompare(b.name))
+
+    expect(surface).toEqual([
+      { name: 'hutch_collection_stats', title: 'Collection Stats', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_create_view', title: 'Create View', destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'slug', 'sort', 'type'] },
+      { name: 'hutch_delete_collection', title: 'Delete Collection', destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_delete_record', title: 'Delete Record', destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
+      { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
+      { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_import_records', title: 'Import Records', destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict'] },
+      { name: 'hutch_infer_schema', title: 'Infer Schema', destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
+      { name: 'hutch_set_record_status', title: 'Set Record Status', destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
+      { name: 'hutch_store_records', title: 'Store Records', destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records'] },
+      { name: 'hutch_transform_records', title: 'Transform Records', destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
+      { name: 'hutch_update_collection', title: 'Update Collection', destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
+      { name: 'hutch_update_record', title: 'Update Record', destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
+      { name: 'hutch_update_schema', title: 'Update Schema', destructiveHint: true, idempotentHint: true, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
+    ])
+  })
+})
+
+describe('error hygiene chokepoint', () => {
+  it('masks DrizzleQueryError-shaped failures with a generic database message and logs the real error', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    // Mirror drizzle-orm 0.45's DrizzleQueryError: message leads with
+    // "Failed query: <sql>\nparams: <params>" (the class never assigns
+    // this.name, so the message prefix is the live signal).
+    const driverError = new Error(
+      'Failed query: UPDATE records SET data = $1 WHERE id = $2\nparams: {"secret":"hunter2"},42'
+    )
+    vi.mocked(recordService.queryRecords).mockRejectedValue(driverError)
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'users' }) as {
+      isError?: boolean
+      content: { text: string }[]
+    }
+
+    expect(result.isError).toBe(true)
+    const text = result.content[0].text
+    expect(text).toBe('hutch_query_records failed while accessing the database. Try again or adjust the inputs.')
+    // No driver internals leak into the client-visible text.
+    expect(text).not.toMatch(/UPDATE/)
+    expect(text).not.toMatch(/params/)
+    expect(text).not.toMatch(/query:/)
+    expect(text).not.toMatch(/hunter2/)
+    // The real error is still logged server-side for operators.
+    expect(consoleError).toHaveBeenCalledWith(expect.stringContaining('hutch_query_records'), driverError)
+    consoleError.mockRestore()
+  })
+
+  it('masks errors carrying the DrizzleQueryError name even without the message prefix', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    const driverError = new Error('connection terminated unexpectedly')
+    driverError.name = 'DrizzleQueryError'
+    vi.mocked(collectionService.listCollections).mockRejectedValue(driverError)
+
+    const result = await registeredTools.get('hutch_list_collections')!({}) as {
+      isError?: boolean
+      content: { text: string }[]
+    }
+
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe('hutch_list_collections failed while accessing the database. Try again or adjust the inputs.')
+    consoleError.mockRestore()
+  })
+
+  it('rethrows non-database errors unchanged so validation messages reach the client via the SDK', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    const validationError = new Error(
+      "Unsupported filter operator '$regex'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains"
+    )
+    vi.mocked(recordService.queryRecords).mockRejectedValue(validationError)
+
+    // The SDK stringifies rethrown errors into the tool output verbatim, so
+    // asserting the wrapped handler rejects with the exact error matches
+    // what the client ends up seeing.
+    await expect(registeredTools.get('hutch_query_records')!({ slug: 'users', filter: { name: { $regex: 'x' } } }))
+      .rejects.toThrow("Unsupported filter operator '$regex'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains")
+  })
+})
+
+describe('response size budgets', () => {
+  it('keeps hutch_list_collections under 48KB for 50 collections with long descriptions', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    // 500-char descriptions on every collection — the worst realistic case
+    // for a busy account. Measured response: ~41,100 bytes (descriptions
+    // alone are 25,000, so a 32KB budget is not attainable at this fixture
+    // size); budget pinned at the next round bound, 48KB.
+    const longDescription = (i: number) =>
+      `Collection ${i}: `.padEnd(
+        500,
+        'Curated research links and notes gathered by the agent during long-running investigations, including source URLs, extraction timestamps, relevance scores, and reviewer annotations. '
+      )
+    vi.mocked(collectionService.listCollections).mockResolvedValue(
+      Array.from({ length: 50 }, (_, i) => ({
+        id: i + 1,
+        name: `Research Collection ${i + 1}`,
+        slug: `research-collection-${i + 1}`,
+        description: longDescription(i + 1),
+        uniqueKey: ['url', 'captured_at'],
+        published: i % 2 === 0,
+        recordCount: 12000 + i,
+        lastRecordAt: '2026-08-01T12:34:56.000Z',
+        updatedAt: '2026-08-02T01:23:45.000Z',
+      })) as never
+    )
+
+    const result = await registeredTools.get('hutch_list_collections')!({}) as { content: { text: string }[] }
+    const bytes = Buffer.byteLength(result.content[0].text, 'utf8')
+    expect(bytes).toBeLessThan(48 * 1024)
+    // Sanity: the fixture is actually big — a shrunken fixture would make
+    // the budget assertion meaningless.
+    expect(bytes).toBeGreaterThan(30 * 1024)
+  })
+
+  it('keeps a default hutch_query_records page under 128KB for 50 records of ~1KB data each', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+
+    // Each record's data serializes to ~1.1KB compact JSON; the pretty-printed
+    // 50-record default page measures ~70,100 bytes. Budget pinned at 128KB.
+    const recordData = (i: number) => ({
+      title: `Record ${i} — long-form captured artifact title with descriptive suffix`,
+      url: `https://example.com/articles/${i}/full-text-analysis`,
+      status: 'active',
+      score: 0.87,
+      tags: ['research', 'agent', 'longform'],
+      notes: 'N'.padEnd(700, 'Detailed extraction notes covering methodology, source reliability, cross-references and follow-up actions. '),
+      summary: 'S'.padEnd(180, 'Concise summary text for the record body. '),
+    })
+    vi.mocked(recordService.queryRecords).mockResolvedValue({
+      records: Array.from({ length: 50 }, (_, i) => ({
+        id: i + 1,
+        status: 'active',
+        created_at: '2026-08-01T12:34:56.000Z',
+        updated_at: '2026-08-02T01:23:45.000Z',
+        data: recordData(i + 1),
+      })),
+      total: 50,
+      limit: 50,
+      offset: 0,
+    } as never)
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'research' }) as { content: { text: string }[] }
+    const bytes = Buffer.byteLength(result.content[0].text, 'utf8')
+    expect(bytes).toBeLessThan(128 * 1024)
+    // Sanity: the fixture really carries ~50KB+ of payload.
+    expect(bytes).toBeGreaterThan(50 * 1024)
+  })
+})
+
 describe('tool input schemas and descriptions', () => {
   it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
