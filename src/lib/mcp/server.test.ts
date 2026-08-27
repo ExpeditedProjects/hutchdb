@@ -95,6 +95,16 @@ describe('createMcpServer tool registration', () => {
       expect(registeredTools.has(name), `${name} should NOT be registered in Core`).toBe(false)
     }
   })
+
+  it('gives every registered tool a non-empty human-readable title', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.size).toBeGreaterThan(0)
+    for (const [name, config] of registeredConfigs) {
+      const title = config.title
+      expect(typeof title, `expected tool ${name} to have a string title`).toBe('string')
+      expect((title as string).length, `expected tool ${name} to have a non-empty title`).toBeGreaterThan(0)
+    }
+  })
 })
 
 describe('tool input schemas and descriptions', () => {
