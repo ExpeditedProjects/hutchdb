@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import { DrizzleQueryError } from "drizzle-orm";
 import { z } from "zod";
 import * as collectionService from "@/lib/services/collections";
@@ -104,7 +104,11 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
    * intentional validation errors (e.g. "Unsupported filter operator …"
    * from the query engine) still reach the client verbatim via the SDK.
    */
-  const registerTool: McpServer["registerTool"] = (name, config, handler) => {
+  const registerTool = ((
+    name: string,
+    config: Record<string, unknown>,
+    handler: (...a: unknown[]) => unknown
+  ) => {
     const wrapped = async (...args: unknown[]) => {
       try {
         return await (handler as (...a: unknown[]) => Promise<McpToolResponse>)(...args);
@@ -118,15 +122,15 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         throw err;
       }
     };
-    return server.registerTool(name, config, wrapped as typeof handler);
-  };
+    return (server.registerTool as (n: string, c: unknown, h: unknown) => unknown)(name, config, wrapped);
+  }) as McpServer["registerTool"];
 
   registerTool(
     "hutch_list_collections",
     {
       title: "List Collections",
       description: "List every collection the user has stored, with id, name, slug, description, unique_key, and record count. Use hutch_describe_collection for a collection's fields and types. Example: use when the user asks 'what data do I have in Hutch?'.",
-      inputSchema: {},
+      inputSchema: z.object({}),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
@@ -155,7 +159,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Get Collection",
       description: "Get one collection's metadata, settings, and record count by slug. Example: use when the user asks 'how big is my bookmarks collection?'.",
-      inputSchema: { slug: z.string().describe("Collection slug") },
+      inputSchema: z.object({ slug: z.string().describe("Collection slug") }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
@@ -170,7 +174,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Describe Collection",
       description: "Describe a collection's field names, types, and sample values. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.",
-      inputSchema: { slug: z.string().describe("Collection slug") },
+      inputSchema: z.object({ slug: z.string().describe("Collection slug") }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
@@ -185,12 +189,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Store Records",
       description: "Save one or many records to a collection (auto-creates the collection if new). Example: use when the user says 'save this' or has just produced structured output worth keeping for later.",
-      inputSchema: {
+      inputSchema: z.object({
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
         data: z.record(z.string(), z.unknown()).optional().describe("Single record as a JSON object (e.g. {\"title\": \"My note\", \"tags\": [\"work\"]}). Use this OR records, not both."),
         records: z.array(z.record(z.string(), z.unknown())).optional().describe("Array of record objects for storing multiple items at once (e.g. [{\"title\": \"A\"}, {\"title\": \"B\"}])"),
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do if a record with the same unique key exists. Default: replace"),
-      },
+      }),
       annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
@@ -212,7 +216,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Query Records",
       description: "Fetch records from a collection with filter, search, sort, group_by, aggregate, time_bucket, and pagination. Example: use when the user asks 'show me bookmarks tagged work from last week'.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
         search: z.string().optional().describe("Full-text search query. Use for free-text across string fields."),
@@ -225,7 +229,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         created_before: z.string().optional().describe("Filter records created before this ISO date (e.g. \"2026-07-18\")"),
         limit: z.number().optional().describe("Max records to return (default 50, max 1000)"),
         offset: z.number().optional().describe("Offset for pagination"),
-      },
+      }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
@@ -252,10 +256,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Search Records",
       description: "Full-text search across every collection the user has access to. Example: use when the user is looking for something but doesn't know which collection holds it.",
-      inputSchema: {
+      inputSchema: z.object({
         search: z.string().describe("What to search for — matches against all fields in all collections"),
         limit: z.number().optional().describe("Max results per collection (default 10, max 50)"),
-      },
+      }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
@@ -269,7 +273,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Collection Stats",
       description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Fill rates are exact counts over all records (hutch_describe_collection's frequency is sampled). Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
-      inputSchema: { slug: z.string().describe("Collection slug") },
+      inputSchema: z.object({ slug: z.string().describe("Collection slug") }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
@@ -284,7 +288,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Export Records",
       description: "Export a collection's records as JSON or CSV text. Accepts the same filter/search/sort/fields params as hutch_query_records, plus limit (default 1000, max 10000). Returns count, total, a truncated flag, and the serialized content. CSV columns are id, created_at, updated_at, then the union of top-level record fields; nested objects/arrays are JSON-stringified into their cell. CSV cells are written verbatim (no spreadsheet formula-escaping) so exports round-trip. Example: use when the user says 'give me my contacts as a CSV' or when handing data to a tool that wants a flat file.",
-      inputSchema: {
+      inputSchema: z.object({
         collection: z.string().describe("Collection slug"),
         format: z.enum(["json", "csv"]).optional().describe("Output format. Default: json"),
         filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
@@ -292,7 +296,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
         fields: z.array(z.string()).optional().describe("Top-level data keys to include (CSV data columns / JSON data keys). Omit for all fields."),
         limit: z.number().optional().describe("Max records to export (default 1000, max 10000). Check the truncated flag in the response."),
-      },
+      }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
@@ -315,12 +319,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Import Records",
       description: "Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.",
-      inputSchema: {
+      inputSchema: z.object({
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
         format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
         content: z.string().max(10 * 1024 * 1024).describe("Raw CSV text (header row required) or a JSON array of objects. Max 10MB."),
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do when a record matches an existing unique key. Default: replace"),
-      },
+      }),
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
@@ -340,13 +344,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Update Collection",
       description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Example: use when the user wants to publish a collection or set a dedup key.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         name: z.string().optional().describe("New collection name"),
         description: z.string().optional().describe("Collection description"),
         unique_key: z.array(z.string()).optional().describe("Fields that form the unique key for upsert (e.g. [\"url\"] or [\"email\", \"date\"])"),
         published: z.boolean().optional().describe("Whether the collection is publicly viewable"),
-      },
+      }),
       // destructiveHint: true because `published: true` exposes the collection to the public web.
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -363,7 +367,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Delete Collection",
       description: "Permanently delete a collection and all of its records. Example: use when the user says 'drop the test collection' or 'delete bookmarks'.",
-      inputSchema: { slug: z.string().describe("Collection slug to delete") },
+      inputSchema: z.object({ slug: z.string().describe("Collection slug to delete") }),
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
@@ -378,11 +382,11 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Update Record",
       description: "Replace one record's data by ID (full overwrite, not a partial merge). Example: use when the user wants to fix a typo or change a value in a saved record.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         record_id: z.number().describe("Record ID to update"),
         data: z.record(z.string(), z.unknown()).describe("New data for the record (replaces existing data)"),
-      },
+      }),
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id, data }) => {
@@ -398,7 +402,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Transform Records",
       description: "Bulk rename, remove, or set fields across records in a collection (optionally filtered). Example: use when the user says 'rename status to state across all tasks' or 'clear the legacy field'.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"})"),
         remove_fields: z.array(z.string()).optional().describe("Fields to remove from all records (e.g. [\"legacy_id\"])"),
@@ -407,7 +411,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
           value: z.unknown().describe("New value"),
           filter: z.record(z.string(), z.unknown()).optional().describe("Only update records matching this filter (e.g. {\"status\": \"active\"})"),
         }).optional().describe("Set a field value, optionally on filtered records"),
-      },
+      }),
       annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async ({ slug, rename_fields, remove_fields, set_field }) => {
@@ -427,10 +431,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Delete Record",
       description: "Soft-delete one record by ID. Example: use when the user says 'remove this bookmark' or 'drop record 42'.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         record_id: z.number().describe("Record ID to delete"),
-      },
+      }),
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id }) => {
@@ -447,7 +451,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Infer Schema",
       description: "Analyze existing records to detect field types and save the inferred schema on the collection. Example: use when the user has stored records and asks Hutch to figure out the shape.",
-      inputSchema: { slug: z.string().describe("Collection slug") },
+      inputSchema: z.object({ slug: z.string().describe("Collection slug") }),
       // Saves the inferred schema over any manually-set field types — destructive
       // by the same logic as hutch_update_schema.
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -465,14 +469,14 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Update Schema",
       description: "Set a field's type, options, position, or visibility on a collection's schema. Example: use when the user says 'make status a select with options todo/done'.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         field: z.string().describe("Field name to update"),
         type: z.enum(["text","number","boolean","date","url","email","image_url","select","multiselect","json","file"]).optional(),
         options: z.array(z.string()).optional().describe("Options for select/multiselect fields (e.g. [\"todo\", \"in-progress\", \"done\"])"),
         position: z.number().optional(),
         hidden: z.boolean().optional(),
-      },
+      }),
       // destructiveHint: true — schema rewrites change how subsequent queries behave.
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -489,11 +493,11 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Set Record Status",
       description: "Set one record's status to active, pending, flagged, or archived. Example: use when the user says 'archive this one' or 'flag for review'.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         record_id: z.number().describe("Record ID"),
         status: z.enum(["active","pending","flagged","archived"]).describe("New status"),
-      },
+      }),
       // destructiveHint: true — overwrites an existing record's status.
       annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -510,7 +514,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     {
       title: "Create View",
       description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted.",
-      inputSchema: {
+      inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         type: z.enum(VIEW_TYPES).optional().default("table"),
         name: z.string().optional().describe("View name (defaults to the type label)"),
@@ -519,7 +523,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"})"),
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
         columns: z.array(z.string()).optional().describe("Columns to display, in order (e.g. [\"title\", \"url\"])"),
-      },
+      }),
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {

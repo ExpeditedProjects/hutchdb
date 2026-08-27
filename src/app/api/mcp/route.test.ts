@@ -15,10 +15,10 @@ vi.mock('@/lib/mcp/server', () => ({
   })),
 }))
 
-vi.mock('@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js', () => ({
-  WebStandardStreamableHTTPServerTransport: class {
-    handleRequest = transportHandleRequest
-  },
+vi.mock('@modelcontextprotocol/server', () => ({
+  createMcpHandler: () => ({
+    fetch: transportHandleRequest,
+  }),
 }))
 
 import { POST } from './route'
