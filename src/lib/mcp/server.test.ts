@@ -5,7 +5,7 @@ const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
   registeredConfigs: new Map<string, Record<string, unknown>>(),
 }))
 
-vi.mock('@modelcontextprotocol/sdk/server/mcp.js', () => {
+vi.mock('@modelcontextprotocol/server', () => {
   class McpServer {
     registerTool(name: string, config: Record<string, unknown>, handler: (params: unknown) => Promise<unknown>) {
       registeredTools.set(name, handler)
@@ -126,7 +126,10 @@ describe('tool surface snapshot', () => {
           readOnlyHint: annotations.readOnlyHint,
           destructiveHint: annotations.destructiveHint,
           idempotentHint: annotations.idempotentHint,
-          inputKeys: Object.keys((config.inputSchema ?? {}) as Record<string, unknown>).sort(),
+          // v2 registers inputSchema as a z.object(...) — field names live on .shape.
+          inputKeys: Object.keys(
+            ((config.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape ?? {})
+          ).sort(),
         }
       })
       .sort((a, b) => a.name.localeCompare(b.name))
@@ -293,8 +296,8 @@ describe('tool input schemas and descriptions', () => {
   it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const schema = (registeredConfigs.get('hutch_import_records')!.inputSchema as {
-      content: { safeParse: (v: unknown) => { success: boolean } }
-    }).content
+      shape: { content: { safeParse: (v: unknown) => { success: boolean } } }
+    }).shape.content
     expect(schema.safeParse('a'.repeat(100)).success).toBe(true)
     expect(schema.safeParse('a'.repeat(10 * 1024 * 1024 + 1)).success).toBe(false)
   })
@@ -302,8 +305,8 @@ describe('tool input schemas and descriptions', () => {
   it('enumerates every FILTER_OPERATORS entry in the filter description', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const filter = (registeredConfigs.get('hutch_query_records')!.inputSchema as {
-      filter: { description?: string }
-    }).filter
+      shape: { filter: { description?: string } }
+    }).shape.filter
     for (const op of FILTER_OPERATORS) {
       expect(filter.description, `expected filter description to mention ${op}`).toContain(op)
     }
