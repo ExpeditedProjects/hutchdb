@@ -17,14 +17,17 @@ export default defineConfig({
         },
       },
       {
-        // Integration tests hit real network endpoints (MinIO); happy-dom's
-        // browser-emulating fetch corrupts SigV4-signed requests, so these
-        // run in the plain node environment.
+        // Integration tests hit real infrastructure (Postgres via
+        // HUTCH_TEST_DATABASE_URL), so they run in the plain node
+        // environment. fileParallelism is off because every integration
+        // file shares one scratch database and truncates between tests —
+        // parallel files would clobber each other's rows.
         extends: true,
         test: {
           name: 'integration',
           environment: 'node',
           include: ['src/**/*.integration.test.ts'],
+          fileParallelism: false,
         },
       },
     ],

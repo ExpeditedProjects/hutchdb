@@ -34,6 +34,17 @@ npm run test:watch
 
 For features that change behavior, write failing tests against the agreed contract first, then implement to green. Tests live next to source as `*.test.ts(x)`.
 
+### Integration tests (real Postgres)
+
+Files matching `*.integration.test.ts` run generated SQL against a real scratch database — no mocks. They auto-skip when `HUTCH_TEST_DATABASE_URL` is unset, so plain `npm test` stays green with no infrastructure. To run them locally:
+
+```bash
+createdb hutch_test
+HUTCH_TEST_DATABASE_URL=postgresql://localhost/hutch_test npm test
+```
+
+Use a dedicated scratch database — the suite applies migrations to it and truncates tables between tests. Never point it at your development database. CI runs this tier automatically against a `postgres:16` service (see `.github/workflows/test.yml`).
+
 ## What's in scope
 
 Hutch is a personal-use structured data store for AI agents. Bug fixes, performance improvements, and small features that fit that purpose are welcome.
