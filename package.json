@@ -15,7 +15,7 @@
     "smoke": "npx tsx scripts/smoke.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "drizzle-orm": "^0.45.2",
     "nanoid": "^5.1.9",
     "next": "16.2.3",
