@@ -453,6 +453,24 @@ describe('list_collections tool', () => {
       expect.objectContaining({ name: 'Users', slug: 'users' }),
     ])
   })
+
+  it('omits each collection schema so large accounts get a summary, not a dump', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.listCollections).mockResolvedValue([
+      {
+        id: 1, name: 'Users', slug: 'users', description: null, uniqueKey: [],
+        published: false, recordCount: 3, lastRecordAt: null, updatedAt: new Date('2026-01-01'),
+        schema: { fields: [{ name: 'huge', type: 'text' }], version: 9 },
+        role: 'owner', createdAt: new Date('2026-01-01'),
+      },
+    ] as never)
+
+    const result = await registeredTools.get('hutch_list_collections')!({}) as { content: { text: string }[] }
+    const [row] = JSON.parse(result.content[0].text)
+    expect(row).toEqual(expect.objectContaining({ slug: 'users', recordCount: 3 }))
+    expect(row).not.toHaveProperty('schema')
+    expect(row).not.toHaveProperty('role')
+  })
 })
 
 describe('collection url in mutation responses', () => {

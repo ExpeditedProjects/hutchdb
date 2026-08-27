@@ -82,13 +82,28 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_list_collections",
     {
       title: "List Collections",
-      description: "List every collection the user has stored, with id, name, slug, and record count. Example: use when the user asks 'what data do I have in Hutch?'.",
+      description: "List every collection the user has stored, with id, name, slug, description, unique_key, and record count. Use hutch_describe_collection for a collection's fields and types. Example: use when the user asks 'what data do I have in Hutch?'.",
       inputSchema: {},
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async () => {
       const collections = await collectionService.listCollections(userId);
-      return jsonResponse(collections);
+      // Summary only — omitting each collection's full schema keeps this
+      // response small on accounts with many collections; per-collection
+      // detail lives in hutch_describe_collection / hutch_get_collection.
+      return jsonResponse(
+        collections.map((c) => ({
+          id: c.id,
+          name: c.name,
+          slug: c.slug,
+          description: c.description,
+          uniqueKey: c.uniqueKey,
+          published: c.published,
+          recordCount: c.recordCount,
+          lastRecordAt: c.lastRecordAt,
+          updatedAt: c.updatedAt,
+        }))
+      );
     }
   );
 
