@@ -10,7 +10,6 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { cleanupCollectionBlobs } from "./files";
 
 export type RecentCollection = { name: string; slug: string; role: CollectionRole };
 
@@ -292,10 +291,6 @@ export async function updateCollection(slug: string, userId: string, updates: Re
 export async function deleteCollection(slug: string, userId: string) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
-
-  // Reap blobs BEFORE the hard row delete — the record rows (and their
-  // blob_keys) are unrecoverable once the collection cascades away.
-  await cleanupCollectionBlobs(access.collection.id);
 
   await db.delete(collections).where(eq(collections.id, access.collection.id));
   revalidateDashboard(slug);

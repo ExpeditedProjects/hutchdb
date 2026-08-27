@@ -12,12 +12,10 @@
     "db:migrate": "npx drizzle-kit migrate",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:integration": "HUTCH_S3_ENDPOINT=${HUTCH_S3_ENDPOINT:-http://127.0.0.1:9010} HUTCH_S3_BUCKET=${HUTCH_S3_BUCKET:-hutch-test} HUTCH_S3_ACCESS_KEY_ID=${HUTCH_S3_ACCESS_KEY_ID:-hutch-test} HUTCH_S3_SECRET_ACCESS_KEY=${HUTCH_S3_SECRET_ACCESS_KEY:-hutch-test-secret} HUTCH_S3_REGION=${HUTCH_S3_REGION:-auto} vitest run src/lib/storage/seam.integration.test.ts",
     "smoke": "npx tsx scripts/smoke.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "aws4fetch": "^1.0.20",
     "drizzle-orm": "^0.45.2",
     "nanoid": "^5.1.9",
     "next": "16.2.3",
