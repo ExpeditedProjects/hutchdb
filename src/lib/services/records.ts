@@ -566,13 +566,15 @@ export async function transformRecords(slug: string, userId: string, params: {
       if (!FIELD_NAME_RE.test(oldName) || !FIELD_NAME_RE.test(newName)) {
         return { error: "Invalid field name", status: 400 };
       }
-      // The ::text casts are load-bearing: `->` and `-` are overloaded on
-      // (jsonb, text) and (jsonb, integer), so an untyped bind param makes
-      // Postgres reject the statement as ambiguous.
+      // Every ::text cast is load-bearing: `->` and `-` are overloaded on
+      // (jsonb, text)/(jsonb, integer), and jsonb_build_object is VARIADIC
+      // "any" — an untyped bind param in any of these makes Postgres reject
+      // the statement ("could not determine data type of parameter").
+      // Verified against node-postgres, which sends params untyped.
       try {
         const result = await db.execute(
           sql`UPDATE records
-              SET data = (data || jsonb_build_object(${newName}, data->${oldName}::text)) - ${oldName}::text,
+              SET data = (data || jsonb_build_object(${newName}::text, data->${oldName}::text)) - ${oldName}::text,
                   updated_at = now()
               WHERE collection_id = ${collection.id}
               AND data ? ${oldName}
