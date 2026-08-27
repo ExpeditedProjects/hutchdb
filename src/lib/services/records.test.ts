@@ -522,6 +522,35 @@ describe('transformRecords', () => {
     const result = await transformRecords('users', 'user-test', { set_field: { field: 'bad-name', value: 1 } })
     expect(result).toEqual(expect.objectContaining({ status: 400 }))
   })
+
+  it('rejects a call with no operations instead of silently succeeding', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
+    const result = await transformRecords('users', 'user-test', {})
+    expect(result).toEqual(expect.objectContaining({
+      status: 400,
+      error: expect.stringContaining('No transform operation'),
+    }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('casts rename bind params to ::text (jsonb -> and - are overloaded and reject untyped params)', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
+    dbExecute.mockResolvedValue({ rowCount: 2 })
+    const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'comment' } })
+    expect(result).toEqual(expect.objectContaining({ transformed: true, updated: 2 }))
+    const renderedChunks = (dbExecute.mock.calls[0][0] as { queryChunks?: unknown[] }).queryChunks ?? []
+    const sqlText = JSON.stringify(renderedChunks)
+    expect(sqlText).toContain('::text')
+  })
+
+  it('returns a clean error (no SQL text) when the rename query fails', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
+    dbExecute.mockRejectedValue(new Error('Failed query: UPDATE records SET ...'))
+    const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'comment' } })
+    expect(result).toEqual(expect.objectContaining({ status: 500 }))
+    expect((result as { error: string }).error).not.toContain('UPDATE')
+    expect((result as { error: string }).error).not.toContain('query')
+  })
 })
 
 describe('updateRecordStatus', () => {

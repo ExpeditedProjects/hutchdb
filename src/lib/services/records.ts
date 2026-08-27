@@ -519,7 +519,26 @@ export async function transformRecords(slug: string, userId: string, params: {
   const collection = access.collection;
 
   const { remove_fields, rename_fields, set_field } = params;
+
+  const hasOperation =
+    (remove_fields && remove_fields.length > 0) ||
+    (rename_fields && Object.keys(rename_fields).length > 0) ||
+    set_field !== undefined;
+  if (!hasOperation) {
+    return {
+      error: "No transform operation provided — pass rename_fields, remove_fields, or set_field",
+      status: 400,
+    };
+  }
+
   let totalUpdated = 0;
+
+  // Database failures return this clean message instead of surfacing raw
+  // driver/SQL text through the MCP tool output.
+  const transformFailed = {
+    error: "Transform failed while updating records — check the field names and values and try again",
+    status: 500,
+  };
 
   if (remove_fields && remove_fields.length > 0) {
     for (const field of remove_fields) {
@@ -530,11 +549,16 @@ export async function transformRecords(slug: string, userId: string, params: {
     // Remove all fields in a single query using array subtraction
     // Field names are validated by FIELD_NAME_RE (alphanumeric + underscore only)
     const fieldsLiteral = `{${remove_fields.join(",")}}`;
-    const result = await db.execute(
-      sql`UPDATE records SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-          WHERE collection_id = ${collection.id} AND deleted_at IS NULL`
-    );
-    totalUpdated += result.rowCount ?? 0;
+    try {
+      const result = await db.execute(
+        sql`UPDATE records SET data = data - ${fieldsLiteral}::text[], updated_at = now()
+            WHERE collection_id = ${collection.id} AND deleted_at IS NULL`
+      );
+      totalUpdated += result.rowCount ?? 0;
+    } catch (err) {
+      console.error(`transformRecords remove_fields failed for collection ${collection.id}`, err);
+      return transformFailed;
+    }
   }
 
   if (rename_fields && Object.keys(rename_fields).length > 0) {
@@ -542,15 +566,23 @@ export async function transformRecords(slug: string, userId: string, params: {
       if (!FIELD_NAME_RE.test(oldName) || !FIELD_NAME_RE.test(newName)) {
         return { error: "Invalid field name", status: 400 };
       }
-      const result = await db.execute(
-        sql`UPDATE records
-            SET data = (data || jsonb_build_object(${newName}, data->${oldName})) - ${oldName},
-                updated_at = now()
-            WHERE collection_id = ${collection.id}
-            AND data ? ${oldName}
-            AND deleted_at IS NULL`
-      );
-      totalUpdated += result.rowCount ?? 0;
+      // The ::text casts are load-bearing: `->` and `-` are overloaded on
+      // (jsonb, text) and (jsonb, integer), so an untyped bind param makes
+      // Postgres reject the statement as ambiguous.
+      try {
+        const result = await db.execute(
+          sql`UPDATE records
+              SET data = (data || jsonb_build_object(${newName}, data->${oldName}::text)) - ${oldName}::text,
+                  updated_at = now()
+              WHERE collection_id = ${collection.id}
+              AND data ? ${oldName}
+              AND deleted_at IS NULL`
+        );
+        totalUpdated += result.rowCount ?? 0;
+      } catch (err) {
+        console.error(`transformRecords rename_fields failed for collection ${collection.id}`, err);
+        return transformFailed;
+      }
     }
   }
 
@@ -560,26 +592,31 @@ export async function transformRecords(slug: string, userId: string, params: {
       return { error: "Invalid field name", status: 400 };
     }
     const overlay = JSON.stringify({ [field]: value });
-    let result;
-    if (filter && Object.keys(filter).length > 0) {
-      result = await db.execute(
-        sql`UPDATE records
-            SET data = data || ${overlay}::jsonb,
-                updated_at = now()
-            WHERE collection_id = ${collection.id}
-            AND data @> ${JSON.stringify(filter)}::jsonb
-            AND deleted_at IS NULL`
-      );
-    } else {
-      result = await db.execute(
-        sql`UPDATE records
-            SET data = data || ${overlay}::jsonb,
-                updated_at = now()
-            WHERE collection_id = ${collection.id}
-            AND deleted_at IS NULL`
-      );
+    try {
+      let result;
+      if (filter && Object.keys(filter).length > 0) {
+        result = await db.execute(
+          sql`UPDATE records
+              SET data = data || ${overlay}::jsonb,
+                  updated_at = now()
+              WHERE collection_id = ${collection.id}
+              AND data @> ${JSON.stringify(filter)}::jsonb
+              AND deleted_at IS NULL`
+        );
+      } else {
+        result = await db.execute(
+          sql`UPDATE records
+              SET data = data || ${overlay}::jsonb,
+                  updated_at = now()
+              WHERE collection_id = ${collection.id}
+              AND deleted_at IS NULL`
+        );
+      }
+      totalUpdated += result.rowCount ?? 0;
+    } catch (err) {
+      console.error(`transformRecords set_field failed for collection ${collection.id}`, err);
+      return transformFailed;
     }
-    totalUpdated += result.rowCount ?? 0;
   }
 
   // Re-infer schema if fields were added or renamed (skip for remove-only)
