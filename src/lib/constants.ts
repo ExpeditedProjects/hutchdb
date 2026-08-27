@@ -14,10 +14,5 @@ export const SIDEBAR_COLLECTION_LIMIT = 10;
 
 export const MAX_RECORD_SIZE = 1_000_000; // 1MB — enforced at the route and service layers
 
-// File storage tiers — inline content lives inside the record JSON (so it must
-// stay under MAX_RECORD_SIZE); anything bigger or binary goes to blob storage.
-export const MAX_INLINE_FILE_SIZE = 262_144; // 256KB — inline (in-record) file content cap
-export const MAX_FILE_SIZE = 4_194_304; // 4MB — overall file size cap (blob tier)
-
 export const FIELD_NAME_RE = /^[a-zA-Z0-9_]+$/;
 export const MAX_FIELD_NAME_LENGTH = 64;

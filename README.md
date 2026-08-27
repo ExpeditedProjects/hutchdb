@@ -18,7 +18,7 @@ Self-host a structured workspace that Claude Code, Codex, Cursor, and other MCP 
 
 ## What is Hutch?
 
-Hutch Core is a **headless, single-user MCP server** that gives every agent you run the same durable, structured data. Connect Claude Code, Codex, Cursor, VS Code, or another MCP client and they can store, query, and update shared collections of records and files across sessions.
+Hutch Core is a **headless, single-user MCP server** that gives every agent you run the same durable, structured data. Connect Claude Code, Codex, Cursor, VS Code, or another MCP client and they can store, query, and update shared collections of records across sessions.
 
 Collections use schema-optional Postgres JSONB with full-text search, optional validation, and view definitions. There is **no dashboard, no login screen, and no OAuth ceremony** — just an MCP endpoint and a Postgres database you control.
 
@@ -26,7 +26,7 @@ This repo is the OSS engine. If you want people and agents working from the same
 
 ## What can you use it for?
 
-- **Store and share structured data.** Keep research, customer records, product data, files, and working context where every connected agent can find and update them.
+- **Store and share structured data.** Keep research, customer records, product data, and working context where every connected agent can find and update them.
 - **Run repeatable playbooks.** Store the instructions, steps, inputs, outputs, and current status for work that needs to survive beyond one chat.
 - **Hand work between agents.** Let one agent collect records, another process them, and a third report on the result without copying data between tools.
 - **Keep useful work across sessions.** Decisions, backlogs, and open threads remain queryable after the context window closes.
@@ -89,7 +89,7 @@ Collections auto-create on the first write. Start with “save this to Hutch,”
      -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
    ```
 
-   You should see the `hutch_*` tool list (collections, records, schema, views, files).
+   You should see the `hutch_*` tool list (collections, records, schema, views).
 
 <details>
 <summary><b>Running without Docker</b></summary>
@@ -133,7 +133,7 @@ Core is intentionally small. If you want the product layer, run [Hutch Cloud](ht
 
 | | Core (this repo) | [Hutch Cloud](https://app.hutchdb.com) |
 | --- | --- | --- |
-| MCP server (collections, records, schema, views, files) | ✅ | ✅ |
+| MCP server (collections, records, schema, views) | ✅ | ✅ |
 | Self-hosted, single-user, static API key | ✅ | — |
 | Web dashboard, record grid, view editor | — | ✅ |
 | Published views + public pages | — | ✅ |
@@ -147,7 +147,7 @@ Core is intentionally small. If you want the product layer, run [Hutch Cloud](ht
 
 - **Next.js App Router** — one static landing page, one MCP route (`/api/mcp`), one REST seed route (`/api/v1/collections`). Everything else is deleted.
 - **Drizzle + Postgres** — records stored as JSONB, queried via containment operators and full-text search.
-- **MCP server** — collection tools (including per-collection stats), record tools (store/query/search/update/delete/status/transform plus CSV/JSON export and import), schema tools (describe/infer/update), view tools, and file tools (small text inline; binary or >256KB via S3-compatible storage with the optional `HUTCH_S3_*` env vars). Queries support filter operators (`$gt`/`$gte`/`$lt`/`$lte`/`$ne`/`$in`/`$nin`/`$exists`/`$contains`), field projection, and count/min/max/distinct/sum/avg aggregations.
+- **MCP server** — collection tools (including per-collection stats), record tools (store/query/search/update/delete/status/transform plus CSV/JSON export and import), schema tools (describe/infer/update), and view tools. Queries support filter operators (`$gt`/`$gte`/`$lt`/`$lte`/`$ne`/`$in`/`$nin`/`$exists`/`$contains`), field projection, and count/min/max/distinct/sum/avg aggregations.
 - **Auth seam** (`src/lib/auth/seam.ts`) — the only place auth lives: bearer-key check when `HUTCH_API_KEY` is set, singleton context otherwise.
 - **Singleton bootstrap** (`src/lib/auth/singleton.ts`) — one user, one personal org, created lazily on first request.
 
