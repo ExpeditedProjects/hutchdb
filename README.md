@@ -1,37 +1,56 @@
 <!-- Banner slot: drop a Plex Terminal banner at assets/banner.png and swap this in:
-<p align="center"><img src="assets/banner.png" alt="Hutch" width="100%" style="border-radius: 8px;" /></p>
+<p align="center"><img src="assets/banner.png" alt="HutchDB" width="100%" style="border-radius: 8px;" /></p>
 -->
 
-<h1 align="center">Hutch</h1>
+<h1 align="center">HutchDB</h1>
 
-<p align="center"><b>Put every AI agent on the same data.</b><br />
-Self-host a structured workspace that Claude Code, Codex, Cursor, and other MCP clients can read and update together.</p>
+<p align="center"><b>A database for AI agents. No schema, SQL, or structure required.</b><br />
+A structured workspace that Claude Code, Codex, Cursor, Hermes, Claw, Grokbot, and other MCP clients can read and update together. Open source.</p>
 
 <p align="center">
   <a href="https://hutchdb.com"><img src="https://img.shields.io/badge/Website-hutchdb.com-fbbf24" alt="Website" /></a>&nbsp;
-  <a href="https://app.hutchdb.com"><img src="https://img.shields.io/badge/Hutch-Cloud-fbbf24" alt="Hutch Cloud" /></a>&nbsp;
+  <a href="https://app.hutchdb.com"><img src="https://img.shields.io/badge/HutchDB-Cloud-fbbf24" alt="HutchDB Cloud" /></a>&nbsp;
   <a href="https://modelcontextprotocol.io"><img src="https://img.shields.io/badge/MCP-compatible-blue" alt="MCP" /></a>&nbsp;
   <a href="LICENSE"><img src="https://img.shields.io/github/license/ExpeditedProjects/hutchdb" alt="License" /></a>
 </p>
 
 ---
 
-## What is Hutch?
+## What is HutchDB?
 
-Hutch Core is a **headless, single-user MCP server** that gives every agent you run the same durable, structured data. Connect Claude Code, Codex, Cursor, VS Code, or another MCP client and they can store, query, and update shared collections of records across sessions.
+HutchDB Core is a **headless, single-user MCP server** that gives every agent you run the same durable, structured data. Connect Claude Code, Codex, Cursor, VS Code, or another MCP client and they can store, query, and update shared collections of records across sessions.
 
 Collections use schema-optional Postgres JSONB with full-text search, optional validation, and view definitions. There is **no dashboard, no login screen, and no OAuth ceremony** — just an MCP endpoint and a Postgres database you control.
 
-This repo is the OSS engine. If you want people and agents working from the same visual workspace, [Hutch Cloud](https://app.hutchdb.com) adds web views, published pages, social login, and organization sharing. See [Core vs Cloud](#hutch-core-vs-hutch-cloud) below.
+This repo is the OSS engine. If you want people and agents working from the same visual workspace, [HutchDB Cloud](https://app.hutchdb.com) adds web views, published pages, social login, and organization sharing. See [Core vs Cloud](#hutchdb-core-vs-hutchdb-cloud) below.
 
 ## What can you use it for?
 
-- **Store and share structured data.** Keep research, customer records, product data, and working context where every connected agent can find and update them.
-- **Run repeatable playbooks.** Store the instructions, steps, inputs, outputs, and current status for work that needs to survive beyond one chat.
-- **Hand work between agents.** Let one agent collect records, another process them, and a third report on the result without copying data between tools.
-- **Keep useful work across sessions.** Decisions, backlogs, and open threads remain queryable after the context window closes.
+The default home for agent working data is a markdown file: a `TODO.md`, a notes directory, a memory file full of prose. That works for one agent taking notes to itself. It breaks down the moment you want to filter ("open bugs above severity 2"), aggregate ("pipeline value by stage"), or have two agents update the same list without overwriting each other.
 
-Collections auto-create on the first write. Start with “save this to Hutch,” then query the same records from any connected agent.
+HutchDB holds the same information as real records: individually addressable, queryable, and safe for multiple agents to read and update at once. That makes it fit anywhere an agent produces or uses structured data that needs to outlast one chat. Some patterns people run on it:
+
+**Research that accumulates.** Customer interviews, competitor teardowns, scraped listings, literature reviews. Each session adds records to a collection; any later session can query the whole set.
+
+> "Save these five competitor pricing pages to `competitor-pricing`, then tell me who changed since last month."
+
+**Trackers you'd otherwise keep in a spreadsheet.** Bug reports, content calendars, job applications, inventory, reading lists. The difference from a spreadsheet: your agents can query and update the records mid-task.
+
+> "Log this bug to `bug-reports` with severity high, then list everything still open."
+
+**Pipelines with handoffs between agents.** One agent collects records, another processes them, a third reports on the results. A status field on each record marks where it is in the pipeline, so nothing gets copied between tools.
+
+> "Pull every `leads` record with status `new`, enrich each one, and set its status to `ready-for-outreach`."
+
+**Working state for long-running projects.** Decisions, open questions, and backlog items stay queryable after the context window closes. A new session starts by asking what came before instead of being re-briefed.
+
+> "What did we decide about the pricing page last week, and what's still unresolved?"
+
+**Repeatable playbooks.** Store the instructions, inputs, and current status for recurring jobs (weekly reports, release checklists, content production) so any agent can pick one up and run it.
+
+> "Run the weekly-metrics playbook and store the results in `weekly-reports`."
+
+None of this needs schema design up front: collections auto-create on the first write and records are arbitrary JSON. Start with "save this to HutchDB," then query the same records from any connected agent.
 
 ## Quick Start
 
@@ -75,7 +94,7 @@ Collections auto-create on the first write. Start with “save this to Hutch,”
 
 4. **Use it.** Collections auto-create on first write — there is no setup step. Just talk to your agent:
 
-   > "Save these launch tasks to Hutch."
+   > "Save these launch tasks to HutchDB."
    > "What did we store about the pricing research last week?"
    > "Query the bug-reports collection for anything mentioning timeouts."
 
@@ -127,11 +146,11 @@ Agent:  Querying `customer-interviews`... 3 records match: Dana R.,
 
 Records are arbitrary JSON in Postgres JSONB — queryable via containment filters, Mongo-style operators (`$gt`, `$in`, `$exists`, `$contains`, …), and full-text search, with optional schemas when you want structure enforced. Collections export and import as CSV or JSON when data needs to move.
 
-## Hutch Core vs Hutch Cloud
+## HutchDB Core vs HutchDB Cloud
 
-Core is intentionally small. If you want the product layer, run [Hutch Cloud](https://app.hutchdb.com) — or fork Core and build your own.
+Core is intentionally small. If you want the product layer, run [HutchDB Cloud](https://app.hutchdb.com) — or fork Core and build your own.
 
-| | Core (this repo) | [Hutch Cloud](https://app.hutchdb.com) |
+| | Core (this repo) | [HutchDB Cloud](https://app.hutchdb.com) |
 | --- | --- | --- |
 | MCP server (collections, records, schema, views) | ✅ | ✅ |
 | Self-hosted, single-user, static API key | ✅ | — |
@@ -154,7 +173,7 @@ Core is intentionally small. If you want the product layer, run [Hutch Cloud](ht
 ## Contributing
 
 - **Found a bug?** [Open an issue](https://github.com/ExpeditedProjects/hutchdb/issues) with repro steps.
-- **Want to improve Core?** PRs welcome — contributors sign a CLA so the maintainer can dual-license into Hutch Cloud. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md).
+- **Want to improve Core?** PRs welcome — contributors sign a CLA so the maintainer can dual-license into HutchDB Cloud. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md).
 - **Feedback or ideas?** Issues are the front door; tell us what you're building.
 
 <details>
