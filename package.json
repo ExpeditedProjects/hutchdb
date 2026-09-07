@@ -41,7 +41,7 @@
     "happy-dom": "^20.14.0",
     "tailwindcss": "^4",
     "tsx": "^4.23.13",
-    "typescript": "^5",
+    "typescript": "^7",
     "vite-tsconfig-paths": "^6.1.1",
     "vitest": "^4.1.4"
   }
