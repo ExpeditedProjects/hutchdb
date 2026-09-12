@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { selectLimit, selectOffset, dbExecute } = vi.hoisted(() => ({
+const { selectLimit, selectOffset, dbExecute, orderByCapture } = vi.hoisted(() => ({
   selectLimit: vi.fn(),
   selectOffset: vi.fn(),
   dbExecute: vi.fn(),
+  orderByCapture: vi.fn(),
 }))
 
 // Drizzle's query builder is chainable: each clause returns an object with
@@ -16,7 +17,10 @@ function buildChain(): any {
     where: vi.fn(() => chain),
     innerJoin: vi.fn(() => chain),
     leftJoin: vi.fn(() => chain),
-    orderBy: vi.fn(() => chain),
+    orderBy: vi.fn((clause) => {
+      orderByCapture(clause)
+      return chain
+    }),
     limit: selectLimit,
   }
   return chain
@@ -324,6 +328,34 @@ describe('queryRecords field projection', () => {
 
     const result = await queryRecords({ collectionId: 1 })
     expect('records' in result && result.records[0].data).toEqual({ a: 1, b: 2 })
+  })
+})
+
+describe('queryRecords sort', () => {
+  it('sorts data fields as jsonb values so numbers compare numerically, not as text', async () => {
+    selectLimit.mockReturnValue({ offset: selectOffset })
+    selectOffset.mockResolvedValue([])
+
+    await queryRecords({ collectionId: 1, sort: '-price' })
+
+    const { sql: rendered, params } = render(orderByCapture.mock.calls[0][0])
+    // `->` keeps jsonb typing (numeric comparison); `->>` casts to text and
+    // sorts numbers lexicographically ("12" < "3" < "5").
+    expect(rendered).toContain('->')
+    expect(rendered).not.toContain('->>')
+    expect(rendered.toLowerCase()).toContain('desc nulls last')
+    expect(params).toEqual(['price'])
+  })
+
+  it('ascending data-field sort also uses jsonb comparison', async () => {
+    selectLimit.mockReturnValue({ offset: selectOffset })
+    selectOffset.mockResolvedValue([])
+
+    await queryRecords({ collectionId: 1, sort: 'price' })
+
+    const { sql: rendered } = render(orderByCapture.mock.calls[0][0])
+    expect(rendered).not.toContain('->>')
+    expect(rendered.toLowerCase()).toContain('asc nulls last')
   })
 })
 
