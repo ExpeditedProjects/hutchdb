@@ -392,9 +392,11 @@ export async function queryRecords(params: QueryParams) {
     } else if (field === "updated_at") {
       orderBy = descending ? desc(records.updatedAt) : asc(records.updatedAt);
     } else if (/^[a-zA-Z0-9_]+$/.test(field)) {
+      // `->` keeps jsonb typing so numbers sort numerically; `->>` would cast
+      // to text and sort them lexicographically ("12" < "3" < "5").
       orderBy = descending
-        ? sql`${records.data}->>${field} DESC NULLS LAST`
-        : sql`${records.data}->>${field} ASC NULLS LAST`;
+        ? sql`${records.data}->${field} DESC NULLS LAST`
+        : sql`${records.data}->${field} ASC NULLS LAST`;
     } else {
       orderBy = desc(records.createdAt);
     }
