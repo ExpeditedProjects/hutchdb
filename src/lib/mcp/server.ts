@@ -122,7 +122,15 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         throw err;
       }
     };
-    return (server.registerTool as (n: string, c: unknown, h: unknown) => unknown)(name, config, wrapped);
+    // The connectors-directory review reads title and readOnlyHint from
+    // annotations and flags them as missing otherwise, so mirror the
+    // top-level title and make the spec-default readOnlyHint explicit.
+    const cfg = config as { title?: string; annotations?: Record<string, unknown> };
+    const enriched = {
+      ...cfg,
+      annotations: { title: cfg.title, readOnlyHint: false, ...cfg.annotations },
+    };
+    return (server.registerTool as (n: string, c: unknown, h: unknown) => unknown)(name, enriched, wrapped);
   }) as McpServer["registerTool"];
 
   registerTool(
