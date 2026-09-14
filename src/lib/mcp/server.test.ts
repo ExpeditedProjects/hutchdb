@@ -105,6 +105,22 @@ describe('createMcpServer tool registration', () => {
       expect((title as string).length, `expected tool ${name} to have a non-empty title`).toBeGreaterThan(0)
     }
   })
+
+  it('mirrors the title into annotations and sets an explicit readOnlyHint on every tool', () => {
+    // The connectors-directory review reads title and readOnlyHint from
+    // annotations; a missing readOnlyHint is flagged even though the MCP
+    // spec defaults it to false.
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.size).toBeGreaterThan(0)
+    for (const [name, config] of registeredConfigs) {
+      const annotations = (config.annotations ?? {}) as { title?: unknown; readOnlyHint?: unknown }
+      // Presence, not equality: the enrichment mirrors config.title but a
+      // tool may legitimately set its own annotations.title (spread lets it win).
+      expect(typeof annotations.title, `expected ${name} to expose annotations.title`).toBe('string')
+      expect((annotations.title as string).length, `expected ${name} annotations.title to be non-empty`).toBeGreaterThan(0)
+      expect(typeof annotations.readOnlyHint, `expected ${name} to set an explicit readOnlyHint`).toBe('boolean')
+    }
+  })
 })
 
 describe('tool surface snapshot', () => {
@@ -136,23 +152,23 @@ describe('tool surface snapshot', () => {
 
     expect(surface).toEqual([
       { name: 'hutch_collection_stats', title: 'Collection Stats', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_create_view', title: 'Create View', destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'slug', 'sort', 'type'] },
-      { name: 'hutch_delete_collection', title: 'Delete Collection', destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_delete_record', title: 'Delete Record', destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
+      { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'slug', 'sort', 'type'] },
+      { name: 'hutch_delete_collection', title: 'Delete Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_delete_record', title: 'Delete Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
       { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
       { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_import_records', title: 'Import Records', destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict'] },
-      { name: 'hutch_infer_schema', title: 'Infer Schema', destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict'] },
+      { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
       { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'search', 'slug', 'sort', 'time_bucket'] },
       { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
-      { name: 'hutch_set_record_status', title: 'Set Record Status', destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
-      { name: 'hutch_store_records', title: 'Store Records', destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records'] },
-      { name: 'hutch_transform_records', title: 'Transform Records', destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
-      { name: 'hutch_update_collection', title: 'Update Collection', destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
-      { name: 'hutch_update_record', title: 'Update Record', destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
-      { name: 'hutch_update_schema', title: 'Update Schema', destructiveHint: true, idempotentHint: true, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
+      { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
+      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records'] },
+      { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
+      { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
+      { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
+      { name: 'hutch_update_schema', title: 'Update Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
     ])
   })
 })

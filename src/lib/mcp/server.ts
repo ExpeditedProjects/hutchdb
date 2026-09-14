@@ -1,4 +1,4 @@
-import { McpServer } from "@modelcontextprotocol/server";
+import { McpServer, type ToolAnnotations } from "@modelcontextprotocol/server";
 import { DrizzleQueryError } from "drizzle-orm";
 import { z } from "zod";
 import * as collectionService from "@/lib/services/collections";
@@ -122,7 +122,18 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         throw err;
       }
     };
-    return (server.registerTool as (n: string, c: unknown, h: unknown) => unknown)(name, config, wrapped);
+    // The connectors-directory review reads title and readOnlyHint from
+    // annotations and flags them as missing otherwise, so mirror the
+    // top-level title and make the spec-default readOnlyHint explicit.
+    // Explicit per-tool annotations win via spread order.
+    const cfg = config as { title?: string; annotations?: ToolAnnotations };
+    const annotations: ToolAnnotations = {
+      ...(cfg.title !== undefined && { title: cfg.title }),
+      readOnlyHint: false,
+      ...cfg.annotations,
+    };
+    const enriched = { ...cfg, annotations };
+    return (server.registerTool as (n: string, c: unknown, h: unknown) => unknown)(name, enriched, wrapped);
   }) as McpServer["registerTool"];
 
   registerTool(
