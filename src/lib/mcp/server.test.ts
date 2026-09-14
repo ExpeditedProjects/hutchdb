@@ -114,7 +114,10 @@ describe('createMcpServer tool registration', () => {
     expect(registeredConfigs.size).toBeGreaterThan(0)
     for (const [name, config] of registeredConfigs) {
       const annotations = (config.annotations ?? {}) as { title?: unknown; readOnlyHint?: unknown }
-      expect(annotations.title, `expected ${name} annotations.title to mirror config.title`).toBe(config.title)
+      // Presence, not equality: the enrichment mirrors config.title but a
+      // tool may legitimately set its own annotations.title (spread lets it win).
+      expect(typeof annotations.title, `expected ${name} to expose annotations.title`).toBe('string')
+      expect((annotations.title as string).length, `expected ${name} annotations.title to be non-empty`).toBeGreaterThan(0)
       expect(typeof annotations.readOnlyHint, `expected ${name} to set an explicit readOnlyHint`).toBe('boolean')
     }
   })
