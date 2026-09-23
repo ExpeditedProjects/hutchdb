@@ -1,0 +1,28 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "com.hutchdb/hutchdb",
+  "title": "HutchDB",
+  "description": "Store, query, and update structured data from any AI agent",
+  "version": "1.0.0",
+  "websiteUrl": "https://hutchdb.com",
+  "repository": {
+    "url": "https://github.com/ExpeditedProjects/hutchdb",
+    "source": "github"
+  },
+  "icons": [
+    {
+      "src": "https://hutchdb.com/h-icon.png",
+      "mimeType": "image/png"
+    },
+    {
+      "src": "https://hutchdb.com/favicon.svg",
+      "mimeType": "image/svg+xml"
+    }
+  ],
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://app.hutchdb.com/api/mcp"
+    }
+  ]
+}
