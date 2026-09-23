@@ -1,7 +1,9 @@
 #!/bin/sh
 set -e
 
-: "${HUTCH_DATABASE_URL:?HUTCH_DATABASE_URL is required}"
+# DATABASE_URL is accepted as a fallback — it's the name most hosts inject.
+export HUTCH_DATABASE_URL="${HUTCH_DATABASE_URL:-$DATABASE_URL}"
+: "${HUTCH_DATABASE_URL:?HUTCH_DATABASE_URL (or DATABASE_URL) is required}"
 
 node scripts/docker-migrate.js
 

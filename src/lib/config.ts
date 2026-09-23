@@ -5,6 +5,7 @@ const env = z
     NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 
     HUTCH_DATABASE_URL: z.string().optional(),
+    DATABASE_URL: z.string().optional(),
     HUTCH_BASE_URL: z.string().optional(),
   })
   .parse(process.env)
@@ -16,7 +17,7 @@ export const config = {
   isTest: env.NODE_ENV === 'test',
 
   db: {
-    url: env.HUTCH_DATABASE_URL,
+    url: env.HUTCH_DATABASE_URL || env.DATABASE_URL,
   },
 
   baseUrl: env.HUTCH_BASE_URL ?? 'http://localhost:3000',

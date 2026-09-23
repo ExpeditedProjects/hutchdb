@@ -8,6 +8,6 @@ export default defineConfig({
   out: "./drizzle",
   dialect: "postgresql",
   dbCredentials: {
-    url: process.env.HUTCH_DATABASE_URL!,
+    url: (process.env.HUTCH_DATABASE_URL || process.env.DATABASE_URL)!,
   },
 });
