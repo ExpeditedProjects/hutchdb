@@ -6,7 +6,7 @@ Hutch is a standard Next.js + Postgres app. Nothing forces a specific host — p
 
 | Variable | Required | Notes |
 |---|---|---|
-| `HUTCH_DATABASE_URL` | ✅ | Postgres connection string. |
+| `HUTCH_DATABASE_URL` | ✅ | Postgres connection string. Falls back to `DATABASE_URL` if unset (the name Vercel/Neon and most hosts inject). |
 | `HUTCH_ADMIN_EMAIL` | ✅ | Identifies the singleton admin user in the database. |
 | `HUTCH_ADMIN_PASSWORD` | ✅ | The password for the web UI login. |
 | `HUTCH_SESSION_SECRET` | ✅ | 32+ random bytes for signing the session cookie. Generate with `openssl rand -hex 32`. |
