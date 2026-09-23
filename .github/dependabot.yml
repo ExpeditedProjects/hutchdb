@@ -9,6 +9,11 @@ updates:
         update-types:
           - "minor"
           - "patch"
+    ignore:
+      # eslint-config-next's plugins (react, import, jsx-a11y) don't support
+      # ESLint 10 yet — it crashes on load. Drop once they do.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"

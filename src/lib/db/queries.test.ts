@@ -11,8 +11,10 @@ const { selectLimit, selectOffset, dbExecute, orderByCapture } = vi.hoisted(() =
 // the next set of clauses. We mock it as a single recursive proxy so every
 // chain ultimately resolves to the same `selectLimit` mock — tests don't
 // have to care about the exact shape of the chain.
-function buildChain(): any {
-  const chain: any = {
+type MockChain = Record<string, unknown>
+
+function buildChain(): MockChain {
+  const chain: MockChain = {
     from: vi.fn(() => chain),
     where: vi.fn(() => chain),
     innerJoin: vi.fn(() => chain),

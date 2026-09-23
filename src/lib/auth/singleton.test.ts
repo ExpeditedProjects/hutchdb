@@ -7,15 +7,20 @@ const { userReturning, orgReturning, memberOnConflict, selectLimit } = vi.hoiste
   selectLimit: vi.fn(),
 }))
 
-function buildSelectChain(): any {
-  const chain: any = {
+type MockChain = Record<string, unknown>
+
+function buildSelectChain(): MockChain {
+  const chain: MockChain = {
     from: vi.fn(() => chain),
     where: vi.fn(() => chain),
     innerJoin: vi.fn(() => chain),
     leftJoin: vi.fn(() => chain),
     orderBy: vi.fn(() => chain),
     limit: selectLimit,
-    then: (onFulfilled: any, onRejected: any) =>
+    then: (
+      onFulfilled?: (value: unknown) => unknown,
+      onRejected?: (reason: unknown) => unknown,
+    ) =>
       Promise.resolve(selectLimit()).then(onFulfilled, onRejected),
   }
   return chain
