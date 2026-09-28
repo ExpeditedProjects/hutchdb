@@ -14,6 +14,10 @@ updates:
       # ESLint 10 yet — it crashes on load. Drop once they do.
       - dependency-name: "eslint"
         update-types: ["version-update:semver-major"]
+      # typescript-eslint doesn't support TypeScript 7 yet — lint fails on load.
+      # Drop once it does.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: "github-actions"
     directory: "/"
