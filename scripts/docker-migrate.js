@@ -9,7 +9,7 @@ const { Client } = require("pg");
 const MIGRATIONS_DIR = path.join(__dirname, "..", "drizzle");
 
 async function main() {
-  const client = new Client({ connectionString: process.env.HUTCH_DATABASE_URL });
+  const client = new Client({ connectionString: process.env.HUTCH_DATABASE_URL || process.env.DATABASE_URL });
   await client.connect();
 
   await client.query(`CREATE SCHEMA IF NOT EXISTS drizzle`);

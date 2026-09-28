@@ -4,7 +4,7 @@ import { migrate } from "drizzle-orm/node-postgres/migrator";
 import { sql } from "drizzle-orm";
 
 const pool = new Pool({
-  connectionString: process.env.HUTCH_DATABASE_URL!,
+  connectionString: process.env.HUTCH_DATABASE_URL || process.env.DATABASE_URL,
 });
 
 const db = drizzle(pool);
