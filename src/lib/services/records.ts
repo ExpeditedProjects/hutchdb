@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { collections, records, collectionMembers } from "@/lib/db/schema";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, QueryParams, notDeleted } from "@/lib/db/queries";
+import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, QueryParams, notDeleted } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
@@ -26,6 +26,29 @@ async function reinferCollectionSchema(collectionId: number, existingSchema: Col
 function shouldReinfer(schema: CollectionSchema | null): boolean {
   if (!schema?.lastInferredAt) return true;
   return Date.now() - new Date(schema.lastInferredAt).getTime() > REINFER_COOLDOWN_MS;
+}
+
+/**
+ * Resolve a write's raw collection argument to an existing collection.
+ * Auto-create stores name = titleCase(raw) and slug = slugify(raw) + random
+ * suffix, so a repeat write of "my_tasks" must match the stored "My Tasks";
+ * exact name and exact slug alone never would.
+ */
+async function findCollectionForWrite(collectionName: string, organizationId: string) {
+  return (
+    (await findCollectionByNameInOrg(collectionName, organizationId)) ??
+    (await findCollectionByNameInsensitiveInOrg([collectionName, titleCase(collectionName)], organizationId)) ??
+    (await findCollectionBySlugInOrg(slugify(collectionName), organizationId))
+  );
+}
+
+/** Unique violation on (organization_id, name). drizzle wraps pg errors in `cause`. */
+function isCollectionNameConflict(err: unknown): boolean {
+  for (let e: unknown = err, depth = 0; e && depth < 3; e = (e as { cause?: unknown }).cause, depth++) {
+    const pg = e as { code?: string; constraint?: string };
+    if (pg.code === "23505" && pg.constraint === "idx_collections_org_name") return true;
+  }
+  return false;
 }
 
 export async function createRecords(userId: string, organizationId: string, params: {
@@ -72,21 +95,25 @@ export async function createRecords(userId: string, organizationId: string, para
   }
 
   // Find or create collection within the caller's org
-  let collection = await findCollectionByNameInOrg(collectionName, organizationId);
-  if (!collection) {
-    const slug = slugify(collectionName);
-    collection = await findCollectionBySlugInOrg(slug, organizationId);
-  }
+  let collection = await findCollectionForWrite(collectionName, organizationId);
 
   let collectionWasCreated = false;
   if (!collection) {
-    collection = await createCollectionWithOwner({
-      organizationId,
-      ownerUserId: userId,
-      name: titleCase(collectionName),
-      slug: uniqueSlug(collectionName),
-    });
-    collectionWasCreated = true;
+    try {
+      collection = await createCollectionWithOwner({
+        organizationId,
+        ownerUserId: userId,
+        name: titleCase(collectionName),
+        slug: uniqueSlug(collectionName),
+      });
+      collectionWasCreated = true;
+    } catch (err) {
+      // A concurrent write created the same name between our lookup and
+      // insert — use the winner's collection instead of surfacing a 500.
+      if (!isCollectionNameConflict(err)) throw err;
+      collection = await findCollectionForWrite(collectionName, organizationId);
+      if (!collection) throw err;
+    }
   }
 
   const uniqueKey = (collection.uniqueKey as string[]) || [];

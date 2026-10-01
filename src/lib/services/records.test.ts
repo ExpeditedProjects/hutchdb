@@ -50,6 +50,7 @@ vi.mock('@/lib/db', () => ({
 
 vi.mock('@/lib/db/queries', () => ({
   findCollectionByNameInOrg: vi.fn(),
+  findCollectionByNameInsensitiveInOrg: vi.fn(),
   findCollectionBySlugInOrg: vi.fn(),
   findAccessibleCollectionBySlug: vi.fn(),
   createCollectionWithOwner: vi.fn(),
@@ -93,6 +94,7 @@ import {
 } from './records'
 import {
   findCollectionByNameInOrg,
+  findCollectionByNameInsensitiveInOrg,
   findCollectionBySlugInOrg,
   findAccessibleCollectionBySlug,
   createCollectionWithOwner,
@@ -127,6 +129,9 @@ const mockOrg = {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  // clearAllMocks keeps implementations; reset this one so a resolved
+  // collection from one test can't leak into an auto-create test.
+  vi.mocked(findCollectionByNameInsensitiveInOrg).mockResolvedValue(undefined as never)
 })
 
 describe('createRecords', () => {
@@ -172,6 +177,67 @@ describe('createRecords', () => {
     })
 
     expect(result).toEqual(expect.objectContaining({ count: 3 }))
+  })
+
+  describe('collection name resolution (regression: duplicate auto-create on repeat writes)', () => {
+    // Auto-create stores name = titleCase(raw) and slug = slugify(raw) + a
+    // random suffix, so neither exact-name nor slug lookup matches a repeat
+    // write with the same raw name (e.g. "my_tasks" -> stored "My Tasks").
+    const myTasks = { ...baseCollection, name: 'My Tasks', slug: 'my-tasks-1a2b3c4d' }
+
+    it('reuses an existing collection whose stored name is the titleCased form of the argument', async () => {
+      vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
+      vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
+      vi.mocked(findCollectionByNameInsensitiveInOrg).mockResolvedValue(myTasks)
+      insertReturning.mockResolvedValue([{ id: 2, data: { n: 2 } }])
+
+      const result = await createRecords('user-test', 'org-test', { collection: 'my_tasks', data: { n: 2 } })
+
+      expect(createCollectionWithOwner).not.toHaveBeenCalled()
+      expect(findCollectionByNameInsensitiveInOrg).toHaveBeenCalledWith(
+        expect.arrayContaining(['my_tasks', 'My Tasks']),
+        'org-test',
+      )
+      expect(result).toEqual(expect.objectContaining({
+        action: 'created',
+        collection: { name: 'My Tasks', slug: 'my-tasks-1a2b3c4d' },
+      }))
+    })
+
+    it('recovers when a concurrent request created the same name first (23505 on idx_collections_org_name)', async () => {
+      vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
+      vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
+      // Miss on the first lookup pass, hit on the re-fetch after the conflict.
+      vi.mocked(findCollectionByNameInsensitiveInOrg)
+        .mockResolvedValueOnce(undefined as never)
+        .mockResolvedValue(myTasks)
+      // drizzle-orm 0.45 wraps driver errors; the pg error rides on `cause`.
+      const pgErr = Object.assign(new Error('duplicate key value violates unique constraint "idx_collections_org_name"'), {
+        code: '23505',
+        constraint: 'idx_collections_org_name',
+      })
+      vi.mocked(createCollectionWithOwner).mockRejectedValue(Object.assign(new Error('Failed query: insert into "collections"'), { cause: pgErr }))
+      insertReturning.mockResolvedValue([{ id: 1, data: { n: 1 } }])
+
+      const result = await createRecords('user-test', 'org-test', { collection: 'my_tasks', data: { n: 1 } })
+
+      expect(result).toEqual(expect.objectContaining({
+        action: 'created',
+        collection: { name: 'My Tasks', slug: 'my-tasks-1a2b3c4d' },
+      }))
+      // Not newly created by this request, so no auto-view seeding.
+      expect(seedAutoViews).not.toHaveBeenCalled()
+    })
+
+    it('rethrows collection-create errors that are not a name unique violation', async () => {
+      vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
+      vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
+      vi.mocked(createCollectionWithOwner).mockRejectedValue(new Error('connection terminated'))
+
+      await expect(
+        createRecords('user-test', 'org-test', { collection: 'my_tasks', data: { n: 1 } }),
+      ).rejects.toThrow('connection terminated')
+    })
   })
 
   describe('auto-seed views on collection auto-create', () => {
