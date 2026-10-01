@@ -562,6 +562,85 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     });
   });
 
+  // ── e2. repeat writes resolve the auto-created collection by name ─────────
+  //
+  // Regression: auto-create stores name = titleCase(raw) and slug =
+  // slugify(raw) + random suffix, so a second write with the same raw
+  // argument (e.g. "my_tasks") missed both the exact-name and the slug
+  // lookup, tried to create again, and hit the idx_collections_org_name
+  // unique violation — a 500 on every agent's second snake_case write.
+
+  describe("createRecords collection name resolution", () => {
+    async function collectionRows() {
+      return testDb.select().from(schema.collections).where(eq(schema.collections.organizationId, ORG_ID));
+    }
+
+    async function store(collection: string, data: Record<string, unknown>) {
+      return ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, data })) as {
+        collection: { name: string; slug: string };
+      };
+    }
+
+    it("snake_case name: second write to 'my_tasks' reuses the auto-created collection", async () => {
+      const first = await store("my_tasks", { n: 1 });
+      expect(first.collection.name).toBe("My Tasks");
+
+      const second = await store("my_tasks", { n: 2 });
+      expect(second.collection.slug).toBe(first.collection.slug);
+
+      expect(await collectionRows()).toHaveLength(1);
+      expect(await rawData(first.collection.slug)).toEqual([{ n: 1 }, { n: 2 }]);
+    });
+
+    it("lowercase name: 'tasks' resolves to an existing 'Tasks' collection", async () => {
+      const first = await store("Tasks", { n: 1 });
+      expect(first.collection.name).toBe("Tasks");
+
+      const second = await store("tasks", { n: 2 });
+      expect(second.collection.slug).toBe(first.collection.slug);
+
+      expect(await collectionRows()).toHaveLength(1);
+      expect(await rawData(first.collection.slug)).toHaveLength(2);
+    });
+
+    it("mixed-case and separator variants all resolve to the same collection", async () => {
+      const first = await store("My_Reading_List", { n: 0 });
+      for (const [i, variant] of ["my_reading_list", "MY_READING_LIST", "my reading list", "my-reading-list", "My Reading List"].entries()) {
+        const res = await store(variant, { n: i + 1 });
+        expect(res.collection.slug).toBe(first.collection.slug);
+      }
+      expect(await collectionRows()).toHaveLength(1);
+      expect(await rawData(first.collection.slug)).toHaveLength(6);
+    });
+
+    it("importRecords twice into the same snake_case collection appends to one collection", async () => {
+      const a = ok(
+        await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "import_tasks", format: "json", content: '[{"n":1}]' }),
+      ) as { collection: { slug: string } };
+      const b = ok(
+        await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "import_tasks", format: "json", content: '[{"n":2}]' }),
+      ) as { collection: { slug: string } };
+      expect(b.collection.slug).toBe(a.collection.slug);
+      expect(await rawData(a.collection.slug)).toEqual([{ n: 1 }, { n: 2 }]);
+    });
+
+    it("concurrent first writes to a new name all succeed into one collection", async () => {
+      // allSettled (not all) so every in-flight write finishes before the
+      // next test's TRUNCATE — an early rejection would otherwise deadlock it.
+      const settled = await Promise.allSettled(
+        Array.from({ length: 5 }, (_, i) => recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "race_coll", data: { i } })),
+      );
+      const rejected = settled.filter((s): s is PromiseRejectedResult => s.status === "rejected");
+      expect(rejected.map((r) => String(r.reason?.cause ?? r.reason))).toEqual([]);
+      const results = settled.map((s) => (s as PromiseFulfilledResult<unknown>).value);
+      const slugs = results.map((r) => (ok(r) as { collection: { slug: string } }).collection.slug);
+      expect(new Set(slugs).size).toBe(1);
+      expect(await collectionRows()).toHaveLength(1);
+      const [coll] = await collectionRows();
+      expect(await rawData(coll.slug)).toHaveLength(5);
+    });
+  });
+
   // ── f. export → import round trip ─────────────────────────────────────────
 
   it("exportRecords CSV round-trips through importRecords via the real DB", async () => {

@@ -1,7 +1,7 @@
 import { cache } from "react";
 import { db } from "./index";
 import { collections, records, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, desc, asc, isNull, SQL } from "drizzle-orm";
+import { eq, and, sql, desc, asc, isNull, inArray, SQL } from "drizzle-orm";
 import { FIELD_NAME_RE } from "@/lib/constants";
 import { isPlainObject } from "@/lib/validation";
 
@@ -139,6 +139,25 @@ export async function findCollectionByNameInOrg(name: string, organizationId: st
     .select()
     .from(collections)
     .where(and(eq(collections.name, name), eq(collections.organizationId, organizationId)))
+    .limit(1);
+  return collection;
+}
+
+/**
+ * Case-insensitive name lookup against any of the candidate names. Used to
+ * resolve a write's raw collection argument ("my_tasks", "tasks") to a
+ * collection stored under its normalized name ("My Tasks", "Tasks").
+ * idx_collections_org_name is case-sensitive, so several rows can match;
+ * the oldest wins for a stable answer.
+ */
+export async function findCollectionByNameInsensitiveInOrg(names: string[], organizationId: string) {
+  const lowered = [...new Set(names.map((n) => n.toLowerCase()))];
+  if (lowered.length === 0) return undefined;
+  const [collection] = await db
+    .select()
+    .from(collections)
+    .where(and(eq(collections.organizationId, organizationId), inArray(sql`lower(${collections.name})`, lowered)))
+    .orderBy(asc(collections.id))
     .limit(1);
   return collection;
 }
