@@ -43,6 +43,10 @@ For new functionality (features, bug fixes that change behavior):
 
 Test stack: vitest + @testing-library/react. Run `npm test` (vitest run) or `npm run test:watch`. Tests live next to source as `*.test.ts(x)`.
 
+`*.integration.test.ts` run against real Postgres and are silently **skipped** unless `HUTCH_TEST_DATABASE_URL` is set (`createdb hutch_core_test` once, then `HUTCH_TEST_DATABASE_URL=postgresql://localhost/hutch_core_test npm test`). Any change to services, queries, or SQL should run them, and should usually add one: mocked unit tests only check SQL strings, and have missed real result-type bugs (numeric aggregates coming back as strings).
+
+Changes to the shared Core surface get mirrored into Hutch Cloud (`../hutch-cloud`), whose CI `parity` job compares against this repo's `main`. Merge the Core PR first.
+
 Skip TDD for trivial edits (renames, copy changes, removing dead code).
 
 ## Never
