@@ -155,10 +155,25 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       ]);
 
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["a", "b"] }));
-      expect(result.updated).toBeGreaterThan(0);
+      expect(result.updated).toBe(2);
 
       const data = await rawData(slug);
       expect(data).toEqual([{ c: 3 }, { c: 5 }]);
+    });
+
+    it("remove_fields leaves records without the field untouched", async () => {
+      const slug = await seed("transform_remove_sparse", [{ a: 1, c: 1 }, { c: 2 }]);
+      const updatedAt = async () =>
+        (await testDb.select().from(schema.records).orderBy(asc(schema.records.id))).map((r) => r.updatedAt?.getTime());
+      const before = await updatedAt();
+
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["a"] }));
+      expect(result.updated).toBe(1);
+
+      expect(await rawData(slug)).toEqual([{ c: 1 }, { c: 2 }]);
+      const after = await updatedAt();
+      expect(after[0]).not.toBe(before[0]);
+      expect(after[1]).toBe(before[1]);
     });
 
     it("set_field without filter overwrites every record", async () => {
@@ -196,6 +211,28 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
         { status: "active", n: 1 },
         { status: "done", n: 2, archived: true },
       ]);
+    });
+
+    it("updated counts distinct records across combined operations", async () => {
+      const slug = await seed("transform_combined", [
+        { state: "todo", legacy: 1, priority: 1 },
+        { state: "done", legacy: 2, priority: 2 },
+        { state: "todo", legacy: 3, priority: 3 },
+        { untouched: true }, // no renamed/removed field, filter doesn't match
+      ]);
+
+      const result = ok(
+        await recordsSvc.transformRecords(slug, USER_ID, {
+          rename_fields: { state: "status" },
+          remove_fields: ["legacy"],
+          set_field: { field: "owner", value: "mike", filter: { priority: 1 } },
+        }),
+      );
+      expect(result.updated).toBe(3);
+
+      const data = await rawData(slug);
+      expect(data[0]).toEqual({ status: "todo", priority: 1, owner: "mike" });
+      expect(data[3]).toEqual({ untouched: true });
     });
 
     it("rejects a transform with no operations (regression: silent no-op success)", async () => {
@@ -350,9 +387,43 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(rows).toEqual([{ total: 5 }]);
     });
 
-    it("min and max (text-based, per current engine semantics)", async () => {
+    it("min and max compare text fields as text", async () => {
       const rows = await aggregated({ aggregate: { lo: { min: "label" }, hi: { max: "label" } } });
       expect(rows).toEqual([{ lo: "alpha", hi: "gamma" }]);
+    });
+
+    it("min and max compare numeric fields numerically and return numbers", async () => {
+      // As text, min would be "10" and max "n/a"; numeric values win and the
+      // non-numeric "n/a"/"high" are ignored, matching sum/avg.
+      const rows = await aggregated({ aggregate: { lo: { min: "score" }, hi: { max: "score" } } });
+      expect(rows).toEqual([{ lo: 5, hi: 30 }]);
+    });
+
+    it("min/max of an absent field is null", async () => {
+      const rows = await aggregated({ aggregate: { lo: { min: "nope" }, hi: { max: "nope" } } });
+      expect(rows).toEqual([{ lo: null, hi: null }]);
+    });
+
+    it("min/max on ISO date strings order as text", async () => {
+      const dates = await seed("aggregations_dates", [{ d: "2024-02-01" }, { d: "2023-12-31" }, { d: "2024-10-05" }]);
+      const result = await query(dates, { aggregate: { lo: { min: "d" }, hi: { max: "d" } } });
+      if (!("results" in result)) throw new Error("expected aggregation shape");
+      expect(result.results).toEqual([{ lo: "2023-12-31", hi: "2024-10-05" }]);
+    });
+
+    it("grouped max is numeric per group and text only where a group has no numbers", async () => {
+      const rows = await aggregated({ groupBy: "team", aggregate: { lo: { min: "score" }, hi: { max: "score" } } });
+      expect(rows).toEqual([
+        { team: "blue", lo: 5, hi: 5 },
+        { team: "red", lo: 10, hi: 30 },
+        { team: "text-only", lo: "high", hi: "high" },
+      ]);
+    });
+
+    it("min/max of an all-non-numeric group falls back to text", async () => {
+      const rows = await aggregated({ groupBy: "team", aggregate: { lo: { min: "score" } } });
+      expect(rows.find((r) => r.team === "text-only")?.lo).toBe("high");
+      expect(rows.find((r) => r.team === "blue")?.lo).toBe(5);
     });
 
     it("distinct", async () => {
@@ -363,8 +434,9 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("sum and avg aggregate only numeric values", async () => {
       const rows = await aggregated({ aggregate: { total: { sum: "score" }, mean: { avg: "score" } } });
       // 10 + 30 + 5; "n/a" and "high" are ignored by the jsonb_typeof guard.
-      expect(Number(rows[0].total)).toBe(45);
-      expect(Number(rows[0].mean)).toBeCloseTo(15);
+      // Real JS numbers, not numeric strings (MCP clients see the raw JSON).
+      expect(rows[0].total).toBe(45);
+      expect(rows[0].mean).toBe(15);
     });
 
     it("avg of an all-non-numeric group returns null (not an error)", async () => {

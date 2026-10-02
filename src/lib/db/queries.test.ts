@@ -414,12 +414,12 @@ describe('queryRecords aggregation', () => {
 
     it('sum aggregates only numeric values via a jsonb_typeof guard', async () => {
       const sql = await aggregationSql({ revenue: { sum: 'amount' } })
-      expect(sql).toContain(`sum(CASE WHEN jsonb_typeof(data->'amount') = 'number' THEN (data->>'amount')::numeric END) as "revenue"`)
+      expect(sql).toContain(`to_jsonb(sum(CASE WHEN jsonb_typeof(data->'amount') = 'number' THEN (data->>'amount')::numeric END)) as "revenue"`)
     })
 
     it('avg aggregates only numeric values via a jsonb_typeof guard', async () => {
       const sql = await aggregationSql({ mean: { avg: 'price' } })
-      expect(sql).toContain(`avg(CASE WHEN jsonb_typeof(data->'price') = 'number' THEN (data->>'price')::numeric END) as "mean"`)
+      expect(sql).toContain(`to_jsonb(avg(CASE WHEN jsonb_typeof(data->'price') = 'number' THEN (data->>'price')::numeric END)) as "mean"`)
     })
 
     it('rejects field and alias names with invalid characters instead of stripping them', async () => {
@@ -429,9 +429,10 @@ describe('queryRecords aggregation', () => {
         .rejects.toThrow(/Invalid field name 'a'; --'/)
     })
 
-    it('existing min/max/distinct specs are unchanged', async () => {
-      const sql = await aggregationSql({ latest: { max: 'created' } })
-      expect(sql).toContain(`max(data->>'created') as "latest"`)
+    it('min/max prefer numeric values and fall back to text', async () => {
+      const sql = await aggregationSql({ earliest: { min: 'created' }, latest: { max: 'created' } })
+      expect(sql).toContain(`coalesce(to_jsonb(min(CASE WHEN jsonb_typeof(data->'created') = 'number' THEN (data->>'created')::numeric END)), to_jsonb(min(data->>'created'))) as "earliest"`)
+      expect(sql).toContain(`coalesce(to_jsonb(max(CASE WHEN jsonb_typeof(data->'created') = 'number' THEN (data->>'created')::numeric END)), to_jsonb(max(data->>'created'))) as "latest"`)
     })
   })
 })
