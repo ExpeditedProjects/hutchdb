@@ -512,11 +512,14 @@ async function queryWithAggregation(
       const safeAlias = escapeField(alias);
       switch (op) {
         case "min":
-          selectParts.push(`min(data->>'${safeField}') as "${safeAlias}"`);
+        case "max": {
+          // Compare numerically when the field holds any numbers (text would
+          // put "10" before "9"), else as text so strings and ISO dates still
+          // work. to_jsonb keeps the JS type: number for numeric, string for text.
+          const numeric = `CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END`;
+          selectParts.push(`CASE WHEN count(${numeric}) > 0 THEN to_jsonb(${op}(${numeric})::float8) ELSE to_jsonb(${op}(data->>'${safeField}')) END as "${safeAlias}"`);
           break;
-        case "max":
-          selectParts.push(`max(data->>'${safeField}') as "${safeAlias}"`);
-          break;
+        }
         case "distinct":
           selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
           break;
@@ -524,7 +527,8 @@ async function queryWithAggregation(
         case "avg":
           // Aggregate only numeric values (jsonb_typeof guard) so mixed-type
           // fields can't raise cast errors; NULL when no numeric values exist.
-          selectParts.push(`${op}(CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END) as "${safeAlias}"`);
+          // ::float8 so node-postgres returns a JS number, not a numeric string.
+          selectParts.push(`${op}(CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END)::float8 as "${safeAlias}"`);
           break;
         default:
           throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);

@@ -558,7 +558,13 @@ export async function transformRecords(slug: string, userId: string, params: {
     };
   }
 
-  let totalUpdated = 0;
+  // Distinct ids, not summed rowCounts: one call can run several UPDATEs
+  // over the same records (rename + remove + set), and the caller wants to
+  // know how many records changed.
+  const touched = new Set<number>();
+  const track = (result: { rows: Record<string, unknown>[] }) => {
+    for (const row of result.rows) touched.add(Number(row.id));
+  };
 
   // Database failures return this clean message instead of surfacing raw
   // driver/SQL text through the MCP tool output.
@@ -579,9 +585,10 @@ export async function transformRecords(slug: string, userId: string, params: {
     try {
       const result = await db.execute(
         sql`UPDATE records SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-            WHERE collection_id = ${collection.id} AND deleted_at IS NULL`
+            WHERE collection_id = ${collection.id} AND data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
+            RETURNING id`
       );
-      totalUpdated += result.rowCount ?? 0;
+      track(result);
     } catch (err) {
       console.error(`transformRecords remove_fields failed for collection ${collection.id}`, err);
       return transformFailed;
@@ -605,9 +612,10 @@ export async function transformRecords(slug: string, userId: string, params: {
                   updated_at = now()
               WHERE collection_id = ${collection.id}
               AND data ? ${oldName}
-              AND deleted_at IS NULL`
+              AND deleted_at IS NULL
+              RETURNING id`
         );
-        totalUpdated += result.rowCount ?? 0;
+        track(result);
       } catch (err) {
         console.error(`transformRecords rename_fields failed for collection ${collection.id}`, err);
         return transformFailed;
@@ -630,7 +638,8 @@ export async function transformRecords(slug: string, userId: string, params: {
                   updated_at = now()
               WHERE collection_id = ${collection.id}
               AND data @> ${JSON.stringify(filter)}::jsonb
-              AND deleted_at IS NULL`
+              AND deleted_at IS NULL
+              RETURNING id`
         );
       } else {
         result = await db.execute(
@@ -638,10 +647,11 @@ export async function transformRecords(slug: string, userId: string, params: {
               SET data = data || ${overlay}::jsonb,
                   updated_at = now()
               WHERE collection_id = ${collection.id}
-              AND deleted_at IS NULL`
+              AND deleted_at IS NULL
+              RETURNING id`
         );
       }
-      totalUpdated += result.rowCount ?? 0;
+      track(result);
     } catch (err) {
       console.error(`transformRecords set_field failed for collection ${collection.id}`, err);
       return transformFailed;
@@ -650,7 +660,7 @@ export async function transformRecords(slug: string, userId: string, params: {
 
   // Re-infer schema if fields were added or renamed (skip for remove-only)
   const existingSchema = collection.schema as CollectionSchema | null;
-  const needsReinference = !!(set_field || rename_fields) && totalUpdated > 0;
+  const needsReinference = !!(set_field || rename_fields) && touched.size > 0;
   if (needsReinference && shouldReinfer(existingSchema)) {
     await reinferCollectionSchema(collection.id, existingSchema);
   } else {
@@ -661,7 +671,7 @@ export async function transformRecords(slug: string, userId: string, params: {
   return {
     transformed: true,
     slug,
-    updated: totalUpdated,
+    updated: touched.size,
     operations: {
       ...(remove_fields ? { removed: remove_fields } : {}),
       ...(rename_fields ? { renamed: rename_fields } : {}),

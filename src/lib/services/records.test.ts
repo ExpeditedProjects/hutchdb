@@ -601,7 +601,7 @@ describe('transformRecords', () => {
 
   it('casts rename bind params to ::text (jsonb -> and - are overloaded and reject untyped params)', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    dbExecute.mockResolvedValue({ rowCount: 2 })
+    dbExecute.mockResolvedValue({ rowCount: 2, rows: [{ id: 1 }, { id: 2 }] })
     const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'comment' } })
     expect(result).toEqual(expect.objectContaining({ transformed: true, updated: 2 }))
     const renderedChunks = (dbExecute.mock.calls[0][0] as { queryChunks?: unknown[] }).queryChunks ?? []
