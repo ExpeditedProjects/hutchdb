@@ -609,6 +609,16 @@ describe('transformRecords', () => {
     expect(sqlText).toContain('::text')
   })
 
+  it('remove_fields only touches records holding a removed field and counts them', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
+    dbExecute.mockResolvedValue({ rowCount: 1, rows: [{ id: 7 }] })
+    const result = await transformRecords('users', 'user-test', { remove_fields: ['legacy'] })
+    expect(result).toEqual(expect.objectContaining({ transformed: true, updated: 1 }))
+    const sqlText = JSON.stringify((dbExecute.mock.calls[0][0] as { queryChunks?: unknown[] }).queryChunks ?? [])
+    expect(sqlText).toContain('?|')
+    expect(sqlText).toContain('RETURNING id')
+  })
+
   it('returns a clean error (no SQL text) when the rename query fails', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
     dbExecute.mockRejectedValue(new Error('Failed query: UPDATE records SET ...'))

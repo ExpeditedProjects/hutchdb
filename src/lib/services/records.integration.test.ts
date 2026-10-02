@@ -161,6 +161,21 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(data).toEqual([{ c: 3 }, { c: 5 }]);
     });
 
+    it("remove_fields leaves records without the field untouched", async () => {
+      const slug = await seed("transform_remove_sparse", [{ a: 1, c: 1 }, { c: 2 }]);
+      const updatedAt = async () =>
+        (await testDb.select().from(schema.records).orderBy(asc(schema.records.id))).map((r) => r.updatedAt?.getTime());
+      const before = await updatedAt();
+
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["a"] }));
+      expect(result.updated).toBe(1);
+
+      expect(await rawData(slug)).toEqual([{ c: 1 }, { c: 2 }]);
+      const after = await updatedAt();
+      expect(after[0]).not.toBe(before[0]);
+      expect(after[1]).toBe(before[1]);
+    });
+
     it("set_field without filter overwrites every record", async () => {
       const slug = await seed("transform_set_all", [{ x: 1 }, { x: 2 }]);
 
@@ -213,7 +228,6 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
           set_field: { field: "owner", value: "mike", filter: { priority: 1 } },
         }),
       );
-      // Previously 7 (3 + 3 + 1 summed rowCounts); the same 3 records changed.
       expect(result.updated).toBe(3);
 
       const data = await rawData(slug);
@@ -383,6 +397,27 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       // non-numeric "n/a"/"high" are ignored, matching sum/avg.
       const rows = await aggregated({ aggregate: { lo: { min: "score" }, hi: { max: "score" } } });
       expect(rows).toEqual([{ lo: 5, hi: 30 }]);
+    });
+
+    it("min/max of an absent field is null", async () => {
+      const rows = await aggregated({ aggregate: { lo: { min: "nope" }, hi: { max: "nope" } } });
+      expect(rows).toEqual([{ lo: null, hi: null }]);
+    });
+
+    it("min/max on ISO date strings order as text", async () => {
+      const dates = await seed("aggregations_dates", [{ d: "2024-02-01" }, { d: "2023-12-31" }, { d: "2024-10-05" }]);
+      const result = await query(dates, { aggregate: { lo: { min: "d" }, hi: { max: "d" } } });
+      if (!("results" in result)) throw new Error("expected aggregation shape");
+      expect(result.results).toEqual([{ lo: "2023-12-31", hi: "2024-10-05" }]);
+    });
+
+    it("grouped max is numeric per group and text only where a group has no numbers", async () => {
+      const rows = await aggregated({ groupBy: "team", aggregate: { lo: { min: "score" }, hi: { max: "score" } } });
+      expect(rows).toEqual([
+        { team: "blue", lo: 5, hi: 5 },
+        { team: "red", lo: 10, hi: 30 },
+        { team: "text-only", lo: "high", hi: "high" },
+      ]);
     });
 
     it("min/max of an all-non-numeric group falls back to text", async () => {

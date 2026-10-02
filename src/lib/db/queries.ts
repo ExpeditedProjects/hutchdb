@@ -510,25 +510,24 @@ async function queryWithAggregation(
       const [op, field] = specEntry;
       const safeField = escapeField(field);
       const safeAlias = escapeField(alias);
+      // Numeric values only (jsonb_typeof guard), so mixed-type fields can't
+      // raise cast errors. Results go through to_jsonb because node-postgres
+      // returns a bare numeric as a string; jsonb comes back as a JS number.
+      const numeric = `CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END`;
       switch (op) {
         case "min":
-        case "max": {
-          // Compare numerically when the field holds any numbers (text would
-          // put "10" before "9"), else as text so strings and ISO dates still
-          // work. to_jsonb keeps the JS type: number for numeric, string for text.
-          const numeric = `CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END`;
-          selectParts.push(`CASE WHEN count(${numeric}) > 0 THEN to_jsonb(${op}(${numeric})::float8) ELSE to_jsonb(${op}(data->>'${safeField}')) END as "${safeAlias}"`);
+        case "max":
+          // Numeric when the field holds any numbers (as text "10" < "9"),
+          // otherwise text so strings and ISO dates still order correctly.
+          selectParts.push(`coalesce(to_jsonb(${op}(${numeric})), to_jsonb(${op}(data->>'${safeField}'))) as "${safeAlias}"`);
           break;
-        }
         case "distinct":
           selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
           break;
         case "sum":
         case "avg":
-          // Aggregate only numeric values (jsonb_typeof guard) so mixed-type
-          // fields can't raise cast errors; NULL when no numeric values exist.
-          // ::float8 so node-postgres returns a JS number, not a numeric string.
-          selectParts.push(`${op}(CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END)::float8 as "${safeAlias}"`);
+          // NULL when the group has no numeric values.
+          selectParts.push(`to_jsonb(${op}(${numeric})) as "${safeAlias}"`);
           break;
         default:
           throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
