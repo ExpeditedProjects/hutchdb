@@ -6,6 +6,8 @@ import * as recordService from "@/lib/services/records";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS } from "@/lib/db/queries";
+import { reportError } from "@/lib/errors/report";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 
 const SERVER_INSTRUCTIONS = `Hutch Core stores structured data for a single AI agent user. Records are arbitrary JSON, grouped into collections.
 
@@ -103,6 +105,16 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
    * generic isError response. Every OTHER throw is rethrown unchanged so
    * intentional validation errors (e.g. "Unsupported filter operator …"
    * from the query engine) still reach the client verbatim via the SDK.
+   *
+   * Reporting: database errors and every unexpected throw go to
+   * reportError (a no-op unless a deployment installs a reporter). The
+   * discriminator for "intentional" is the ClientInputError class — the
+   * query engine throws it for caller mistakes, so those are expected
+   * outcomes, not bugs. A class beats message matching: new validation
+   * messages need no allowlist, and a plain Error from anywhere else is
+   * reported by default. (Zod input-schema failures are rejected by the
+   * SDK before the handler runs, so they never reach this wrapper.)
+   * Context carries identifiers only — never tool arguments or records.
    */
   const registerTool = ((
     name: string,
@@ -113,12 +125,15 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       try {
         return await (handler as (...a: unknown[]) => Promise<McpToolResponse>)(...args);
       } catch (err) {
+        const errorContext = { tool: name, organizationId, userId };
         if (isDatabaseError(err)) {
           console.error(`[mcp] ${name} database error:`, err);
+          reportError(err, errorContext);
           return errorResponse(
             `${name} failed while accessing the database. Try again or adjust the inputs.`
           );
         }
+        if (!(err instanceof ClientInputError)) reportError(err, errorContext);
         throw err;
       }
     };

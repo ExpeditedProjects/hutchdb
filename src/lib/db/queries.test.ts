@@ -37,6 +37,7 @@ vi.mock('./index', () => ({
 
 import { PgDialect } from 'drizzle-orm/pg-core'
 import type { SQL } from 'drizzle-orm'
+import { ClientInputError } from '@/lib/errors/client-input-error'
 import {
   findAccessibleCollectionBySlug,
   queryRecords,
@@ -285,6 +286,11 @@ describe('buildFilterConditions', () => {
 
   it('rejects unknown $-operators with the supported list', () => {
     expect(() => buildFilterConditions({ f: { $regex: 'x' } })).toThrow(/Unsupported filter operator '\$regex'/)
+  })
+
+  it('throws ClientInputError so the MCP chokepoint treats these as caller mistakes, not bugs', () => {
+    expect(() => buildFilterConditions({ f: { $regex: 'x' } })).toThrow(ClientInputError)
+    expect(() => buildFilterConditions({ f: { $in: 'active' } })).toThrow(ClientInputError)
   })
 })
 
