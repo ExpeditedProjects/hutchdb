@@ -4,6 +4,7 @@ import { collections, records, collectionMembers, organizations, organizationMem
 import { eq, and, sql, desc, asc, isNull, inArray, SQL } from "drizzle-orm";
 import { FIELD_NAME_RE } from "@/lib/constants";
 import { isPlainObject } from "@/lib/validation";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 
 export const notDeleted = isNull(records.deletedAt);
 
@@ -309,7 +310,7 @@ function buildOperatorCondition(field: string, op: string, operand: unknown): SQ
     if (typeof operand === "string") {
       return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ${cmp} ${operand})`;
     }
-    throw new Error(`${op} requires a number or string operand`);
+    throw new ClientInputError(`${op} requires a number or string operand`);
   }
 
   switch (op) {
@@ -318,9 +319,9 @@ function buildOperatorCondition(field: string, op: string, operand: unknown): SQ
       return sql`NOT (${records.data} @> ${JSON.stringify({ [field]: operand })}::jsonb)`;
     case "$in":
     case "$nin": {
-      if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
+      if (!Array.isArray(operand)) throw new ClientInputError(`${op} requires an array operand`);
       if (operand.length > IN_ARRAY_LIMIT) {
-        throw new Error(`$in/$nin arrays are limited to ${IN_ARRAY_LIMIT} elements`);
+        throw new ClientInputError(`$in/$nin arrays are limited to ${IN_ARRAY_LIMIT} elements`);
       }
       if (operand.length === 0) {
         // $in [] matches nothing; $nin [] matches everything.
@@ -333,15 +334,15 @@ function buildOperatorCondition(field: string, op: string, operand: unknown): SQ
         : sql`(${records.data}->${field} IS NULL OR NOT (${inCondition}))`;
     }
     case "$exists":
-      if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+      if (typeof operand !== "boolean") throw new ClientInputError("$exists requires a boolean operand");
       return operand ? sql`${records.data} ? ${field}` : sql`NOT (${records.data} ? ${field})`;
     case "$contains": {
-      if (typeof operand !== "string") throw new Error("$contains requires a string operand");
+      if (typeof operand !== "string") throw new ClientInputError("$contains requires a string operand");
       const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
       return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ILIKE ${pattern})`;
     }
     default:
-      throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
+      throw new ClientInputError(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
   }
 }
 
@@ -505,7 +506,7 @@ async function queryWithAggregation(
       const specEntry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
       if (!specEntry) {
         const label = typeof spec === "string" ? spec : JSON.stringify(spec);
-        throw new Error(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
+        throw new ClientInputError(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
       }
       const [op, field] = specEntry;
       const safeField = escapeField(field);
@@ -530,7 +531,7 @@ async function queryWithAggregation(
           selectParts.push(`to_jsonb(${op}(${numeric})) as "${safeAlias}"`);
           break;
         default:
-          throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
+          throw new ClientInputError(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
       }
     }
   } else {
@@ -556,7 +557,7 @@ async function queryWithAggregation(
 
 function escapeField(field: string): string {
   if (!FIELD_NAME_RE.test(field)) {
-    throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
+    throw new ClientInputError(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
   }
   return field;
 }
