@@ -12,15 +12,13 @@ What review should care about in this repo. `/review` and `/issue-pr` read this;
 
 ## Sensitive paths
 <!-- /issue-pr stops before merging when a diff touches one of these. One glob per line in backticks, then why. Keep it short. -->
-- `.github/**` — CI, Dependabot config and the auto-merge workflow. Loosening these lets unreviewed code merge (#39, #50).
+- `.github/workflows/**` — CI and the Dependabot auto-merge workflow. Loosening these lets unreviewed code merge (#39, #50).
 - `drizzle/**` — migrations and the journal Cloud adds its own migrations to. A dropped column doesn't come back (#3).
 - `src/lib/db/schema.ts` — must stay merge-compatible with Cloud. Every change needs a migration.
 - `src/lib/auth/**` — the auth seam and singleton bootstrap. CLAUDE.md says no changes without discussion.
 - `src/app/api/**` — HTTP entry points. `mcp/route.ts` is where requests without a valid key get a 401. Cloud forks this route.
 - `src/lib/db/index.ts` — the shared pool. A bug here takes down every request (#61), and the DB URL it picks decides which database gets written (#48).
-- `src/lib/quota.ts` — seam contract that Cloud's overlay replaces. A changed signature breaks Cloud's quota enforcement (#2).
 - `scripts/**` and `drizzle.config.ts` — migration runner, Docker entrypoint and prod DB sync. They choose which database gets migrated or dropped (#48, #54).
-- `server.json` — the official MCP Registry listing (#47). Public identity and remote URL.
 
 ## Skip
 - `package-lock.json`
