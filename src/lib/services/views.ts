@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
-import { views, collections, collectionMembers } from "@/lib/db/schema";
-import { eq, and } from "drizzle-orm";
+import { views, collections } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
 import { findAccessibleCollectionBySlug } from "@/lib/db/queries";
 import { uniqueSlug, titleCase } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
@@ -55,20 +55,32 @@ export async function createView(collectionSlug: string, userId: string, params:
   return { view: created };
 }
 
-export async function renameView(viewId: number, userId: string, name: string) {
+/**
+ * Resolves a view for mutation with the same access rule as createView
+ * (effective role editor or higher, including org-derived access). When
+ * collectionSlug is given, the view must belong to that collection, so a
+ * route scoped to one collection can't reach another's views.
+ */
+async function findEditableView(viewId: number, userId: string, collectionSlug?: string) {
+  const [view] = await db
+    .select({ config: views.config, collectionSlug: collections.slug })
+    .from(views)
+    .innerJoin(collections, eq(views.collectionId, collections.id))
+    .where(eq(views.id, viewId))
+    .limit(1);
+  if (!view) return null;
+  if (collectionSlug !== undefined && view.collectionSlug !== collectionSlug) return null;
+
+  const access = await findAccessibleCollectionBySlug(view.collectionSlug, userId, "editor");
+  if (!access) return null;
+  return view;
+}
+
+export async function renameView(viewId: number, userId: string, name: string, collectionSlug?: string) {
   const validated = validateTrimmedLength(name, MAX_VIEW_NAME_LENGTH, "Name");
   if ("error" in validated) return validated;
 
-  const [existing] = await db
-    .select({ collectionId: views.collectionId, collectionSlug: collections.slug })
-    .from(views)
-    .innerJoin(collections, eq(views.collectionId, collections.id))
-    .innerJoin(
-      collectionMembers,
-      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(eq(views.id, viewId))
-    .limit(1);
+  const existing = await findEditableView(viewId, userId, collectionSlug);
   if (!existing) return { error: "View not found", status: 404 };
 
   const [updated] = await db
@@ -100,17 +112,13 @@ function pickAllowedConfig(config: Record<string, unknown>): Record<string, unkn
   return picked;
 }
 
-export async function updateViewConfig(viewId: number, userId: string, config: Record<string, unknown>) {
-  const [existing] = await db
-    .select({ config: views.config, collectionId: views.collectionId })
-    .from(views)
-    .innerJoin(collections, eq(views.collectionId, collections.id))
-    .innerJoin(
-      collectionMembers,
-      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(eq(views.id, viewId))
-    .limit(1);
+export async function updateViewConfig(
+  viewId: number,
+  userId: string,
+  config: Record<string, unknown>,
+  collectionSlug?: string
+) {
+  const existing = await findEditableView(viewId, userId, collectionSlug);
   if (!existing) return null;
 
   const sanitized = pickAllowedConfig(config);
