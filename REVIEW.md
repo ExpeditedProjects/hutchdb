@@ -3,10 +3,10 @@
 What review should care about in this repo. `/review` and `/issue-pr` read this; [CLAUDE.md](CLAUDE.md) has the stack and commands.
 
 ## What failure looks like here
-- **One account reads or edits another's data.** Core is single-user, but Hutch Cloud runs this same `src/` for many users. Every collection, record and view lookup must go through `findAccessibleCollectionBySlug` (`src/lib/db/queries.ts:79`) with the right role (`viewer` for reads, `editor` for writes). A service that writes its own membership join is a bug even if tests pass: #63 fixed `renameView`/`updateViewConfig` doing exactly that.
+- **One account reads or edits another's data.** Core is single-user, but Hutch Cloud runs this same `src/` for many users. Every collection, record and view lookup by slug must go through `findAccessibleCollectionBySlug` (`src/lib/db/queries.ts:79`) with the right role (`viewer` for reads, `editor` for writes). A service that writes its own membership join is a bug even if tests pass: #63 fixed `renameView`/`updateViewConfig` doing exactly that.
 - **SQL that only a mock has seen.** Unit tests check SQL strings and miss what Postgres does: untyped bind params (#7, #8), `->>` sorting numbers as text (#30), `numeric` aggregates returned as strings (#53). A change to services, queries or SQL needs a `*.integration.test.ts` case. A string assertion is not evidence.
 - **Writes that touch more than they should.** `transform_records` over-counted and bumped `updated_at` on records it didn't change (#53). Repeat or concurrent writes to an auto-created collection made duplicates or 500s (#52). Check that writes touch only the targeted records, survive concurrent first writes, and report correct counts.
-- **MCP contract drift.** Agents and Cloud depend on tool names, input schemas, annotations (`readOnlyHint`/`destructiveHint`, #5, #37) and response shapes. If a diff edits the expected list in the tool-surface snapshot (`src/lib/mcp/server.test.ts:126`), that's a contract change: tag it Important and name it in the summary. Tool descriptions are kept byte-identical with Cloud (#2).
+- **MCP contract drift.** Agents and Cloud depend on tool names, input schemas, annotations (`readOnlyHint`/`destructiveHint`, #5, #37) and response shapes. If a diff edits the expected lists in `src/lib/mcp/server.test.ts` (the registered tool names at `:68`, the `tool surface snapshot` at `:153`), that's a contract change: tag it Important and name it in the summary. Tool descriptions are kept byte-identical with Cloud (#2).
 - **Breaking Cloud.** Cloud's `parity` job diffs `src/`, `scripts/` and `drizzle/` against Core `main`. Changed signatures (#63) and exports Cloud imports (`pool`, #61) need a matching Cloud PR. Merge Core first.
 - **Leaking internals or crashing the process.** DB errors must not reach tool output as raw driver or SQL text (#7, #9). One unhandled pool `error` event killed the process and every in-flight request (#61).
 
@@ -18,7 +18,8 @@ What review should care about in this repo. `/review` and `/issue-pr` read this;
 - `src/lib/auth/**` — the auth seam and singleton bootstrap. CLAUDE.md says no changes without discussion.
 - `src/app/api/**` — HTTP entry points. `mcp/route.ts` is where requests without a valid key get a 401. Cloud forks this route.
 - `src/lib/db/index.ts` — the shared pool. A bug here takes down every request (#61), and the DB URL it picks decides which database gets written (#48).
-- `scripts/**` and `drizzle.config.ts` — migration runner, Docker entrypoint and prod DB sync. They choose which database gets migrated or dropped (#48, #54).
+- `scripts/**` — migration runner, Docker entrypoint and prod DB sync. They choose which database gets migrated or dropped (#48, #54).
+- `drizzle.config.ts` — picks the database drizzle-kit migrates (#48).
 
 ## Skip
 - `package-lock.json`
