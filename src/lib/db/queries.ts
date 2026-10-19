@@ -312,15 +312,17 @@ export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
   const containment: Record<string, unknown> = {};
 
   for (const [field, value] of Object.entries(filter)) {
-    // A dotted key ("address.city") addresses a nested object; any other
-    // key is a literal top-level key, exactly as before.
+    // A dotted key ("address.city") addresses a nested object, and still
+    // matches a literal top-level key of that name (e.g. a CSV column
+    // "first.name"), as it did before paths existed. Any other key is a
+    // literal top-level key.
     const path = dottedPathSegments(field);
     if (isOperatorSpec(value)) {
       for (const [op, operand] of Object.entries(value)) {
         conditions.push(buildOperatorCondition(field, op, operand, path));
       }
     } else if (path) {
-      conditions.push(sql`${records.data} @> ${JSON.stringify(nestValue(path, value))}::jsonb`);
+      conditions.push(sql`(${records.data} @> ${JSON.stringify(nestValue(path, value))}::jsonb OR ${records.data} @> ${JSON.stringify({ [field]: value })}::jsonb)`);
     } else {
       containment[field] = value;
     }
@@ -335,10 +337,13 @@ export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
 
 function buildOperatorCondition(field: string, op: string, operand: unknown, path: string[] | null = null): SQL {
   // Top-level fields keep their original `->` / `->>` / `?` SQL; dotted
-  // object paths use `#>` / `#>>` with the path bound as a text[] parameter.
-  const json = path ? sql`${records.data} #> ${pathLiteral(path)}::text[]` : sql`${records.data}->${field}`;
-  const text = path ? sql`${records.data} #>> ${pathLiteral(path)}::text[]` : sql`${records.data}->>${field}`;
-  const contains = (v: unknown) => JSON.stringify(path ? nestValue(path, v) : { [field]: v });
+  // object paths use `#>` / `#>>` with the path bound as a text[] parameter,
+  // falling back to a literal top-level key of the same name.
+  const json = path ? sql`coalesce(${records.data} #> ${pathLiteral(path)}::text[], ${records.data}->${field})` : sql`${records.data}->${field}`;
+  const text = path ? sql`coalesce(${records.data} #>> ${pathLiteral(path)}::text[], ${records.data}->>${field})` : sql`${records.data}->>${field}`;
+  const contains = (v: unknown) => path
+    ? sql`(${records.data} @> ${JSON.stringify(nestValue(path, v))}::jsonb OR ${records.data} @> ${JSON.stringify({ [field]: v })}::jsonb)`
+    : sql`${records.data} @> ${JSON.stringify({ [field]: v })}::jsonb`;
 
   if (Object.hasOwn(COMPARISON_OPS, op)) {
     const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
@@ -354,7 +359,7 @@ function buildOperatorCondition(field: string, op: string, operand: unknown, pat
   switch (op) {
     case "$ne":
       // Mongo semantics: matches records where the field differs OR is absent.
-      return sql`NOT (${records.data} @> ${contains(operand)}::jsonb)`;
+      return sql`NOT (${contains(operand)})`;
     case "$in":
     case "$nin": {
       if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);

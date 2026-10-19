@@ -621,6 +621,26 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(await names({ filter: { "totals.veterans": { $exists: false } } })).toEqual(["NOVETS"]);
     });
 
+    it("dotted filter keys still match a literal top-level key of that name", async () => {
+      // e.g. a CSV import with a "first.name" column, filterable before paths existed.
+      const csv = await seed("csvish", [
+        { "first.name": "Ada", "age.years": 36 },
+        { first: { name: "Ada" }, age: { years: 40 } },
+        { "first.name": "Grace", "age.years": 85 },
+      ]);
+      const count = async (filter: Record<string, unknown>) => {
+        const result = await query(csv, { filter });
+        if (!("records" in result)) throw new Error("expected records shape");
+        return result.records.length;
+      };
+      expect(await count({ "first.name": "Ada" })).toBe(2);
+      expect(await count({ "age.years": { $gte: 40 } })).toBe(2);
+      expect(await count({ "first.name": { $ne: "Ada" } })).toBe(1);
+      expect(await count({ "first.name": { $in: ["Grace"] } })).toBe(1);
+      expect(await count({ "first.name": { $exists: true } })).toBe(3);
+      expect(await count({ "first.name": { $contains: "rac" } })).toBe(1);
+    });
+
     it("aggregate sort by alias + limit returns the true top-N groups and the group total", async () => {
       const result = await groups({
         groupBy: "party",

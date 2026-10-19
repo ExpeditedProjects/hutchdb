@@ -442,29 +442,37 @@ describe('queryRecords aggregation', () => {
 })
 
 describe('buildFilterConditions dotted object paths', () => {
-  it('compiles a plain dotted filter to nested containment', () => {
+  it('compiles a plain dotted filter to nested containment, or the literal dotted key', () => {
     const conditions = buildFilterConditions({ status: 'active', 'address.city': 'Austin' })
     expect(conditions).toHaveLength(2)
     expect(render(conditions[0]).params).toEqual([JSON.stringify({ status: 'active' })])
-    expect(render(conditions[1]).params).toEqual([JSON.stringify({ address: { city: 'Austin' } })])
+    const { sql, params } = render(conditions[1])
+    expect(sql).toContain(' OR ')
+    expect(params).toEqual([JSON.stringify({ address: { city: 'Austin' } }), JSON.stringify({ 'address.city': 'Austin' })])
   })
 
-  it('compiles operators on a dotted path with #> / #>> and a bound path', () => {
+  it('compiles operators on a dotted path with #> / #>> and a bound path, falling back to the literal key', () => {
     const [cond] = buildFilterConditions({ 'totals.veterans.points': { $gte: 20 } })
     const { sql, params } = render(cond)
+    expect(sql).toContain('coalesce(')
     expect(sql).toContain('#> $1::text[]')
-    expect(sql).toContain('#>> $2::text[]')
-    expect(params).toEqual(['{totals,veterans,points}', '{totals,veterans,points}', 20])
+    expect(sql).toContain('#>> $3::text[]')
+    expect(params).toEqual([
+      '{totals,veterans,points}', 'totals.veterans.points',
+      '{totals,veterans,points}', 'totals.veterans.points',
+      20,
+    ])
   })
 
-  it('$exists on a dotted path checks #> IS [NOT] NULL', () => {
-    expect(render(buildFilterConditions({ 'a.b': { $exists: true } })[0]).sql).toMatch(/#> \$1::text\[\] IS NOT NULL$/)
-    expect(render(buildFilterConditions({ 'a.b': { $exists: false } })[0]).sql).toMatch(/#> \$1::text\[\] IS NULL$/)
+  it('$exists on a dotted path checks the path or the literal key IS [NOT] NULL', () => {
+    expect(render(buildFilterConditions({ 'a.b': { $exists: true } })[0]).sql).toMatch(/coalesce\(.*#> \$1::text\[\].*\) IS NOT NULL$/)
+    expect(render(buildFilterConditions({ 'a.b': { $exists: false } })[0]).sql).toMatch(/coalesce\(.*#> \$1::text\[\].*\) IS NULL$/)
   })
 
-  it('$ne on a dotted path negates nested containment', () => {
-    const { params } = render(buildFilterConditions({ 'a.b': { $ne: 1 } })[0])
-    expect(params).toEqual([JSON.stringify({ a: { b: 1 } })])
+  it('$ne on a dotted path negates nested and literal containment', () => {
+    const { sql, params } = render(buildFilterConditions({ 'a.b': { $ne: 1 } })[0])
+    expect(sql).toMatch(/^NOT \(/)
+    expect(params).toEqual([JSON.stringify({ a: { b: 1 } }), JSON.stringify({ 'a.b': 1 })])
   })
 
   it('keys with other characters stay literal top-level keys (unchanged behavior)', () => {
