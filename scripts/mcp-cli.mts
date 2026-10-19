@@ -5,19 +5,19 @@
 //   npx tsx scripts/mcp-cli.mts call <tool> '<json args>'
 //   npx tsx scripts/mcp-cli.mts call <tool> @args.json
 //
-// Env: MCP_URL (default http://localhost:3112/api/mcp), MCP_API_KEY (optional bearer).
+// Env: MCP_URL (default http://localhost:3111/api/mcp), MCP_API_KEY (optional bearer).
 // JSON-RPC / SSE handling adapted from scripts/smoke.ts.
 
 import { readFileSync } from "node:fs";
 
-const MCP_URL = process.env.MCP_URL ?? "http://localhost:3112/api/mcp";
+const MCP_URL = process.env.MCP_URL ?? "http://localhost:3111/api/mcp";
 const API_KEY = process.env.MCP_API_KEY;
 
 const USAGE = `usage:
   mcp-cli.mts list [--names]
   mcp-cli.mts call <tool> ['<json args>' | @file.json]
 
-env: MCP_URL (default http://localhost:3112/api/mcp), MCP_API_KEY`;
+env: MCP_URL (default http://localhost:3111/api/mcp), MCP_API_KEY`;
 
 type JsonRpcMessage = {
   jsonrpc: string;
