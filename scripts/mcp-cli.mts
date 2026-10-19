@@ -1,6 +1,7 @@
 // Minimal MCP CLI for Hutch Core.
 //
-//   npx tsx scripts/mcp-cli.mts list
+//   npx tsx scripts/mcp-cli.mts list            (names, descriptions, compact input schema)
+//   npx tsx scripts/mcp-cli.mts list --names    (names only)
 //   npx tsx scripts/mcp-cli.mts call <tool> '<json args>'
 //   npx tsx scripts/mcp-cli.mts call <tool> @args.json
 //
@@ -13,7 +14,7 @@ const MCP_URL = process.env.MCP_URL ?? "http://localhost:3112/api/mcp";
 const API_KEY = process.env.MCP_API_KEY;
 
 const USAGE = `usage:
-  mcp-cli.mts list
+  mcp-cli.mts list [--names]
   mcp-cli.mts call <tool> ['<json args>' | @file.json]
 
 env: MCP_URL (default http://localhost:3112/api/mcp), MCP_API_KEY`;
@@ -27,7 +28,26 @@ type JsonRpcMessage = {
 
 type ToolCallResult = { content?: { type: string; text?: string }[]; isError?: boolean };
 
-type ToolInfo = { name: string; description?: string };
+type JsonSchema = { type?: string | string[]; properties?: Record<string, JsonSchema>; required?: string[]; enum?: unknown[]; anyOf?: JsonSchema[]; items?: JsonSchema };
+type ToolInfo = { name: string; description?: string; inputSchema?: JsonSchema };
+
+/** One-line rendering of a JSON schema type, e.g. `string`, `object`, `string | string[]`. */
+function schemaType(schema: JsonSchema | undefined): string {
+  if (!schema) return "any";
+  if (schema.enum) return schema.enum.map((v) => JSON.stringify(v)).join(" | ");
+  if (schema.anyOf) return schema.anyOf.map(schemaType).join(" | ");
+  const type = Array.isArray(schema.type) ? schema.type.join(" | ") : schema.type ?? "any";
+  if (type === "array") return `${schemaType(schema.items)}[]`;
+  return type;
+}
+
+/** `{slug: string, filter?: object, ...}` — required keys first, optional ones marked with ?. */
+function compactSchema(schema: JsonSchema | undefined): string {
+  const props = schema?.properties ?? {};
+  const required = new Set(schema?.required ?? []);
+  const keys = Object.keys(props).sort((a, b) => Number(required.has(b)) - Number(required.has(a)) || a.localeCompare(b));
+  return `{${keys.map((k) => `${k}${required.has(k) ? "" : "?"}: ${schemaType(props[k])}`).join(", ")}}`;
+}
 
 function usageExit(message?: string): never {
   if (message) console.error(`mcp-cli: ${message}\n`);
@@ -71,7 +91,17 @@ async function rpc(method: string, params?: Record<string, unknown>, label = met
     body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method, ...(params ? { params } : {}) }),
   });
   if (res.status >= 400) {
-    throw new Error(`${method}: HTTP ${res.status}`);
+    // The server explains refusals (e.g. a 413 names the body limit) in a
+    // JSON-RPC error body; surface that instead of the bare status.
+    const body = await res.text();
+    let detail = body.slice(0, 300);
+    try {
+      const parsed = JSON.parse(body) as JsonRpcMessage;
+      if (parsed.error?.message) detail = parsed.error.message;
+    } catch {
+      // Not JSON — keep the raw snippet.
+    }
+    throw new Error(`${method}: HTTP ${res.status}${detail ? ` — ${detail}` : ""}`);
   }
   const msg = await readJsonRpcResponse(res);
   console.error(`[mcp-cli] ${label} ${(performance.now() - started).toFixed(1)}ms`);
@@ -92,14 +122,16 @@ async function initialize(): Promise<void> {
   });
 }
 
-async function listTools(): Promise<void> {
+async function listTools(namesOnly: boolean): Promise<void> {
   await initialize();
   const listed = await rpc("tools/list");
   const tools = (listed.tools ?? []) as ToolInfo[];
   for (const tool of tools) {
-    const description = (tool.description ?? "").trim();
     console.log(tool.name);
+    if (namesOnly) continue;
+    const description = (tool.description ?? "").trim();
     if (description) console.log(description.replace(/^/gm, "  "));
+    console.log(`  input: ${compactSchema(tool.inputSchema)}`);
     console.log();
   }
 }
@@ -134,8 +166,8 @@ async function main(): Promise<void> {
   const [command, ...rest] = process.argv.slice(2);
   switch (command) {
     case "list":
-      if (rest.length > 0) usageExit("list takes no arguments");
-      return listTools();
+      if (rest.length > 1 || (rest.length === 1 && rest[0] !== "--names")) usageExit("list takes only --names");
+      return listTools(rest[0] === "--names");
     case "call": {
       const [tool, raw, ...extra] = rest;
       if (!tool || extra.length > 0) usageExit("call requires <tool> and at most one args value");
