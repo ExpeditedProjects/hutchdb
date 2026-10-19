@@ -56,8 +56,10 @@ export async function createRecords(userId: string, organizationId: string, para
   data?: Record<string, unknown>;
   records?: Record<string, unknown>[];
   on_conflict?: string;
+  /** "summary" leaves the stored records out of the response (bulk loads). */
+  return?: "records" | "summary";
 }) {
-  const { collection: collectionName, data: singleData, records: bulkRecords, on_conflict: onConflict = "replace" } = params;
+  const { collection: collectionName, data: singleData, records: bulkRecords, on_conflict: onConflict = "replace", return: returnMode = "records" } = params;
 
   if (!collectionName) {
     return { error: "Missing 'collection' field", status: 400 };
@@ -210,6 +212,16 @@ export async function createRecords(userId: string, organizationId: string, para
   }
 
   const summary = buildSaveSummary(collection.name, results, collectionWasCreated);
+
+  if (returnMode === "summary") {
+    return {
+      collection: { name: collection.name, slug: collection.slug },
+      count: results.length,
+      ...tallyActions(results),
+      ...(bulkRecords ? {} : { action: results[0]?.action, id: (results[0]?.record as { id?: number } | undefined)?.id }),
+      summary,
+    };
+  }
 
   if (bulkRecords) {
     return {
@@ -383,8 +395,10 @@ export async function importRecords(userId: string, organizationId: string, para
   format?: "csv" | "json";
   content: string;
   on_conflict?: string;
+  /** "records" echoes the stored records; the default is a summary. */
+  return?: "records" | "summary";
 }) {
-  const { collection, format = "csv", content, on_conflict } = params;
+  const { collection, format = "csv", content, on_conflict, return: returnMode = "summary" } = params;
 
   if (content.length > IMPORT_MAX_CONTENT_BYTES) {
     return { error: "Import content exceeds 10MB limit", status: 400 };
@@ -428,22 +442,27 @@ export async function importRecords(userId: string, organizationId: string, para
     collection,
     records: recordsToStore,
     on_conflict,
+    return: returnMode,
   });
   if ("error" in result) return result;
 
   const bulk = result as {
     collection: { name: string; slug: string };
-    results?: { action: string }[];
+    results?: { action: string; record: Record<string, unknown> }[];
     count?: number;
+    created?: number;
+    updated?: number;
+    skipped?: number;
     summary?: string;
   };
 
-  const counts = tallyActions(bulk.results ?? []);
+  const counts = bulk.results ? tallyActions(bulk.results) : { created: bulk.created ?? 0, updated: bulk.updated ?? 0, skipped: bulk.skipped ?? 0 };
 
   return {
     collection: bulk.collection,
     count: bulk.count ?? 0,
     ...counts,
+    ...(returnMode === "records" && bulk.results ? { results: bulk.results } : {}),
     summary: bulk.summary,
   };
 }

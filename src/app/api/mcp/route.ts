@@ -2,6 +2,7 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { createMcpServer } from "@/lib/mcp/server";
 import { authenticate } from "@/lib/auth/seam";
 import { config } from "@/lib/config";
+import { MCP_MAX_REQUEST_BODY_BYTES } from "@/lib/constants";
 
 function unauthorizedResponse(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -28,6 +29,10 @@ const handler = createMcpHandler((ctx) => {
     throw new Error("MCP request reached the server factory without an authenticated identity");
   }
   return createMcpServer(identity.userId, identity.orgId, config.baseUrl);
+}, {
+  // The SDK default is 4 MiB and answers larger bodies with a JSON-RPC
+  // "Payload Too Large" error; bulk stores and 10 MB imports need more.
+  maxRequestBodySize: MCP_MAX_REQUEST_BODY_BYTES,
 });
 
 async function handleMcpRequest(req: Request): Promise<Response> {

@@ -6,6 +6,7 @@ import * as recordService from "@/lib/services/records";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
+import { MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
 
 const SERVER_INSTRUCTIONS = `Hutch Core stores structured data for a single AI agent user. Records are arbitrary JSON, grouped into collections.
 
@@ -199,12 +200,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_store_records",
     {
       title: "Store Records",
-      description: "Save one or many records to a collection (auto-creates the collection if new). Example: use when the user says 'save this' or has just produced structured output worth keeping for later.",
+      description: `Save one or many records to a collection (auto-creates the collection if new). The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. Example: use when the user says 'save this' or has just produced structured output worth keeping for later.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
         data: z.record(z.string(), z.unknown()).optional().describe("Single record as a JSON object (e.g. {\"title\": \"My note\", \"tags\": [\"work\"]}). Use this OR records, not both."),
         records: z.array(z.record(z.string(), z.unknown())).optional().describe("Array of record objects for storing multiple items at once (e.g. [{\"title\": \"A\"}, {\"title\": \"B\"}])"),
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do if a record with the same unique key exists. Default: replace"),
+        return: z.enum(["records", "summary"]).optional().describe("\"records\" (default) echoes each stored record; \"summary\" returns only counts and the summary line — use it for bulk loads."),
       }),
       annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
@@ -214,6 +216,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         data: params.data as Record<string, unknown> | undefined,
         records: params.records as Record<string, unknown>[] | undefined,
         on_conflict: params.on_conflict,
+        return: params.return,
       });
       if ('error' in result) {
         return errorResponse(result.error as string);
@@ -329,12 +332,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_import_records",
     {
       title: "Import Records",
-      description: "Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.",
+      description: `Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL} (content up to 10 MB). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
         format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
         content: z.string().max(10 * 1024 * 1024).describe("Raw CSV text (header row required) or a JSON array of objects. Max 10MB."),
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do when a record matches an existing unique key. Default: replace"),
+        return: z.enum(["records", "summary"]).optional().describe("\"summary\" (default) returns counts only; \"records\" also echoes each stored record."),
       }),
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
@@ -344,6 +348,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         format: params.format,
         content: params.content,
         on_conflict: params.on_conflict,
+        return: params.return,
       });
       if ('error' in result) return errorResponse(result.error as string);
       return summarizedWriteResponse(result, collectionUrl);

@@ -16,3 +16,7 @@ export const MAX_RECORD_SIZE = 1_000_000; // 1MB — enforced at the route and s
 
 export const FIELD_NAME_RE = /^[a-zA-Z0-9_]+$/;
 export const MAX_FIELD_NAME_LENGTH = 64;
+
+/** Upper bound on an MCP request body (hutch_store_records / hutch_import_records payloads). */
+export const MCP_MAX_REQUEST_BODY_BYTES = 16 * 1024 * 1024;
+export const MCP_MAX_REQUEST_BODY_LABEL = "16 MB";

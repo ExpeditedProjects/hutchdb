@@ -158,13 +158,13 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
       { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict'] },
+      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
       { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'search', 'slug', 'sort', 'time_bucket'] },
       { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
       { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
-      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records'] },
+      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
       { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
       { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
       { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
@@ -329,7 +329,7 @@ describe('tool input schemas and descriptions', () => {
   })
 })
 
-describe('query descriptions', () => {
+describe('query, store and import descriptions', () => {
   type Shape = Record<string, { description?: string; safeParse: (v: unknown) => { success: boolean } }>
   const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
   const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
@@ -360,6 +360,24 @@ describe('query descriptions', () => {
     expect(groupBy.safeParse('status').success).toBe(true)
     expect(groupBy.safeParse(['a', 'b.c', 'd']).success).toBe(true)
     expect(groupBy.safeParse(['a', 'b', 'c', 'd']).success).toBe(false)
+  })
+
+  it('states the 16 MB request body limit on store and import', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
+    expect(descriptionOf('hutch_import_records')).toContain('limited to 16 MB')
+    expect(shapeOf('hutch_store_records').return.safeParse('summary').success).toBe(true)
+    expect(shapeOf('hutch_import_records').return.safeParse('bogus').success).toBe(false)
+  })
+
+  it('forwards return to createRecords and importRecords', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'U', slug: 'u' }, count: 2 } as never)
+    vi.mocked(recordService.importRecords).mockResolvedValue({ collection: { name: 'U', slug: 'u' }, count: 2 } as never)
+    await registeredTools.get('hutch_store_records')!({ collection: 'U', records: [{ a: 1 }, { a: 2 }], return: 'summary' })
+    await registeredTools.get('hutch_import_records')!({ collection: 'U', content: 'a\n1', return: 'records' })
+    expect(recordService.createRecords).toHaveBeenCalledWith('user-1', 'org-test', expect.objectContaining({ return: 'summary' }))
+    expect(recordService.importRecords).toHaveBeenCalledWith('user-1', 'org-test', expect.objectContaining({ return: 'records' }))
   })
 
   it('forwards a multi-key group_by and sort to the service', async () => {

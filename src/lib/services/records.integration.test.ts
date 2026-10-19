@@ -669,6 +669,34 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("rejects more than 3 group_by keys", async () => {
       await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: ["a", "b", "c", "d"] })).rejects.toThrow(/at most 3 keys/);
     });
+
+    it("createRecords return: summary omits the stored records", async () => {
+      const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, {
+        collection: "legislators",
+        records: [{ name: "NEW1" }, { name: "NEW2" }],
+        return: "summary",
+      })) as Record<string, unknown>;
+      expect(result).not.toHaveProperty("results");
+      expect(result).toEqual(expect.objectContaining({ count: 2, created: 2, updated: 0, skipped: 0 }));
+      expect(result.summary).toMatch(/Saved 2 records/);
+
+      const single = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "legislators", data: { name: "NEW3" }, return: "summary" })) as Record<string, unknown>;
+      expect(single).not.toHaveProperty("record");
+      expect(single).toEqual(expect.objectContaining({ count: 1, created: 1, action: "created", id: expect.any(Number) }));
+
+      const echoed = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "legislators", records: [{ name: "NEW4" }] })) as Record<string, unknown>;
+      expect(echoed.results).toHaveLength(1);
+    });
+
+    it("importRecords defaults to summary and echoes records with return: records", async () => {
+      const summary = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "imported", content: "name\nA\nB\n" })) as Record<string, unknown>;
+      expect(summary).not.toHaveProperty("results");
+      expect(summary).toEqual(expect.objectContaining({ count: 2, created: 2 }));
+
+      const records = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "imported", content: "name\nC\n", return: "records" })) as Record<string, unknown>;
+      expect(records.results).toHaveLength(1);
+      expect(records).toEqual(expect.objectContaining({ count: 1, created: 1 }));
+    });
   });
 
   // ── e. upsert via unique_key ──────────────────────────────────────────────
