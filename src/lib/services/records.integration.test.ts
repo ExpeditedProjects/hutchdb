@@ -529,6 +529,148 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     });
   });
 
+  // ── d2. query API: dotted sort, sort validation, aggregate top-N ─────────
+
+  describe("query API fixes (sort, aggregate top-N, multi-key group_by)", () => {
+    // Ties on purpose: three at 29 and two at 5, inserted out of name order
+    // so a correct sort can't pass by accident of insertion order.
+    const legislators = [
+      { name: "WHITEHOUSE", party: "D", chamber: "Senate", totals: { veterans: { points: 5 } } },
+      { name: "BACON", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "WILD", party: "D", chamber: "House", totals: { veterans: { points: 13 } } },
+      { name: "AMODEI", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "NOVETS", party: "I", chamber: "Senate", totals: { other: { points: 99 } } },
+      { name: "ZINKE", party: "R", chamber: "House", totals: { veterans: { points: 5 } } },
+      { name: "WENSTRUP", party: "R", chamber: "House", totals: { veterans: { points: 28 } } },
+      { name: "BARR", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "HUNDRED", party: "D", chamber: "Senate", totals: { veterans: { points: 100 } } },
+    ];
+    let slug: string;
+
+    beforeEach(async () => {
+      slug = await seed("legislators", legislators);
+    });
+
+    async function names(params: Parameters<RecordsService["queryRecords"]>[2]) {
+      const result = await query(slug, params);
+      if (!("records" in result)) throw new Error("expected records shape");
+      return result.records.map((r) => (r.data as Record<string, unknown>).name);
+    }
+
+    async function groups(params: Parameters<RecordsService["queryRecords"]>[2]) {
+      const result = await query(slug, params);
+      if (!("results" in result)) throw new Error("expected aggregation shape");
+      return result as { results: Record<string, unknown>[]; total: number };
+    }
+
+    it("sorts descending on a dotted path numerically, missing values last, ties by insertion", async () => {
+      // As text, "5" > "29" > "100"; numeric jsonb order puts 100 first.
+      expect(await names({ sort: "-totals.veterans.points" })).toEqual([
+        "HUNDRED", "BACON", "AMODEI", "BARR", "WENSTRUP", "WILD", "WHITEHOUSE", "ZINKE", "NOVETS",
+      ]);
+    });
+
+    it("sorts ascending on a dotted path with missing values still last", async () => {
+      expect(await names({ sort: "totals.veterans.points", limit: 3 })).toEqual(["WHITEHOUSE", "ZINKE", "WILD"]);
+      const all = await names({ sort: "totals.veterans.points" });
+      expect(all[all.length - 1]).toBe("NOVETS");
+    });
+
+    it("top-N pages over ties are stable and partition the ordered set", async () => {
+      const first = await names({ sort: "-totals.veterans.points", limit: 3 });
+      for (let i = 0; i < 3; i++) expect(await names({ sort: "-totals.veterans.points", limit: 3 })).toEqual(first);
+      const page2 = await names({ sort: "-totals.veterans.points", limit: 3, offset: 3 });
+      expect([...first, ...page2]).toEqual(["HUNDRED", "BACON", "AMODEI", "BARR", "WENSTRUP", "WILD"]);
+    });
+
+    it("rejects an invalid sort field instead of falling back to created_at", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "-totals..points" }))
+        .rejects.toThrow(/Invalid sort field 'totals\.\.points'/);
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "name; DROP TABLE records" }))
+        .rejects.toThrow(/Invalid sort field/);
+    });
+
+    it("rejects a sort on a field or path no record has", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "-totals.veterans.pionts" }))
+        .rejects.toThrow(/no record in this collection has it/);
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "nonsense" }))
+        .rejects.toThrow(/no record in this collection has it/);
+    });
+
+    it("accepts a sort the filtered rows lack when other records have it", async () => {
+      expect(await names({ filter: { name: "NOVETS" }, sort: "-totals.veterans.points" })).toEqual(["NOVETS"]);
+    });
+
+    it("ignores soft-deleted records when checking the sort path exists", async () => {
+      const lone = await seed("lonely", [{ name: "kept" }, { name: "gone", score: 1 }]);
+      const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, lone));
+      await testDb.execute(sql`UPDATE records SET deleted_at = now() WHERE collection_id = ${coll.id} AND data->>'name' = 'gone'`);
+      await expect(recordsSvc.queryRecords(lone, USER_ID, { sort: "score" })).rejects.toThrow(/no record in this collection has it/);
+    });
+
+    it("keeps default order (created_at DESC) and accepts id / created_at sorts", async () => {
+      expect((await names({}))[0]).toBe("HUNDRED");
+      expect(await names({ sort: "id", limit: 2 })).toEqual(["WHITEHOUSE", "BACON"]);
+      expect(await names({ sort: "-id", limit: 2 })).toEqual(["HUNDRED", "BARR"]);
+      expect(await names({ sort: "created_at", limit: 2 })).toEqual(["WHITEHOUSE", "BACON"]);
+    });
+
+    it("filters on dotted paths with plain values and operators", async () => {
+      expect(await names({ filter: { "totals.veterans.points": 29 }, sort: "name" })).toEqual(["AMODEI", "BACON", "BARR"]);
+      expect(await names({ filter: { "totals.veterans.points": { $gte: 28 } }, sort: "name" })).toEqual(["AMODEI", "BACON", "BARR", "HUNDRED", "WENSTRUP"]);
+      expect(await names({ filter: { "totals.veterans": { $exists: false } } })).toEqual(["NOVETS"]);
+    });
+
+    it("aggregate sort by alias + limit returns the true top-N groups and the group total", async () => {
+      const result = await groups({
+        groupBy: "party",
+        aggregate: { points: { sum: "totals.veterans.points" }, n: "count" },
+        sort: "-points",
+        limit: 2,
+      });
+      expect(result.results).toEqual([
+        { party: "R", points: 120, n: 5 },
+        { party: "D", points: 118, n: 3 },
+      ]);
+      expect(result.total).toBe(3);
+    });
+
+    it("aggregate sort by group_by key ascending and descending", async () => {
+      const desc = await groups({ groupBy: "party", sort: "-party" });
+      expect(desc.results.map((r) => r.party)).toEqual(["R", "I", "D"]);
+      const asc = await groups({ groupBy: "party", sort: "count", limit: 1 });
+      expect(asc.results).toEqual([{ party: "I", count: 1 }]);
+      expect(asc.total).toBe(3);
+    });
+
+    it("aggregate without sort keeps group key ASC order", async () => {
+      expect((await groups({ groupBy: "party" })).results.map((r) => r.party)).toEqual(["D", "I", "R"]);
+    });
+
+    it("rejects an aggregate sort that is neither an alias nor a group key", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: "party", aggregate: { n: "count" }, sort: "-created_at" }))
+        .rejects.toThrow(/Invalid sort field 'created_at' for a group_by\/aggregate query/);
+    });
+
+    it("multi-key group_by names columns by key, including a dotted path", async () => {
+      const result = await groups({ groupBy: ["chamber", "party"], aggregate: { n: "count" }, sort: "-n" });
+      expect(result.results[0]).toEqual({ chamber: "House", party: "R", n: 5 });
+      expect(result.total).toBe(4);
+      expect(result.results.slice(1)).toEqual([
+        { chamber: "House", party: "D", n: 1 },
+        { chamber: "Senate", party: "D", n: 2 },
+        { chamber: "Senate", party: "I", n: 1 },
+      ].sort((a, b) => b.n - a.n || a.chamber.localeCompare(b.chamber) || a.party.localeCompare(b.party)));
+
+      const byPoints = await groups({ groupBy: ["party", "totals.veterans.points"], sort: "-count", limit: 1 });
+      expect(byPoints.results).toEqual([{ party: "R", "totals.veterans.points": "29", count: 3 }]);
+    });
+
+    it("rejects more than 3 group_by keys", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: ["a", "b", "c", "d"] })).rejects.toThrow(/at most 3 keys/);
+    });
+  });
+
   // ── e. upsert via unique_key ──────────────────────────────────────────────
 
   describe("createRecords upsert with unique_key", () => {

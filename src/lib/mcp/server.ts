@@ -5,7 +5,7 @@ import * as collectionService from "@/lib/services/collections";
 import * as recordService from "@/lib/services/records";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
-import { FILTER_OPERATORS } from "@/lib/db/queries";
+import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
 
 const SERVER_INSTRUCTIONS = `Hutch Core stores structured data for a single AI agent user. Records are arbitrary JSON, grouped into collections.
 
@@ -226,14 +226,14 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_query_records",
     {
       title: "Query Records",
-      description: "Fetch records from a collection with filter, search, sort, group_by, aggregate, time_bucket, and pagination. Example: use when the user asks 'show me bookmarks tagged work from last week'.",
+      description: "Fetch records from a collection with filter, search, sort, group_by, aggregate, time_bucket, and pagination. filter, sort, group_by and aggregate fields may be dotted paths into nested objects of any depth (e.g. \"totals.veterans.points\"); paths do not reach into arrays. sort orders records by a field or dotted path (numbers numerically, records missing the value last). With group_by/aggregate, sort takes an aggregate alias or a group_by key and limit applies after sorting, so sort: \"-points\" with limit: 10 returns the top 10 groups; aggregate responses include total (the number of groups before limit). group_by takes one key or an array of up to 3 keys; result columns are named by the key. An unknown sort field, or one no record in the collection has, is an error — never silently ignored. Example: use when the user asks 'show me bookmarks tagged work from last week'.",
       inputSchema: z.object({
         slug: z.string().describe("Collection slug"),
         filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
         search: z.string().optional().describe("Full-text search query. Use for free-text across string fields."),
-        sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
+        sort: z.string().optional().describe("Sort field, prefix with - for descending: a top-level field, a dotted object path (\"-totals.veterans.points\"), id, created_at or updated_at; with group_by/aggregate, an aggregate alias or group_by key (\"-points\"). Unknown fields are an error."),
         fields: z.array(z.string()).optional().describe("Projection: top-level data keys to include in each returned record's data (e.g. [\"title\", \"url\"]). System fields id/status/created_at/updated_at are always returned."),
-        group_by: z.string().optional().describe("Field to group by for aggregation (e.g. \"status\")"),
+        group_by: z.union([z.string(), z.array(z.string()).max(MAX_GROUP_BY_KEYS)]).optional().describe("Field(s) to group by for aggregation: one key (e.g. \"status\") or up to 3 (e.g. [\"chamber\", \"party\"]); dotted object paths allowed"),
         aggregate: z.record(z.string(), z.unknown()).optional().describe("Aggregation spec mapping result alias to \"count\" or {op: field} where op is min/max/distinct/sum/avg (e.g. {\"total\": \"count\", \"revenue\": {\"sum\": \"amount\"}}). sum/avg only aggregate numeric values and return null when a field has none. min/max compare numerically when a field has numeric values (ignoring non-numeric ones), otherwise as text (works for ISO dates), so with group_by one alias can be a number in some groups and a string in others."),
         time_bucket: z.string().optional().describe("Time bucket (hour, day, week, month, year)"),
         created_after: z.string().optional().describe("Filter records created after this ISO date (e.g. \"2026-07-01\" or \"2026-07-01T12:00:00Z\")"),
@@ -304,7 +304,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         format: z.enum(["json", "csv"]).optional().describe("Output format. Default: json"),
         filter: z.record(z.string(), z.unknown()).optional().describe(FILTER_DESCRIPTION),
         search: z.string().optional().describe("Full-text search query applied before export"),
-        sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
+        sort: z.string().optional().describe("Sort field, prefix with - for descending: a top-level field, a dotted object path (\"-totals.veterans.points\"), id, created_at or updated_at (e.g. \"-created_at\"). Unknown fields are an error."),
         fields: z.array(z.string()).optional().describe("Top-level data keys to include (CSV data columns / JSON data keys). Omit for all fields."),
         limit: z.number().optional().describe("Max records to export (default 1000, max 10000). Check the truncated flag in the response."),
       }),

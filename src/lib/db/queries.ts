@@ -1,7 +1,7 @@
 import { cache } from "react";
 import { db } from "./index";
 import { collections, records, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, desc, asc, isNull, inArray, SQL } from "drizzle-orm";
+import { eq, and, sql, asc, isNull, inArray, SQL } from "drizzle-orm";
 import { FIELD_NAME_RE } from "@/lib/constants";
 import { isPlainObject } from "@/lib/validation";
 
@@ -239,7 +239,8 @@ export type QueryParams = {
   searchFields?: string[];
   sort?: string;
   fields?: string[];
-  groupBy?: string;
+  /** One field, or up to MAX_GROUP_BY_KEYS fields; each may be a dotted object path. */
+  groupBy?: string | string[];
   aggregate?: Record<string, string | Record<string, string>>;
   timeBucket?: string;
   createdAfter?: string;
@@ -249,6 +250,33 @@ export type QueryParams = {
   /** Internal: raises the 1000-row limit ceiling (used by export). Not exposed via MCP. */
   limitCap?: number;
 };
+
+export const SORT_FIELD_HELP =
+  "sort accepts a top-level field name, a dotted path into nested objects (a.b.c), id, created_at or updated_at, optionally prefixed with - for descending";
+
+export const MAX_GROUP_BY_KEYS = 3;
+
+/**
+ * A field name, or a dotted path into nested objects ("totals.veterans.points").
+ * Every segment is letters, digits and underscores only, so a validated path
+ * can never carry quotes, braces or commas into SQL.
+ */
+const FIELD_PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
+
+/** Segments of a dotted object path, or null when `field` is not one (plain keys stay literal). */
+function dottedPathSegments(field: string): string[] | null {
+  return field.includes(".") && FIELD_PATH_RE.test(field) ? field.split(".") : null;
+}
+
+/** Postgres text[] literal for a validated path, bound as a parameter for `#>` / `#>>`. */
+function pathLiteral(segments: string[]): string {
+  return `{${segments.join(",")}}`;
+}
+
+/** {a: {b: {c: value}}} for path [a, b, c] — the containment shape of a dotted filter. */
+function nestValue(segments: string[], value: unknown): Record<string, unknown> {
+  return segments.reduceRight<unknown>((acc, key) => ({ [key]: acc }), value) as Record<string, unknown>;
+}
 
 export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
 export type FilterOperator = (typeof FILTER_OPERATORS)[number];
@@ -284,10 +312,15 @@ export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
   const containment: Record<string, unknown> = {};
 
   for (const [field, value] of Object.entries(filter)) {
+    // A dotted key ("address.city") addresses a nested object; any other
+    // key is a literal top-level key, exactly as before.
+    const path = dottedPathSegments(field);
     if (isOperatorSpec(value)) {
       for (const [op, operand] of Object.entries(value)) {
-        conditions.push(buildOperatorCondition(field, op, operand));
+        conditions.push(buildOperatorCondition(field, op, operand, path));
       }
+    } else if (path) {
+      conditions.push(sql`${records.data} @> ${JSON.stringify(nestValue(path, value))}::jsonb`);
     } else {
       containment[field] = value;
     }
@@ -300,14 +333,20 @@ export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
   return conditions;
 }
 
-function buildOperatorCondition(field: string, op: string, operand: unknown): SQL {
+function buildOperatorCondition(field: string, op: string, operand: unknown, path: string[] | null = null): SQL {
+  // Top-level fields keep their original `->` / `->>` / `?` SQL; dotted
+  // object paths use `#>` / `#>>` with the path bound as a text[] parameter.
+  const json = path ? sql`${records.data} #> ${pathLiteral(path)}::text[]` : sql`${records.data}->${field}`;
+  const text = path ? sql`${records.data} #>> ${pathLiteral(path)}::text[]` : sql`${records.data}->>${field}`;
+  const contains = (v: unknown) => JSON.stringify(path ? nestValue(path, v) : { [field]: v });
+
   if (Object.hasOwn(COMPARISON_OPS, op)) {
     const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
     if (typeof operand === "number") {
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'number' AND (${records.data}->>${field})::numeric ${cmp} ${operand})`;
+      return sql`(jsonb_typeof(${json}) = 'number' AND (${text})::numeric ${cmp} ${operand})`;
     }
     if (typeof operand === "string") {
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ${cmp} ${operand})`;
+      return sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ${cmp} ${operand})`;
     }
     throw new Error(`${op} requires a number or string operand`);
   }
@@ -315,7 +354,7 @@ function buildOperatorCondition(field: string, op: string, operand: unknown): SQ
   switch (op) {
     case "$ne":
       // Mongo semantics: matches records where the field differs OR is absent.
-      return sql`NOT (${records.data} @> ${JSON.stringify({ [field]: operand })}::jsonb)`;
+      return sql`NOT (${records.data} @> ${contains(operand)}::jsonb)`;
     case "$in":
     case "$nin": {
       if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
@@ -327,18 +366,22 @@ function buildOperatorCondition(field: string, op: string, operand: unknown): SQ
         return op === "$in" ? sql`false` : sql`true`;
       }
       const list = sql.join(operand.map((v) => sql`${JSON.stringify(v)}::jsonb`), sql`, `);
-      const inCondition = sql`${records.data}->${field} = ANY(ARRAY[${list}])`;
+      const inCondition = sql`${json} = ANY(ARRAY[${list}])`;
       return op === "$in"
         ? inCondition
-        : sql`(${records.data}->${field} IS NULL OR NOT (${inCondition}))`;
+        : sql`(${json} IS NULL OR NOT (${inCondition}))`;
     }
     case "$exists":
       if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+      if (path) {
+        // `#>` yields SQL NULL only when the key is absent (a stored JSON null is present).
+        return operand ? sql`${json} IS NOT NULL` : sql`${json} IS NULL`;
+      }
       return operand ? sql`${records.data} ? ${field}` : sql`NOT (${records.data} ? ${field})`;
     case "$contains": {
       if (typeof operand !== "string") throw new Error("$contains requires a string operand");
       const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ILIKE ${pattern})`;
+      return sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ILIKE ${pattern})`;
     }
     default:
       throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
@@ -397,31 +440,12 @@ export async function queryRecords(params: QueryParams) {
     : conditions[0];
 
   // Handle aggregation queries
-  if (groupBy || aggregate) {
-    return queryWithAggregation(whereClause, { groupBy, aggregate, timeBucket, limit });
+  const groupByKeys = normalizeGroupBy(groupBy);
+  if (groupByKeys.length > 0 || aggregate) {
+    return queryWithAggregation(whereClause, { groupBy: groupByKeys, aggregate, timeBucket, sort, limit });
   }
 
-  // Build sort
-  let orderBy: SQL;
-  if (sort) {
-    const descending = sort.startsWith("-");
-    const field = descending ? sort.slice(1) : sort;
-    if (field === "created_at") {
-      orderBy = descending ? desc(records.createdAt) : asc(records.createdAt);
-    } else if (field === "updated_at") {
-      orderBy = descending ? desc(records.updatedAt) : asc(records.updatedAt);
-    } else if (/^[a-zA-Z0-9_]+$/.test(field)) {
-      // `->` keeps jsonb typing so numbers sort numerically; `->>` would cast
-      // to text and sort them lexicographically ("12" < "3" < "5").
-      orderBy = descending
-        ? sql`${records.data}->${field} DESC NULLS LAST`
-        : sql`${records.data}->${field} ASC NULLS LAST`;
-    } else {
-      orderBy = desc(records.createdAt);
-    }
-  } else {
-    orderBy = desc(records.createdAt);
-  }
+  const { orderBy, valuePath: sortPath } = buildRecordSort(sort);
 
   const clampedLimit = Math.min(Math.max(limit, 1), limitCap);
 
@@ -439,12 +463,14 @@ export async function queryRecords(params: QueryParams) {
   if (offset === 0) {
     // First page: wait for results; if they fit in one page, results.length is the total.
     results = await selectQuery;
+    await assertSortedPageIsOrdered(collectionId, sort, sortPath, results);
     total = results.length < clampedLimit ? results.length : await runCount(whereClause);
   } else {
     // Paginated read: count and results are independent — run in parallel.
     const [rs, [{ count }]] = await Promise.all([selectQuery, runCountQuery(whereClause)]);
     results = rs;
     total = count;
+    await assertSortedPageIsOrdered(collectionId, sort, sortPath, results);
   }
 
   const projected = fields && fields.length > 0
@@ -463,6 +489,76 @@ export async function queryRecords(params: QueryParams) {
   };
 }
 
+/**
+ * ORDER BY for a records query. `valuePath` is the data path the sort reads
+ * (absent for system columns and `id`), used to detect a sort on a field no
+ * record has. Every order ends on the row id so ties (equal values, records
+ * from one batch sharing created_at) come back in the same order every time
+ * and top-N pages are stable.
+ */
+export function buildRecordSort(sort: string | undefined): { orderBy: SQL; valuePath?: string[] } {
+  if (sort === undefined || sort === null || sort === "") {
+    return { orderBy: sql`${records.createdAt} DESC, ${records.id} DESC` };
+  }
+  const descending = sort.startsWith("-");
+  const field = descending ? sort.slice(1) : sort;
+  const dir = sql.raw(descending ? "DESC" : "ASC");
+
+  if (field === "created_at") return { orderBy: sql`${records.createdAt} ${dir}, ${records.id} ${dir}` };
+  if (field === "updated_at") return { orderBy: sql`${records.updatedAt} ${dir}, ${records.id} ${dir}` };
+  if (field === "id") {
+    // A data field named `id` sorts as it always has; records without one
+    // (the usual case) fall through to the record id, so `id` is always valid.
+    return { orderBy: sql`${records.data}->${field} ${dir} NULLS LAST, ${records.id} ${dir}` };
+  }
+  if (FIELD_NAME_RE.test(field)) {
+    // `->` keeps jsonb typing so numbers sort numerically; `->>` would cast
+    // to text and sort them lexicographically ("12" < "3" < "5").
+    return { orderBy: sql`${records.data}->${field} ${dir} NULLS LAST, ${records.id} ASC`, valuePath: [field] };
+  }
+  const path = dottedPathSegments(field);
+  if (path) {
+    // `#>` keeps jsonb typing too.
+    return { orderBy: sql`${records.data} #> ${pathLiteral(path)}::text[] ${dir} NULLS LAST, ${records.id} ASC`, valuePath: path };
+  }
+  throw new Error(`Invalid sort field '${field}' — ${SORT_FIELD_HELP}`);
+}
+
+function valueAtPath(data: unknown, path: string[]): unknown {
+  let current: unknown = data;
+  for (const key of path) {
+    if (!isPlainObject(current) || !Object.hasOwn(current, key)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+/**
+ * A sort on a field or path no record has (a typo, or a path into an
+ * array) orders every row by NULL and would silently return the default
+ * order. Sorting is NULLS LAST, so when the page's first row has a value
+ * the sort was applied and no extra query runs; otherwise one EXISTS
+ * probe over the collection's live records decides whether to refuse it.
+ * An empty page has no order to get wrong.
+ */
+async function assertSortedPageIsOrdered(
+  collectionId: number,
+  sort: string | undefined,
+  path: string[] | undefined,
+  rows: { data: unknown }[],
+): Promise<void> {
+  if (!path || rows.length === 0 || valueAtPath(rows[0].data, path) !== undefined) return;
+  const [found] = await db
+    .select({ one: sql<number>`1` })
+    .from(records)
+    .where(and(eq(records.collectionId, collectionId), notDeleted, sql`${records.data} #> ${pathLiteral(path)}::text[] IS NOT NULL`))
+    .limit(1);
+  if (!found) {
+    const field = sort!.startsWith("-") ? sort!.slice(1) : sort!;
+    throw new Error(`Invalid sort field '${field}': no record in this collection has it — ${SORT_FIELD_HELP}`);
+  }
+}
+
 function runCountQuery(whereClause: SQL) {
   return db
     .select({ count: sql<number>`count(*)::int` })
@@ -477,29 +573,78 @@ async function runCount(whereClause: SQL): Promise<number> {
 
 const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
 
-async function queryWithAggregation(
+/** Internal column carrying the group count; stripped from every result row. */
+const TOTAL_COLUMN = "__hutch_total";
+
+export function normalizeGroupBy(groupBy: string | string[] | undefined): string[] {
+  if (Array.isArray(groupBy)) {
+    if (groupBy.length > MAX_GROUP_BY_KEYS) throw new Error(`group_by accepts at most ${MAX_GROUP_BY_KEYS} keys`);
+    for (const key of groupBy) {
+      if (typeof key !== "string") throw new Error("group_by must be a field name or an array of field names");
+      escapeFieldPath(key);
+    }
+    return groupBy;
+  }
+  return groupBy ? [groupBy] : [];
+}
+
+/** `data->'f'` for a top-level field, `data #> '{a,b,c}'` for a dotted object path (jsonb). */
+function jsonbAt(field: string): string {
+  const segments = escapeFieldPath(field).split(".");
+  return segments.length === 1 ? `data->'${segments[0]}'` : `data #> '${pathLiteral(segments)}'`;
+}
+
+/** `data->>'f'` / `data #>> '{a,b,c}'` (text). */
+function textAt(field: string): string {
+  const segments = escapeFieldPath(field).split(".");
+  return segments.length === 1 ? `data->>'${segments[0]}'` : `data #>> '${pathLiteral(segments)}'`;
+}
+
+/**
+ * Build the aggregate statement. Every identifier and path is validated
+ * (escapeField / escapeFieldPath) before it is interpolated; filter values
+ * stay bound parameters inside whereClause.
+ *
+ * Ordering happens before LIMIT, so `sort: "-alias", limit: 10` is the true
+ * top 10 groups. `count(*) OVER ()` runs after grouping and before LIMIT,
+ * giving the number of groups for the response's `total`.
+ */
+export function buildAggregationQuery(
   whereClause: SQL,
-  params: { groupBy?: string; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; limit?: number }
-) {
-  const { groupBy, aggregate, timeBucket, limit = 50 } = params;
+  params: { groupBy?: string[]; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; sort?: string; limit?: number }
+): SQL {
+  const { groupBy = [], aggregate, timeBucket, sort, limit = 50 } = params;
 
   const selectParts: string[] = [];
   const groupByParts: string[] = [];
+  // Output columns addressable by sort, mapped to their select-list ordinal.
+  // Ordinals keep ORDER BY unambiguous with real columns such as `status`.
+  const sortable = new Map<string, number>();
+  const defaultOrder: number[] = [];
 
   if (timeBucket) {
     selectParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at) as time_bucket`);
     groupByParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at)`);
+    sortable.set("time_bucket", selectParts.length);
+    defaultOrder.push(selectParts.length);
   }
 
-  if (groupBy) {
-    selectParts.push(`data->>'${escapeField(groupBy)}' as "${escapeField(groupBy)}"`);
-    groupByParts.push(`data->>'${escapeField(groupBy)}'`);
+  for (const key of groupBy) {
+    // Result columns are named by the key itself; a validated path only
+    // holds [a-zA-Z0-9_.], so it is safe inside a quoted identifier.
+    selectParts.push(`${textAt(key)} as "${escapeFieldPath(key)}"`);
+    groupByParts.push(textAt(key));
+    sortable.set(key, selectParts.length);
+    // Without a time bucket the first group key leads the default order, as
+    // before; further keys make the order within it deterministic.
+    defaultOrder.push(selectParts.length);
   }
 
   if (aggregate) {
     for (const [alias, spec] of Object.entries(aggregate)) {
       if (spec === "count" || (isPlainObject(spec) && "count" in spec)) {
         selectParts.push(`count(*)::int as "${escapeField(alias)}"`);
+        sortable.set(alias, selectParts.length);
         continue;
       }
       const specEntry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
@@ -508,21 +653,22 @@ async function queryWithAggregation(
         throw new Error(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
       }
       const [op, field] = specEntry;
-      const safeField = escapeField(field);
+      const json = jsonbAt(field);
+      const text = textAt(field);
       const safeAlias = escapeField(alias);
       // Numeric values only (jsonb_typeof guard), so mixed-type fields can't
       // raise cast errors. Results go through to_jsonb because node-postgres
       // returns a bare numeric as a string; jsonb comes back as a JS number.
-      const numeric = `CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END`;
+      const numeric = `CASE WHEN jsonb_typeof(${json}) = 'number' THEN (${text})::numeric END`;
       switch (op) {
         case "min":
         case "max":
           // Numeric when the field holds any numbers (as text "10" < "9"),
           // otherwise text so strings and ISO dates still order correctly.
-          selectParts.push(`coalesce(to_jsonb(${op}(${numeric})), to_jsonb(${op}(data->>'${safeField}'))) as "${safeAlias}"`);
+          selectParts.push(`coalesce(to_jsonb(${op}(${numeric})), to_jsonb(${op}(${text}))) as "${safeAlias}"`);
           break;
         case "distinct":
-          selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
+          selectParts.push(`array_agg(distinct ${text}) as "${safeAlias}"`);
           break;
         case "sum":
         case "avg":
@@ -532,16 +678,33 @@ async function queryWithAggregation(
         default:
           throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
       }
+      sortable.set(alias, selectParts.length);
     }
   } else {
     selectParts.push("count(*)::int as count");
+    sortable.set("count", selectParts.length);
   }
+
+  let order = defaultOrder.map((n) => `${n} ASC`);
+  if (sort) {
+    const descending = sort.startsWith("-");
+    const field = descending ? sort.slice(1) : sort;
+    const ordinal = sortable.get(field);
+    if (ordinal === undefined) {
+      throw new Error(
+        `Invalid sort field '${field}' for a group_by/aggregate query — sort accepts an aggregate alias or a group_by key here (${[...sortable.keys()].join(", ")}), optionally prefixed with - for descending`
+      );
+    }
+    order = [`${ordinal} ${descending ? "DESC" : "ASC"} NULLS LAST`, ...defaultOrder.filter((n) => n !== ordinal).map((n) => `${n} ASC`)];
+  }
+
+  selectParts.push(`count(*) OVER ()::int as "${TOTAL_COLUMN}"`);
 
   const selectClause = selectParts.join(", ");
   const groupClause = groupByParts.length > 0 ? `GROUP BY ${groupByParts.join(", ")}` : "";
-  const orderClause = timeBucket ? "ORDER BY time_bucket ASC" : (groupBy ? `ORDER BY "${escapeField(groupBy)}" ASC` : "");
+  const orderClause = order.length > 0 ? `ORDER BY ${order.join(", ")}` : "";
 
-  const query = sql`
+  return sql`
     SELECT ${sql.raw(selectClause)}
     FROM records
     WHERE ${whereClause}
@@ -549,14 +712,30 @@ async function queryWithAggregation(
     ${sql.raw(orderClause)}
     LIMIT ${Math.min(limit, 1000)}
   `;
+}
 
-  const rows = await db.execute(query);
-  return { results: rows.rows };
+async function queryWithAggregation(
+  whereClause: SQL,
+  params: { groupBy?: string[]; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; sort?: string; limit?: number }
+) {
+  const rows = await db.execute(buildAggregationQuery(whereClause, params));
+  const raw = rows.rows as Record<string, unknown>[];
+  const total = raw.length > 0 ? Number(raw[0][TOTAL_COLUMN] ?? raw.length) : 0;
+  const results = raw.map(({ [TOTAL_COLUMN]: _total, ...rest }) => rest);
+  return { results, total };
 }
 
 function escapeField(field: string): string {
   if (!FIELD_NAME_RE.test(field)) {
     throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
+  }
+  return field;
+}
+
+/** escapeField for a field or a dotted path into nested objects (each segment as strict as a field name). */
+function escapeFieldPath(field: string): string {
+  if (typeof field !== "string" || !FIELD_PATH_RE.test(field)) {
+    throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed, with dots separating nested object keys`);
   }
   return field;
 }

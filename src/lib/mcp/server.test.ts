@@ -329,6 +329,47 @@ describe('tool input schemas and descriptions', () => {
   })
 })
 
+describe('query descriptions', () => {
+  type Shape = Record<string, { description?: string; safeParse: (v: unknown) => { success: boolean } }>
+  const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
+  const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
+
+  it('describes dotted object paths, alias/key sort with top-N, total, multi-key group_by and unknown-sort errors', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const description = descriptionOf('hutch_query_records')
+    expect(description).toMatch(/dotted paths into nested objects of any depth/)
+    expect(description).toMatch(/aggregate alias or a group_by key and limit applies after sorting/)
+    expect(description).toMatch(/include total/)
+    expect(description).toMatch(/array of up to 3 keys/)
+    expect(description).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
+    expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
+  })
+
+  it('does not describe storage-layout features this layout lacks', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const text = [descriptionOf('hutch_query_records'), descriptionOf('hutch_store_records'), descriptionOf('hutch_import_records'),
+      ...Object.values(shapeOf('hutch_query_records')).map((f) => f.description ?? '')].join('\n')
+    for (const forbidden of [/indexed/i, /\bplan\b/i, /queryable automatically/i, /unwind/i, /`record`/, /record: false/]) {
+      expect(text).not.toMatch(forbidden)
+    }
+  })
+
+  it('accepts group_by as a string or up to 3 keys', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const groupBy = shapeOf('hutch_query_records').group_by
+    expect(groupBy.safeParse('status').success).toBe(true)
+    expect(groupBy.safeParse(['a', 'b.c', 'd']).success).toBe(true)
+    expect(groupBy.safeParse(['a', 'b', 'c', 'd']).success).toBe(false)
+  })
+
+  it('forwards a multi-key group_by and sort to the service', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: ['chamber', 'party'], aggregate: { n: 'count' }, sort: '-n', limit: 10 })
+    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }))
+  })
+})
+
 describe('store_records tool', () => {
   it('forwards params to recordService.createRecords and returns the result as JSON text', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
