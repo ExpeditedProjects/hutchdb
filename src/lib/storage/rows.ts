@@ -540,6 +540,25 @@ export async function tableBytes(collectionId: number): Promise<number> {
 }
 
 /**
+ * Approximate table size (heap + TOAST) of several collections from
+ * pg_class (relpages, as of the last VACUUM, ANALYZE or index build): a
+ * catalog read that takes no lock on the tables, so a table another
+ * session holds locked does not block it the way pg_table_size would. A
+ * collection without a table is left out.
+ */
+export async function approxTableBytesOf(collectionIds: number[]): Promise<Map<number, number>> {
+  const sizes = new Map<number, number>();
+  if (collectionIds.length === 0) return sizes;
+  const result = await db.execute(sql`
+    SELECT w.id, ((c.relpages + coalesce(t.relpages, 0))::float8 * current_setting('block_size')::int) AS bytes
+    FROM unnest(${toIntArrayLiteral(collectionIds)}::int[]) AS w(id)
+    JOIN pg_class c ON c.relname = 'hc_' || w.id AND c.relnamespace = current_schema()::regnamespace
+    LEFT JOIN pg_class t ON t.oid = c.reltoastrelid`);
+  for (const row of result.rows as { id: number; bytes: number }[]) sizes.set(Number(row.id), Number(row.bytes));
+  return sizes;
+}
+
+/**
  * Collections whose table (tableBytes) is at most this large get exact
  * figures that read every document — field fill rates in
  * hutch_collection_stats, distinct counts in describe; larger ones get

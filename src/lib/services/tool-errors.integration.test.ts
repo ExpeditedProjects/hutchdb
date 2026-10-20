@@ -39,7 +39,7 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
   let collectionsSvc: CollectionsService;
   let errors: Errors;
   let appDb: typeof import("@/lib/db").db;
-  const saved = { url: process.env.HUTCH_DATABASE_URL, timeout: process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS };
+  const saved = { url: process.env.HUTCH_DATABASE_URL, timeout: process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS, threshold: process.env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES };
 
   beforeAll(async () => {
     process.env.HUTCH_DATABASE_URL = TEST_DB_URL;
@@ -58,6 +58,7 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
   });
 
   beforeEach(async () => {
+    delete process.env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES;
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
     for (const row of tables.rows as { tablename: string }[]) {
@@ -68,7 +69,7 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
   afterAll(async () => {
     await appPool?.end();
     await testPool?.end();
-    for (const [key, value] of [["HUTCH_DATABASE_URL", saved.url], ["HUTCH_DB_STATEMENT_TIMEOUT_MS", saved.timeout]] as const) {
+    for (const [key, value] of [["HUTCH_DATABASE_URL", saved.url], ["HUTCH_DB_STATEMENT_TIMEOUT_MS", saved.timeout], ["HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", saved.threshold]] as const) {
       if (value === undefined) delete process.env[key];
       else process.env[key] = value;
     }
@@ -82,12 +83,12 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
     return { slug, id: coll.id };
   }
 
-  /** Run `fn` while another connection holds an ACCESS EXCLUSIVE lock on hc_<id>. */
-  async function whileLocked<T>(collectionId: number, fn: () => Promise<T>): Promise<T> {
+  /** Run `fn` while another connection holds an ACCESS EXCLUSIVE lock on hc_<id> (each of them). */
+  async function whileLocked<T>(collectionId: number | number[], fn: () => Promise<T>): Promise<T> {
     const client: PoolClient = await testPool.connect();
     try {
       await client.query("BEGIN");
-      await client.query(`LOCK TABLE hc_${collectionId} IN ACCESS EXCLUSIVE MODE`);
+      await client.query(`LOCK TABLE ${[collectionId].flat().map((id) => `hc_${id}`).join(", ")} IN ACCESS EXCLUSIVE MODE`);
       return await fn();
     } finally {
       await client.query("ROLLBACK");
@@ -166,6 +167,9 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
   it("hutch_search returns the matches of the collections that answered and names the one that timed out", async () => {
     const fast = await seed("Fast Notes", [{ text: "zebra crossing", n: 1 }, { text: "giraffe", n: 2 }]);
     const slow = await seed("Slow Notes", [{ text: "zebra stripes", n: 3 }]);
+    // The slow table is over the search-index threshold (by its pg_class size, once analyzed) with no index queued: it gets its own time limit.
+    await testDb.execute(sql`VACUUM ANALYZE ${sql.identifier(`hc_${slow.id}`)}`);
+    process.env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES = "8192";
     const started = Date.now();
     const result = await whileLocked(slow.id, () => recordsSvc.searchGlobal(USER_ID, "zebra", 10)) as unknown as GlobalSearch;
     const elapsed = Date.now() - started;
@@ -175,8 +179,52 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
     expect(result.not_searched).toEqual([{ collection: { name: "Slow Notes", slug: slow.slug }, reason: expect.stringMatching(/^timed out: it has no full-text index/) }]);
     expect(result.note).toMatch(/^1 of 2 collections did not answer in time, so any matches in them are missing: 'Slow Notes'\. To search one of them, use hutch_query_records with search/);
     for (const leak of LEAKS) expect(JSON.stringify(result)).not.toMatch(leak);
-    // Each collection gets half the statement timeout (400ms here), not all of it.
-    expect(elapsed).toBeLessThan(380);
+    // The call answers within the statement timeout (400ms here): the slow collection got half of it.
+    expect(elapsed).toBeLessThan(Number(TIMEOUT_MS));
+  });
+
+  /** Mark collections' search index as queued (pending), as a large table's is until it is built. */
+  async function markSearchPending(ids: number[]) {
+    for (const id of ids) {
+      await testDb.update(schema.collections)
+        .set({ storage: { projections: [], unwinds: [], evaluated_rows: 1, search_index: { reason: "r", build: { state: "pending", at: "2026-10-20T00:00:00Z" } } } })
+        .where(eq(schema.collections.id, id));
+    }
+  }
+
+  it("hutch_search gives a collection whose full-text index is not ready its own time limit (half the statement timeout)", async () => {
+    await seed("Fast Notes", [{ text: "zebra crossing", n: 1 }]);
+    const slow = await seed("Slow Notes", [{ text: "zebra stripes", n: 3 }]);
+    await markSearchPending([slow.id]);
+    const started = Date.now();
+    const result = await whileLocked(slow.id, () => recordsSvc.searchGlobal(USER_ID, "zebra", 10)) as unknown as GlobalSearch;
+    expect(Date.now() - started).toBeLessThan(300);
+    expect(result.not_searched).toEqual([{ collection: { name: "Slow Notes", slug: slow.slug }, reason: expect.stringMatching(/^timed out: its full-text index is still being built/) }]);
+  });
+
+  it("hutch_search runs a small collection with no queued index as one statement, without a time limit of its own", async () => {
+    const fast = await seed("Fast Notes", [{ text: "zebra crossing", n: 1 }]);
+    const small = await seed("Small Notes", [{ text: "zebra stripes", n: 3 }]);
+    const started = Date.now();
+    const result = await whileLocked(small.id, () => recordsSvc.searchGlobal(USER_ID, "zebra", 10)) as unknown as GlobalSearch;
+    // Only the statement timeout stopped it (a lock on a small table is rare; its search is otherwise quick).
+    expect(Date.now() - started).toBeGreaterThanOrEqual(Number(TIMEOUT_MS) - 20);
+    expect(result.results.map((g) => g.collection.slug)).toEqual([fast.slug]);
+    expect(result.not_searched).toEqual([{ collection: { name: "Small Notes", slug: small.slug }, reason: expect.stringMatching(/^timed out/) }]);
+  });
+
+  it("hutch_search names the collections it had no time left to start", async () => {
+    const colls = [];
+    for (let i = 0; i < 10; i++) colls.push(await seed(`Busy ${i}`, [{ text: "zebra", n: i }]));
+    await markSearchPending(colls.map((c) => c.id));
+    // Four at a time, each cut at half the 400ms: two rounds use up the call's time, and the rest never start.
+    const result = await whileLocked(colls.map((c) => c.id), () => recordsSvc.searchGlobal(USER_ID, "zebra", 10)) as unknown as GlobalSearch;
+    expect(result.incomplete).toBe(true);
+    expect(result.results).toEqual([]);
+    expect(result.not_searched).toHaveLength(10);
+    const reasons = result.not_searched!.map((n) => n.reason);
+    expect(reasons.filter((r) => r === "not searched: the time for this call ran out before its turn").length).toBeGreaterThan(0);
+    expect(reasons.filter((r) => /^timed out: its full-text index is still being built/.test(r)).length).toBeGreaterThan(0);
   });
 
   it("hutch_search is complete, with no note, when every collection answers", async () => {

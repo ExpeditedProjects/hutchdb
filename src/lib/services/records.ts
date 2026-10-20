@@ -11,9 +11,9 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
-import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
+import { isReady, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout, setUniqueKey } from "@/lib/storage/ddl";
-import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
+import { applyInference, markMixedProjections, recheckMixedProjections, searchIndexThresholdFromEnv, updateRegistry } from "@/lib/storage/apply";
 import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
@@ -566,6 +566,7 @@ export async function searchGlobal(userId: string, search: string, limit: number
     );
   for (const coll of accessible) queueDueIndexBuild(coll);
   const { perCollectionMs, deadline } = searchTimeLimits(Date.now());
+  const limited = perCollectionMs === undefined ? new Set<number>() : await searchMayBeSlow(accessible);
   const missed = new Map<number, string>();
   // Bounded concurrency; results are concatenated in collection order, as
   // the serial loop did, so the stable sort below ranks ties the same way.
@@ -576,7 +577,10 @@ export async function searchGlobal(userId: string, search: string, limit: number
       return [];
     }
     try {
-      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs: perCollectionMs === undefined ? undefined : Math.min(perCollectionMs, remaining) })).map((row) => ({ coll, row }));
+      // Only a collection that may read every document gets its own time
+      // limit (a transaction of its own); the rest run as one statement.
+      const timeoutMs = perCollectionMs !== undefined && limited.has(coll.id) ? Math.min(perCollectionMs, remaining) : undefined;
+      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs })).map((row) => ({ coll, row }));
     } catch (err) {
       if (classifyDbError(err) !== "timeout") throw err;
       missed.set(coll.id, searchTimeoutReason(coll.storage));
@@ -632,6 +636,27 @@ export async function searchGlobal(userId: string, search: string, limit: number
       }
       : {}),
   };
+}
+
+/**
+ * The collections whose search may be slow, so they get the per-collection
+ * time limit: no ready full-text index, and either one is queued, being
+ * built or failed, or the table is over the search-index threshold (by
+ * its pg_class size estimate, for collections inference never queued an
+ * index for: inference queues one on the write that crosses it).
+ * Small or indexed collections answer quickly.
+ */
+async function searchMayBeSlow(colls: { id: number; storage: unknown }[]): Promise<Set<number>> {
+  const slow = new Set<number>();
+  const unqueued: number[] = [];
+  for (const coll of colls) {
+    const index = readRegistry(coll.storage).search_index;
+    if (!index) unqueued.push(coll.id);
+    else if (!isReady(index)) slow.add(coll.id);
+  }
+  const threshold = searchIndexThresholdFromEnv();
+  for (const [id, bytes] of await tableRows.approxTableBytesOf(unqueued)) if (bytes >= threshold) slow.add(id);
+  return slow;
 }
 
 /** Collections not started with less than this left of the call's time are reported as not searched. */
