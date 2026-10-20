@@ -4,7 +4,9 @@ import {
   declareFields,
   declareNestedFields,
   inferDecisions,
+  surveyArrays,
   thresholdsFromEnv,
+  MAX_PROJECTED_TEXT,
   MAX_PROJECTIONS,
   type InferenceInput,
 } from './inference'
@@ -348,5 +350,47 @@ describe('nested object paths', () => {
     expect(d.unwinds.map((u) => u.path)).toEqual(['scores', 'votes'])
     expect(d.projections.map((p) => p.field).sort()).toEqual(['bioguide_id', 'chamber', 'congress', 'govtrack_id', 'icpsr', 'name', 'opensecrets_id', 'party', 'state'])
     expect(d.projections.some((p) => p.field.startsWith('totals.'))).toBe(false)
+  })
+})
+
+describe('long text and pending unwinds', () => {
+  const long = 'x'.repeat(300)
+
+  it('never declares a text field holding a value over MAX_PROJECTED_TEXT characters', () => {
+    const batch = docs(20, (i) => ({ title: `t${i}`, body: i === 3 ? long : 'short', meta: { note: i === 5 ? long : 'n' } }))
+    expect(declareFields(batch).map((f) => f.field)).toEqual(['title'])
+    expect(declareNestedFields(batch).map((f) => f.field)).toEqual([])
+    expect(MAX_PROJECTED_TEXT).toBe(256)
+  })
+
+  it('leaves long text out of an unwind (the btree cannot index it) and still unwinds', () => {
+    const batch = docs(50, (i) => ({ id: i, answers: [{ answer_id: i, score: i % 7, body: long }] }))
+    const d = inferDecisions(input({ docs: batch, rowCount: 50, elementCounts: { answers: 150 } }))
+    expect(d.unwinds.map((u) => u.path)).toEqual(['answers'])
+    expect(d.unwinds[0].fields.map((f) => f.field)).toEqual(['answer_id', 'score'])
+  })
+
+  it('says why an array of objects is not unwound yet', () => {
+    const below = docs(20, (i) => ({ votes: [{ k: i }] }))
+    expect(inferDecisions(input({ docs: below, rowCount: 20, elementCounts: { votes: 40 } })).pending)
+      .toEqual([{ path: 'votes', reason: "'votes' holds 40 elements across the collection; it is unwound at 100." }])
+
+    const sparse = docs(20, (i) => (i < 5 ? { items: [{ k: i }] } : { other: i }))
+    expect(surveyArrays(sparse).rejected[0].reason).toMatch(/array of objects in only 25% of the last batch's documents \(needs 90%\)/)
+
+    const mixed = docs(20, (i) => ({ items: i % 2 ? [{ k: i }] : [{ k: i }, 'loose'] }))
+    expect(surveyArrays(mixed).rejected[0].reason).toMatch(/mixes objects with other values in 10 of 20 documents/)
+
+    const noKey = docs(10, (i) => ({ items: [{ [`k${i}`]: i }] }))
+    expect(surveyArrays(noKey).rejected[0].reason).toMatch(/nothing to index/)
+
+    // Arrays of scalars and empty arrays are never reported.
+    expect(surveyArrays(docs(10, () => ({ tags: ['a'], empty: [] }))).rejected).toEqual([])
+  })
+
+  it('reports nothing for a path that is already unwound', () => {
+    const registry: StorageRegistry = { ...EMPTY_REGISTRY, unwinds: [{ path: 'votes', table: 'hc_1__votes', fields: [], reason: 'r' }] }
+    const batch = docs(20, (i) => ({ votes: [{ k: i }] }))
+    expect(inferDecisions(input({ docs: batch, registry, rowCount: 20, elementCounts: { votes: 40 } })).pending).toEqual([])
   })
 })

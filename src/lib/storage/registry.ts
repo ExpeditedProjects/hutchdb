@@ -53,6 +53,8 @@ export type StorageRegistry = {
   evaluated_rows: number;
   /** Unique key the uk_* columns and hc_<id>_uk index currently reflect. */
   unique_key?: string[];
+  /** Arrays of objects that are not unwound yet, each with the latest reason (below threshold, mixed shapes, a failed attempt, ...). */
+  pending_unwinds?: { path: string; reason: string }[];
 };
 
 export const EMPTY_REGISTRY: StorageRegistry = { projections: [], unwinds: [], evaluated_rows: 0 };
@@ -76,6 +78,7 @@ export function readRegistry(raw: unknown): StorageRegistry {
     unwinds: Array.isArray(r.unwinds) ? r.unwinds : [],
     evaluated_rows: typeof r.evaluated_rows === "number" ? r.evaluated_rows : 0,
     ...(Array.isArray(r.unique_key) ? { unique_key: r.unique_key } : {}),
+    ...(Array.isArray(r.pending_unwinds) ? { pending_unwinds: r.pending_unwinds } : {}),
   };
 }
 
