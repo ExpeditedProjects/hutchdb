@@ -220,7 +220,7 @@ export function storageChangeNote(before: StorageRegistry, after: StorageRegistr
   if (projected.length > 0) parts.push(`indexes on ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")}`);
   if (unwound.length > 0) parts.push(`unwinding ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (so filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can use indexes)`);
   if (search) parts.push("a full-text index for search");
-  return `This batch queued ${parts.join(", ")}. They are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until they are ready, queries return the same results without them.`;
+  return `This batch queued ${parts.join(", ")}. Indexes are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until one is ready, queries return the same results without it.`;
 }
 
 type CollectionRow = typeof collections.$inferSelect;

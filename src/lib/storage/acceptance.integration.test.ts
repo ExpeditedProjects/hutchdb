@@ -623,7 +623,7 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       expect(first.storage_note).toBeUndefined();
       const second = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(50), return: "summary" })) as Record<string, unknown>;
       // The write only queues the builds; they run in the background after the response.
-      expect(second.storage_note).toMatch(/^This batch queued indexes on fields .*'owner_user_id'.*, unwinding 'answers' into a queryable table .*\. They are built in the background shortly after this write/);
+      expect(second.storage_note).toMatch(/^This batch queued indexes on fields .*'owner_user_id'.*, unwinding 'answers' into a queryable table .*\. Indexes are built in the background shortly after this write/);
       expect(second.summary).toContain(second.storage_note as string);
       expect(first.use).toBe(`Pass slug "${(first.collection as { slug: string }).slug}" to other tools for this collection; its name "Questions" works too.`);
       const third = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: makeQuestions(3), return: "summary" })) as Record<string, unknown>;

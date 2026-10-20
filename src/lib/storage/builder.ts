@@ -209,14 +209,19 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
     let mixed = false;
     if (item.kind === "projection") {
       index = indexName(table, item.projection.column);
-      await dropInvalidIndex(client, index);
-      await client.query(await projectionIndexDdl(db, collectionId, item.projection));
+      const ddl = await projectionIndexDdl(db, collectionId, item.projection);
+      await withoutLockTimeout(client, async () => {
+        await dropInvalidIndex(client, index!);
+        await client.query(ddl);
+      });
       await assertValidIndex(client, index);
       mixed = await hasMisfits(ex, collectionId, item.projection);
     } else if (item.kind === "search") {
       index = searchIndexName(table);
-      await dropInvalidIndex(client, index);
-      await ex.execute(searchIndexDdl(collectionId));
+      await withoutLockTimeout(client, async () => {
+        await dropInvalidIndex(client, index!);
+        await ex.execute(searchIndexDdl(collectionId));
+      });
       await assertValidIndex(client, index);
     } else {
       await buildUnwind(ex, client, collectionId, item.unwind);
@@ -229,7 +234,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
       try {
         // Cleanup gets at least a minute even when the build's limit was tiny.
         await client.query(`SET statement_timeout = ${Math.max(buildTimeoutMs(), CLEANUP_TIMEOUT_MS)}`);
-        await dropInvalidIndex(client, index);
+        await withoutLockTimeout(client, () => dropInvalidIndex(client, index!));
         await client.query(`SET statement_timeout = ${Math.trunc(buildTimeoutMs())}`);
       } catch (dropErr) {
         // The next attempt drops it first.
@@ -316,6 +321,25 @@ async function indexValidity(client: PoolClient, index: string): Promise<boolean
     [index],
   );
   return r.rows.length === 0 ? null : r.rows[0].valid === true;
+}
+
+/**
+ * Run CREATE/DROP INDEX CONCURRENTLY with no lock_timeout, bounded by the
+ * build's statement_timeout instead. Both wait for every transaction with an
+ * older snapshot — including another collection's concurrent build and any
+ * slow query — and that wait is subject to lock_timeout; with the short
+ * builder lock_timeout, two collections building at once failed each other.
+ * Waiting is harmless here: the SHARE UPDATE EXCLUSIVE lock they queue for
+ * conflicts with no read or write, so nothing queues behind them. The short
+ * lock_timeout still applies to the unwind trigger DDL, which does block writes.
+ */
+async function withoutLockTimeout<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
+  await client.query("SET lock_timeout = 0");
+  try {
+    return await fn();
+  } finally {
+    await client.query(`SET lock_timeout = ${Math.trunc(buildLockTimeoutMs())}`);
+  }
 }
 
 /** Drop an INVALID index left behind by a failed CREATE INDEX CONCURRENTLY. A valid one is kept. */

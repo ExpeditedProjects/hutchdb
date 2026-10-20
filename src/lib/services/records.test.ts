@@ -986,6 +986,6 @@ describe('storageChangeNote', () => {
       search_index: { build: { state: 'pending' as const, at: '2026-10-20T00:00:00.000Z' }, reason: 'r' },
     }
     const note = storageChangeNote(base, after)!
-    expect(note).toBe("This batch queued indexes on fields 'score', 'owner.id', unwinding 'answers' into a queryable table (so filters and aggregates on its elements can use indexes), a full-text index for search. They are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until they are ready, queries return the same results without them.")
+    expect(note).toBe("This batch queued indexes on fields 'score', 'owner.id', unwinding 'answers' into a queryable table (so filters and aggregates on its elements can use indexes), a full-text index for search. Indexes are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until one is ready, queries return the same results without it.")
   })
 })

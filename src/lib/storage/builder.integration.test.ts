@@ -365,14 +365,39 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
   });
 
   describe("failures", () => {
+    it("an older open transaction makes the build wait for it, not fail, even past the lock timeout", async () => {
+      const slug = await store("waits", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = "200";
+      // CREATE INDEX CONCURRENTLY waits for every older snapshot (another
+      // collection's build, a slow query); that wait must not hit lock_timeout.
+      const blocker = await testPool.connect();
+      let report;
+      try {
+        await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        await blocker.query("SELECT 1");
+        const building = builder.buildPendingIndexes({ collectionId: id });
+        await new Promise((r) => setTimeout(r, 800));
+        await blocker.query("ROLLBACK");
+        report = await building;
+      } finally {
+        blocker.release();
+      }
+      expect(report.failed).toBe(0);
+      for (const p of (await registry(slug)).projections) {
+        expect(p.build?.state).toBe("ready");
+        expect(await indexState(`hc_${id}_${p.column}_idx`)).toBe("valid");
+      }
+    });
+
     it("a build that fails after creating its index drops the INVALID index, records a generic reason with backoff, and a retry builds it", async () => {
       const slug = await store("fails", makeDocs(0, 150));
       const id = (await collectionRow(slug)).id;
-      process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = "300";
+      process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS = "300";
       // An open snapshot older than the build: CREATE INDEX CONCURRENTLY
-      // creates the index, then waits for it and gives up on lock_timeout,
-      // leaving the index INVALID. DROP INDEX CONCURRENTLY does not wait for
-      // it (it holds no lock on the table).
+      // creates the index, then waits for it and gives up on the build's
+      // statement timeout, leaving the index INVALID. DROP INDEX
+      // CONCURRENTLY does not wait for it (it holds no lock on the table).
       const blocker = await testPool.connect();
       let report;
       try {
@@ -383,10 +408,11 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
         await blocker.query("ROLLBACK");
         blocker.release();
       }
+      delete process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS;
       expect(report.failed).toBe(8);
       const reg = await registry(slug);
       for (const p of reg.projections) {
-        expect(p.build).toMatchObject({ state: "failed", attempts: 1, error: "the build could not get a lock on the collection's table in time" });
+        expect(p.build).toMatchObject({ state: "failed", attempts: 1, error: "the build ran past its 300 ms limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)" });
         const delay = Date.parse(p.build!.retry_after!) - Date.parse(p.build!.at);
         expect(delay).toBe(builder.RETRY_BASE_MS);
         expect(await indexState(`hc_${id}_${p.column}_idx`)).toBe("missing");
