@@ -105,7 +105,22 @@ export type TableAggregateResult = {
 export type Clause = { label: string; indexes: string[]; note?: string };
 
 export type CompiledQuery =
-  | { kind: "records"; query: SQL; countQuery: SQL; limit: number; offset: number; fields?: string[]; clauses: Clause[] }
+  | {
+      kind: "records";
+      query: SQL;
+      countQuery: SQL;
+      limit: number;
+      offset: number;
+      fields?: string[];
+      clauses: Clause[];
+      /**
+       * A descending sort on a projection column, run in two parts so the
+       * column's btree (ASC NULLS LAST) serves it backwards: `query` reads
+       * the rows that have a value, then the rows without one follow in id
+       * order. Together they are exactly ORDER BY col DESC NULLS LAST, id.
+       */
+      nullsLast?: { nullRows: (limit: number, offset: number) => SQL; countWithValue: SQL };
+    }
   | {
       kind: "aggregate";
       query: SQL;
@@ -448,9 +463,9 @@ function parseSort(sort: string): { field: string; dir: SQL; descending: boolean
   return { field, dir: descending ? sql`DESC` : sql`ASC`, descending };
 }
 
-type SortKey = { orderBy: SQL; clause?: Clause; tiebreak?: SQL };
+type SortKey = { orderBy: SQL; clause?: Clause; tiebreak?: SQL; descendingColumn?: SQL };
 
-function compileRecordSort(ctx: Ctx, sort: string | undefined): { orderBy: SQL; clause?: Clause } {
+function compileRecordSort(ctx: Ctx, sort: string | undefined): { orderBy: SQL; clause?: Clause; descendingColumn?: SQL } {
   const { tiebreak, ...sorted } = compileRecordSortKey(ctx, sort);
   // Ties (equal values, same-batch created_at) break on the row id so a
   // page of top-N results is the same every time; as in the shared layout,
@@ -487,7 +502,8 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   if (parsed.kind === "object") {
     const projection = findPathProjection(registry, parsed.segments);
     if (projection && !projection.mixed) {
-      return { orderBy: sql`t.${ident(projection.column)} ${dir} NULLS LAST`, clause: { label, indexes: [indexName(parent, projection.column)] } };
+      const column = sql`t.${ident(projection.column)}`;
+      return { orderBy: sql`${column} ${dir} NULLS LAST`, clause: { label, indexes: [indexName(parent, projection.column)] }, ...(sort.startsWith("-") ? { descendingColumn: column } : {}) };
     }
     // `#>` keeps jsonb typing so numbers order numerically.
     return {
@@ -497,9 +513,11 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   }
   const projection = findProjection(registry, field);
   if (projection && !projection.mixed) {
+    const column = sql`t.${ident(projection.column)}`;
     return {
-      orderBy: sql`t.${ident(projection.column)} ${dir} NULLS LAST`,
+      orderBy: sql`${column} ${dir} NULLS LAST`,
       clause: { label, indexes: [indexName(parent, projection.column)] },
+      ...(sort.startsWith("-") ? { descendingColumn: column } : {}),
     };
   }
   return { orderBy: sql`t.data->${field}::text ${dir} NULLS LAST`, clause: { label, indexes: [], ...(projection ? { note: mixedNote(field) } : {}) } };
@@ -639,10 +657,27 @@ export function compileQuery(collection: Collection, params: Omit<QueryParams, "
   const where = sql.join([...parent, ...existsConditions(parsed)], sql` AND `);
   const sorted = compileRecordSort(ctx, sort);
   if (sorted.clause) clauses.push(sorted.clause);
+  const countQuery = sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where}`;
+  const column = sorted.descendingColumn;
+  if (column) {
+    return {
+      kind: "records",
+      query: sql`SELECT ${RECORD_COLUMNS} FROM ${table} t WHERE ${where} AND ${column} IS NOT NULL ORDER BY ${column} DESC, t.id ASC LIMIT ${clampedLimit} OFFSET ${offset}`,
+      countQuery,
+      limit: clampedLimit,
+      offset,
+      fields,
+      clauses,
+      nullsLast: {
+        nullRows: (limit, nullOffset) => sql`SELECT ${RECORD_COLUMNS} FROM ${table} t WHERE ${where} AND ${column} IS NULL ORDER BY t.id ASC LIMIT ${limit} OFFSET ${nullOffset}`,
+        countWithValue: sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where} AND ${column} IS NOT NULL`,
+      },
+    };
+  }
   return {
     kind: "records",
     query: sql`SELECT ${RECORD_COLUMNS} FROM ${table} t WHERE ${where} ORDER BY ${sorted.orderBy} LIMIT ${clampedLimit} OFFSET ${offset}`,
-    countQuery: sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where}`,
+    countQuery,
     limit: clampedLimit,
     offset,
     fields,
@@ -834,8 +869,10 @@ export function summarizePlan(root: PlanNode, tablePrefix: string, clauses: Clau
 
 async function explain(collectionId: number, query: SQL, clauses: Clause[]): Promise<IndexReport> {
   // Keyed on the clauses too: a default sort and an explicit sort on
-  // created_at render to the same SQL but report differently.
-  const key = `${collectionId}:${renderSql(query)}:${JSON.stringify(clauses)}`;
+  // created_at render to the same SQL but report differently. And on the
+  // bound values: the plan for LIMIT 10 is not the plan for OFFSET 5000.
+  const { sql: text, params } = dialect.sqlToQuery(query);
+  const key = `${collectionId}:${text}:${JSON.stringify(params)}:${JSON.stringify(clauses)}`;
   const now = Date.now();
   const cached = explainCache.get(key);
   if (cached && cached.expires > now) return cached.report;
@@ -945,9 +982,20 @@ export async function queryTable(collection: Collection, params: Omit<QueryParam
     return { results, total, count: results.length, limit: compiled.limit, ...report };
   }
 
-  const { query, countQuery, limit, offset, fields } = compiled;
+  const { query, countQuery, limit, offset, fields, nullsLast } = compiled;
   const [rowsResult, report] = await Promise.all([db.execute(query), explain(collection.id, query, compiled.clauses)]);
   const rows = (rowsResult.rows as Parameters<typeof toRecord>[1][]).map((r) => toRecord(collection.id, r));
+
+  if (nullsLast && rows.length < limit) {
+    // The rows with a value ran out on this page: continue with the rows
+    // without one. Their offset is the page offset minus how many rows have
+    // a value, which this page tells us unless it came back empty.
+    const withValue = rows.length > 0 || offset === 0
+      ? offset + rows.length
+      : ((await db.execute(nullsLast.countWithValue)).rows[0] as { count: number }).count;
+    const more = await db.execute(nullsLast.nullRows(limit - rows.length, Math.max(0, offset - withValue)));
+    rows.push(...(more.rows as Parameters<typeof toRecord>[1][]).map((r) => toRecord(collection.id, r)));
+  }
 
   let total: number;
   if (offset === 0 && rows.length < limit) {

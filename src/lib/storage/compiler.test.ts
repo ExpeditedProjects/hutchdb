@@ -130,7 +130,9 @@ describe('compileQuery: records', () => {
   })
 
   it('sorts on the projected column, else the jsonb value', () => {
-    expect(compile({ sort: '-price' }).sql).toContain('ORDER BY t."p_price" DESC NULLS LAST')
+    // Descending runs as two parts so the ASC btree serves it backwards.
+    expect(compile({ sort: '-price' }).sql).toContain('t."p_price" IS NOT NULL ORDER BY t."p_price" DESC, t.id ASC')
+    expect(compile({ sort: 'price' }).sql).toContain('ORDER BY t."p_price" ASC NULLS LAST')
     expect(compile({ sort: 'other' }).sql).toContain('ORDER BY t.data->$1::text ASC NULLS LAST')
   })
 
@@ -364,5 +366,113 @@ describe('embeddedRecord', () => {
 
   it('applies the requested fields, including nested objects', () => {
     expect(embeddedRecord(rec, ['name', 'totals']).data).toEqual({ name: 'A', totals: { x: 1 } })
+  })
+})
+
+describe('compileQuery: projected nested object paths', () => {
+  const nested: StorageRegistry = {
+    ...registry,
+    projections: [
+      ...registry.projections,
+      { field: 'totals.veterans.points', path: ['totals', 'veterans', 'points'], column: 'p_totals_veterans_points', type: 'number', reason: 'r' },
+      { field: 'owner.name', path: ['owner', 'name'], column: 'p_owner_name', type: 'text', reason: 'r' },
+      { field: 'owner.joined', path: ['owner', 'joined'], column: 'p_owner_joined', type: 'date', reason: 'r' },
+      { field: 'owner.active', path: ['owner', 'active'], column: 'p_owner_active', type: 'boolean', reason: 'r' },
+    ],
+  }
+  const run = (params: Parameters<typeof compileQuery>[1], reg: StorageRegistry = nested) => {
+    const compiled = compileQuery({ id: 12, storage: reg }, params)
+    const { sql, params: bound } = dialect.sqlToQuery(compiled.query)
+    return { compiled, sql: sql.replace(/\s+/g, ' ').trim(), params: bound }
+  }
+  const withMixed = (field: string): StorageRegistry => ({
+    ...nested,
+    projections: nested.projections.map((p) => (p.field === field ? { ...p, mixed: true } : p)),
+  })
+
+  it('routes equality, ranges, $in, $nin and $ne on a projected path to its column', () => {
+    const { sql, params, compiled } = run({ filter: { 'totals.veterans.points': { $gte: 10, $lt: 20, $ne: 15 }, 'owner.name': { $in: ['a', 'b'] }, 'owner.active': true } })
+    expect(sql).toContain('t."p_totals_veterans_points" >= $1::float8')
+    expect(sql).toContain('t."p_totals_veterans_points" < $2::float8')
+    expect(sql).toContain('t."p_totals_veterans_points" IS DISTINCT FROM $3::float8')
+    expect(sql).toContain('t."p_owner_name" IN ($4::text, $5::text)')
+    expect(sql).toContain('t."p_owner_active" = $6::boolean')
+    expect(params.slice(0, 3)).toEqual([10, 20, 15])
+    expect(sql).not.toContain('#>')
+    expect(compiled.clauses.map((c) => c.indexes[0])).toEqual([
+      'hc_12_p_totals_veterans_points_idx', 'hc_12_p_totals_veterans_points_idx', 'hc_12_p_totals_veterans_points_idx',
+      'hc_12_p_owner_name_idx', 'hc_12_p_owner_active_idx',
+    ])
+  })
+
+  it('falls back to the document for literals of another type, $exists, $contains and boolean ranges', () => {
+    const { sql, params } = run({ filter: { 'totals.veterans.points': '7', 'owner.name': { $exists: true, $contains: 'x' } } })
+    expect(sql).toContain('t.data @> $1::jsonb')
+    expect(params[0]).toBe('{"totals":{"veterans":{"points":"7"}}}')
+    expect(sql).toContain('t.data #> $2::text[] IS NOT NULL')
+    expect(sql).toContain('ILIKE')
+    expect(sql).not.toContain('p_totals_veterans_points')
+    expect(sql).not.toContain('p_owner_name')
+    // The document route rejects a boolean range; the column must not accept it either.
+    expect(() => run({ filter: { 'owner.active': { $gt: true } } })).toThrow(/requires a number or string operand/)
+  })
+
+  it('uses a date column for ranges only while no other value type is stored, and never for impossible dates', () => {
+    expect(run({ filter: { 'owner.joined': { $gte: '2026-01-01' } } }).sql).toContain('t."p_owner_joined" >= $1::date')
+    const mixed = run({ filter: { 'owner.joined': { $gte: '2026-01-01' } } }, withMixed('owner.joined')).sql
+    expect(mixed).not.toContain('p_owner_joined')
+    expect(mixed).toContain("jsonb_typeof(t.data #> $1::text[]) = 'string'")
+    // Equality stays exact on a mixed date column.
+    expect(run({ filter: { 'owner.joined': '2026-01-01' } }, withMixed('owner.joined')).sql).toContain('t."p_owner_joined" = $1::date')
+    expect(run({ filter: { 'owner.joined': '2026-02-30' } }).sql).not.toContain('p_owner_joined')
+  })
+
+  it('sorts on the column, or on the document once the path holds mixed types', () => {
+    const { sql, compiled } = run({ sort: '-totals.veterans.points' })
+    expect(sql).toContain('AND t."p_totals_veterans_points" IS NOT NULL ORDER BY t."p_totals_veterans_points" DESC, t.id ASC LIMIT')
+    expect(compiled.clauses).toEqual([{ label: 'sort on totals.veterans.points', indexes: ['hc_12_p_totals_veterans_points_idx'] }])
+    const m = run({ sort: '-totals.veterans.points' }, withMixed('totals.veterans.points'))
+    expect(m.sql).toContain('ORDER BY t.data #> $1::text[] DESC NULLS LAST')
+    expect(m.compiled.clauses[0].note).toMatch(/more than one type/)
+    const top = run({ sort: 'price' }, withMixed('price'))
+    expect(top.sql).toContain('ORDER BY t.data->$1::text ASC NULLS LAST')
+  })
+
+  it('splits a descending projected sort into rows with a value, then rows without one', () => {
+    const { compiled } = run({ sort: '-totals.veterans.points', limit: 5, offset: 10 })
+    if (compiled.kind !== 'records') throw new Error('expected records')
+    expect(compiled.nullsLast).toBeDefined()
+    const nulls = dialect.sqlToQuery(compiled.nullsLast!.nullRows(3, 2))
+    expect(nulls.sql).toContain('AND t."p_totals_veterans_points" IS NULL ORDER BY t.id ASC LIMIT')
+    expect(nulls.params.slice(-2)).toEqual([3, 2])
+    expect(dialect.sqlToQuery(compiled.nullsLast!.countWithValue).sql).toContain('count(*)::int AS count')
+    // Ascending, mixed and document sorts keep a single query.
+    for (const q of [run({ sort: 'totals.veterans.points' }), run({ sort: '-totals.veterans.points' }, withMixed('totals.veterans.points')), run({ sort: '-id' })]) {
+      if (q.compiled.kind !== 'records') throw new Error('expected records')
+      expect(q.compiled.nullsLast).toBeUndefined()
+    }
+  })
+
+  it('aggregates numbers from the column exactly and groups by the document text', () => {
+    const { sql } = run({ groupBy: 'owner.name', aggregate: { pts: { sum: 'totals.veterans.points' }, hi: { max: 'totals.veterans.points' } } })
+    expect(sql).toContain('to_jsonb(sum(t."p_totals_veterans_points"::text::numeric)) AS "pts"')
+    expect(sql).toContain('coalesce(to_jsonb(max(t."p_totals_veterans_points"::text::numeric)), to_jsonb(max(t.data #>> $')
+    expect(sql).toContain('t.data #>> $1::text[] AS "owner.name"')
+  })
+
+  it('explains an unprojected nested path in the clause note', () => {
+    const { compiled } = run({ filter: { 'totals.other.points': { $gt: 1 } }, sort: 'totals.other.votes' })
+    expect(compiled.clauses).toEqual([
+      { label: 'filter on totals.other.points ($gt)', indexes: [], note: expect.stringMatching(/'totals.other.points' is a nested object path with no projection/) },
+      { label: 'sort on totals.other.votes', indexes: [], note: expect.stringMatching(/'totals.other.votes' is a nested object path with no projection/) },
+    ])
+    const report = summarizePlan({ 'Node Type': 'Seq Scan', 'Relation Name': 'hc_12' }, 'hc_12', compiled.clauses)
+    expect(report.reason).toMatch(/no projection/)
+  })
+
+  it('treats a key that is not a valid dotted path as a literal top-level key', () => {
+    const { sql, params } = run({ filter: { 'a b.c': 1, 'x..y': 2 } })
+    expect(sql).toContain('t.data @> $1::jsonb')
+    expect(params[0]).toBe('{"a b.c":1,"x..y":2}')
   })
 })
