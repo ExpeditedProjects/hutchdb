@@ -14,6 +14,7 @@ import { seedAutoViews } from "./views";
 import { queryIndexes, readRegistry } from "@/lib/storage/registry";
 import { dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
+import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 
 export type RecentCollection = { name: string; slug: string; role: CollectionRole };
 
@@ -190,12 +191,10 @@ export async function listCollections(userId: string, organizationId?: string) {
   if (colls.length === 0) return [];
 
   const counts = await tableRows.recordCounts(colls.map((c) => c.id));
-  const result = [];
-  for (const coll of colls) {
+  return mapLimit(colls, COLLECTION_QUERY_CONCURRENCY, async (coll) => {
     const fields = await tableRows.sampleFieldNames(coll.id, 10);
-    result.push({ ...coll, ...countFields(counts.get(coll.id)), fields: fields.sort() });
-  }
-  return result;
+    return { ...coll, ...countFields(counts.get(coll.id)), fields: fields.sort() };
+  });
 }
 
 export async function createCollection(userId: string, organizationId: string, params: {

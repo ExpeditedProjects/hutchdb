@@ -339,5 +339,21 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
       const gone = await testDb.execute(sql`SELECT to_regclass(${`hc_${betaRow.id}`}) IS NULL AS gone`);
       expect((gone.rows[0] as { gone: boolean }).gone).toBe(true);
     });
+
+    it("listCollections samples each collection's fields concurrently but keeps the most-recently-updated-first order", async () => {
+      const slugs: string[] = [];
+      for (let c = 0; c < 7; c++) slugs.push(await store(`many_${c}`, [{ [`f${c}`]: c, shared: true }]));
+      // Make the order differ from creation order.
+      const order = [3, 0, 6, 1, 5, 2, 4];
+      for (const [k, c] of order.entries()) {
+        await testDb.execute(sql`UPDATE collections SET updated_at = ${`2026-0${1 + (k % 9)}-01T00:00:00Z`}::timestamptz WHERE slug = ${slugs[c]}`);
+      }
+      const listed = await collectionsSvc.listCollections(USER_ID, ORG_ID);
+      expect(listed.map((c) => c.slug)).toEqual([...order].reverse().map((c) => slugs[c]));
+      for (const c of listed) {
+        const n = Number(c.slug.match(/many_(\d)/)?.[1] ?? c.name.match(/(\d)$/)?.[1]);
+        expect(c.fields).toEqual([`f${n}`, "shared"].sort());
+      }
+    });
   });
 });

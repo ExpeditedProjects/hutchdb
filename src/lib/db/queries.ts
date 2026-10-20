@@ -1,7 +1,7 @@
 import { cache } from "react";
 import { db } from "./index";
 import { collections, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, asc, inArray } from "drizzle-orm";
+import { eq, and, sql, asc, inArray, type SQL } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { createCollectionTable } from "@/lib/storage/ddl";
 
@@ -64,6 +64,37 @@ function resolveEffectiveRole(
   }
 
   return effective;
+}
+
+// ── SQL mirror of resolveEffectiveRole (visibility) ────────────────────────
+//
+// For queries that can't call resolveEffectiveRole per row. References the
+// OUTER query's unaliased `"collections"` table by literal name, so the
+// caller must select FROM `collections` without an alias. `userId` is the
+// only bind parameter. Keep in lockstep with resolveEffectiveRole.
+
+/**
+ * Predicate: `"collections"` row is visible to `userId` (effective role ≥
+ * viewer). An `IN (… UNION …)` id set rather than joins, so a user holding
+ * several grants on one collection never duplicates rows, and both arms are
+ * index-driven (collection_members by user, organization_members by user).
+ */
+export function collectionVisibleTo(userId: string): SQL {
+  return sql`"collections"."id" IN (${visibleCollectionIdsSql(userId)})`;
+}
+
+/** Subquery yielding the ids of every collection `userId` can at least view. */
+export function visibleCollectionIdsSql(userId: string): SQL {
+  return sql`
+    SELECT vcm.collection_id FROM collection_members vcm
+     WHERE vcm.user_id = ${userId} AND vcm.role IN ('owner', 'editor', 'viewer')
+    UNION
+    SELECT vc.id FROM collections vc
+      JOIN organization_members vom
+        ON vom.organization_id = vc.organization_id AND vom.user_id = ${userId}
+     WHERE vom.role = 'admin'
+        OR (vom.role = 'member' AND vc.visibility = 'org'
+            AND vc.org_default_role IN ('owner', 'editor', 'viewer'))`;
 }
 
 /**

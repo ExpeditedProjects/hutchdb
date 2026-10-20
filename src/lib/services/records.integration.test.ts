@@ -1051,5 +1051,35 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       const all = await recordsSvc.searchGlobal(USER_ID, "otter", 50);
       expect(all.results.reduce((n, g) => n + g.matches, 0)).toBe(6);
     });
+
+    it("searchGlobal over many collections returns exactly what a serial pass over them would, ties included", async () => {
+      // Six collections (more than the concurrency bound), each with an exact
+      // tie (same text, same id 1, same created_at) and one better match.
+      const slugs: string[] = [];
+      for (let c = 0; c < 6; c++) {
+        slugs.push(await seed(`kiwis_${c}`, [{ text: "kiwi" }, { text: c % 2 ? "kiwi kiwi kiwi" : "a kiwi and more" }]));
+      }
+      const colls = await testDb.select().from(schema.collections);
+      for (const coll of colls) {
+        await testDb.execute(sql`UPDATE ${sql.identifier(`hc_${coll.id}`)} SET created_at = '2026-03-01T00:00:00Z'`);
+      }
+      const { searchRecords } = await import("@/lib/storage/rows");
+      // The serial order: collections as the access query returns them, then a stable sort.
+      const accessible = (await testDb.execute(sql`
+        SELECT c.id, c.slug FROM collections c JOIN collection_members m ON m.collection_id = c.id AND m.user_id = ${USER_ID}`)).rows as { id: number; slug: string }[];
+      const serial: { slug: string; id: number; rank: number; created: number }[] = [];
+      for (const coll of accessible) {
+        for (const row of await searchRecords(coll.id, "kiwi", 50)) serial.push({ slug: coll.slug, id: row.id, rank: row.rank, created: row.createdAt?.getTime() ?? 0 });
+      }
+      serial.sort((a, b) => b.rank - a.rank || b.created - a.created || b.id - a.id);
+
+      const result = await recordsSvc.searchGlobal(USER_ID, "kiwi", 50);
+      const flat = result.results.flatMap((g) => (g.records as { collectionSlug: string; id: number }[]).map((r) => `${r.collectionSlug}#${r.id}`));
+      const grouped: string[] = [];
+      for (const slug of [...new Set(serial.map((r) => r.slug))]) grouped.push(...serial.filter((r) => r.slug === slug).map((r) => `${r.slug}#${r.id}`));
+      expect(flat).toEqual(grouped);
+      expect(flat).toHaveLength(12);
+      expect(new Set(flat.map((f) => f.split("#")[0]))).toEqual(new Set(slugs));
+    });
   });
 });

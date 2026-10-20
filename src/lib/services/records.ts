@@ -15,6 +15,7 @@ import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
+import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
@@ -340,15 +341,11 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-function runQuery(collection: CollectionRow, params: TableQueryParams) {
-  return queryTable(collection, params);
-}
-
 export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
-  return runQuery(access.collection, params);
+  return queryTable(access.collection, params);
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -381,7 +378,7 @@ export async function exportRecords(slug: string, userId: string, params: {
   const format = params.format ?? "json";
   const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
 
-  const result = await runQuery(access.collection, {
+  const result = await queryTable(access.collection, {
     filter: params.filter,
     search: params.search,
     sort: params.sort,
@@ -525,10 +522,11 @@ export async function searchGlobal(userId: string, search: string, limit: number
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
-  const candidates: { coll: (typeof accessible)[number]; row: tableRows.SearchMatch }[] = [];
-  for (const coll of accessible) {
-    for (const row of await tableRows.searchRecords(coll.id, search, clampedLimit)) candidates.push({ coll, row });
-  }
+  // Bounded concurrency; results are concatenated in collection order, as
+  // the serial loop did, so the stable sort below ranks ties the same way.
+  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) =>
+    (await tableRows.searchRecords(coll.id, search, clampedLimit)).map((row) => ({ coll, row })));
+  const candidates = perCollection.flat();
   const time = (d: Date | null) => d?.getTime() ?? 0;
   candidates.sort((a, b) =>
     b.row.rank - a.row.rank || time(b.row.createdAt) - time(a.row.createdAt) || b.row.id - a.row.id);

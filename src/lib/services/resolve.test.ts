@@ -2,7 +2,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const { dbExecute } = vi.hoisted(() => ({ dbExecute: vi.fn() }))
 vi.mock('@/lib/db', () => ({ db: { execute: dbExecute } }))
-vi.mock('@/lib/db/queries', () => ({ findAccessibleCollectionBySlug: vi.fn() }))
+vi.mock('@/lib/db/queries', async () => {
+  const { sql } = await import('drizzle-orm')
+  return { findAccessibleCollectionBySlug: vi.fn(), collectionVisibleTo: vi.fn((userId: string) => sql`visible_to(${userId})`) }
+})
 
 import { findAccessibleCollection } from './resolve'
 import { findAccessibleCollectionBySlug } from '@/lib/db/queries'
@@ -28,6 +31,10 @@ describe('findAccessibleCollection', () => {
     // The candidate names are bound parameters, lowercased.
     const query = dbExecute.mock.calls[0][0]
     expect(JSON.stringify(query)).toContain('"tags"')
+    // Only collections the caller can see are candidates, so other users'
+    // same-named collections never fill the candidate limit.
+    expect(JSON.stringify(query)).toContain('visible_to(')
+    expect(JSON.stringify(query)).toContain('"u"')
   })
 
   it('resolves nothing when two visible collections match equally', async () => {

@@ -1,10 +1,10 @@
 import { db } from "@/lib/db";
 import { sql } from "drizzle-orm";
 import type { CollectionRole } from "@/lib/db/schema";
-import { findAccessibleCollectionBySlug, type CollectionAccess } from "@/lib/db/queries";
+import { collectionVisibleTo, findAccessibleCollectionBySlug, type CollectionAccess } from "@/lib/db/queries";
 import { titleCase } from "@/lib/slugify";
 
-/** How many same-named collections the name fallback looks at. */
+/** How many same-named collections the caller can see the name fallback looks at. */
 const NAME_CANDIDATES = 20;
 
 /**
@@ -26,6 +26,7 @@ export async function findAccessibleCollection(ref: string, userId: string, minR
   const result = await db.execute(sql`
     SELECT slug, name FROM collections
     WHERE lower(name) IN (${sql.join(names.map((n) => sql`${n}`), sql`, `)})
+      AND ${collectionVisibleTo(userId)}
     ORDER BY id
     LIMIT ${NAME_CANDIDATES}`);
   const rows = (Array.isArray(result?.rows) ? result.rows : []) as { slug?: unknown; name?: unknown }[];
