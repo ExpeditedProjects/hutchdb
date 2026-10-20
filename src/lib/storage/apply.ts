@@ -37,6 +37,10 @@ export function searchIndexThresholdFromEnv(env: Record<string, string | undefin
     : DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES;
 }
 
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${Math.round(bytes / 1024 / 1024)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
 function pending(now: number): IndexBuild {
   return { state: "pending", at: new Date(now).toISOString() };
 }
@@ -104,7 +108,7 @@ export async function applyInference(
     if (wantSearch && !next.search_index) {
       next = {
         ...next,
-        search_index: { build: pending(now), reason: `the collection's table reached ${Math.round(Number(bytes) / 1024 / 1024)} MB (threshold ${Math.round(searchThresholdBytes / 1024 / 1024)} MB).` },
+        search_index: { build: pending(now), reason: `the collection's table reached ${formatBytes(Number(bytes))} (threshold ${formatBytes(searchThresholdBytes)}).` },
       };
     }
     return finishBatch(next, docs.length, evaluated, decisions.pending);

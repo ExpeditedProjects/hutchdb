@@ -463,13 +463,22 @@ export type SearchMatch = TableRecord & { rank: number };
  * `rank` lets matches from several collections be merged in one order.
  */
 export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<SearchMatch[]> {
-  const result = await tx.execute(sql`
+  const result = await tx.execute(searchRecordsQuery(collectionId, search, limit));
+  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+}
+
+/**
+ * The searchRecords statement. Its match condition is the expression of
+ * the collection's search GIN (builder.ts), so the index serves it once
+ * built.
+ */
+export function searchRecordsQuery(collectionId: number, search: string, limit: number): SQL {
+  return sql`
     SELECT ${RECORD_COLUMNS}, m.rank FROM ${table(collectionId)} t,
       LATERAL (SELECT ts_rank(to_tsvector('english', t.data::text), plainto_tsquery('english', ${search}))::float8 AS rank) m
     WHERE t.deleted_at IS NULL AND to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})
     ORDER BY m.rank DESC, t.created_at DESC, t.id DESC
-    LIMIT ${limit}`);
-  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+    LIMIT ${limit}`;
 }
 
 /** Top-level keys of a few live documents, for hutch_list_collections. */

@@ -53,6 +53,8 @@ export const DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS = 5000;
 /** First retry delay after a failed build; each further failure multiplies it by 4, up to MAX_RETRY_DELAY_MS. */
 export const RETRY_BASE_MS = 60 * 1000;
 export const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
+/** Least statement timeout for dropping an INVALID index after a failed build. */
+const CLEANUP_TIMEOUT_MS = 60 * 1000;
 /** Parent ids per backfill statement. */
 const BACKFILL_BATCH = 1000;
 /** Rounds of retrying parent rows a writer held locked during the backfill, before the build fails. */
@@ -178,7 +180,7 @@ async function buildCollection(collectionId: number, deadline: number, options: 
       const outcome = await buildItem(ex, client, collectionId, item);
       const ms = Date.now() - started;
       report.outcomes.push({ kind: item.kind, key: item.key, ms, ...outcome });
-      log(`  ${collectionTableName(collectionId)}: ${item.kind} ${item.key} ${outcome.state} in ${ms} ms${outcome.error ? ` (${outcome.error})` : ""}`);
+      log(`  ${collectionTableName(collectionId)}: ${item.kind === "search" ? "search index" : `${item.kind} ${item.key}`} ${outcome.state} in ${ms} ms${outcome.error ? ` (${outcome.error})` : ""}`);
       if (outcome.state === "ready" && item.kind !== "unwind") analyze = true;
     }
     if (analyze) {
@@ -225,7 +227,10 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
     console.error(`[storage] building ${item.kind} ${item.key} failed for collection ${collectionId}`, err);
     if (index) {
       try {
+        // Cleanup gets at least a minute even when the build's limit was tiny.
+        await client.query(`SET statement_timeout = ${Math.max(buildTimeoutMs(), CLEANUP_TIMEOUT_MS)}`);
         await dropInvalidIndex(client, index);
+        await client.query(`SET statement_timeout = ${Math.trunc(buildTimeoutMs())}`);
       } catch (dropErr) {
         // The next attempt drops it first.
         console.error(`[storage] dropping invalid index ${index} failed`, dropErr);
@@ -336,7 +341,10 @@ function pgCode(err: unknown): string | undefined {
 function genericReason(err: unknown): string {
   if (err instanceof BackfillLockedError) return "writes kept some records locked through every backfill retry";
   switch (pgCode(err)) {
-    case "57014": return `the build ran past its ${Math.round(buildTimeoutMs() / 1000)} s limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)`;
+    case "57014": {
+      const ms = buildTimeoutMs();
+      return `the build ran past its ${ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`} limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)`;
+    }
     case "55P03": return "the build could not get a lock on the collection's table in time";
     case "40P01": return "the build was cancelled by a deadlock with a concurrent write";
     default: return "the build failed; the server log has the details";
