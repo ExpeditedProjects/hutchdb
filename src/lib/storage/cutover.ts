@@ -1,7 +1,6 @@
 import { db } from "@/lib/db";
-import { collections } from "@/lib/db/schema";
-import { eq, sql } from "drizzle-orm";
-import { applyInference } from "./apply";
+import { sql } from "drizzle-orm";
+import { applyInference, updateRegistry } from "./apply";
 import { childTableCounts } from "./rows";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "./ddl";
 import { collectionTableName, ident, projectionKey, readRegistry, type CutoverMark, type StorageRegistry } from "./registry";
@@ -19,9 +18,12 @@ import { collectionTableName, ident, projectionKey, readRegistry, type CutoverMa
  *    finished collection is marked in its storage registry (`cutover`), so a
  *    re-run skips it.
  * 2. Inference, per collection: ANALYZE, then the inference rules over all of
- *    its live documents as one batch; what it created is reported.
+ *    its live documents as one batch; what it created is reported. A
+ *    collection whose inference failed is not stamped, so a re-run retries
+ *    it.
  * 3. Only with dropRecords, and only once every collection is marked and
- *    still matches its mark: DROP TABLE records.
+ *    its rows in `records` still match the mark (count, and a content md5
+ *    over id, data, status and deleted_at): DROP TABLE records.
  *
  * No write lock: it is meant for a quiet minute. A collection whose new
  * table already holds rows written by the new code before the cutover ran
@@ -110,6 +112,24 @@ async function fingerprint(ex: Executor, source: ReturnType<typeof sql>, where: 
   return result.rows[0] as { rows: number; data_md5: string; row_md5: string };
 }
 
+/**
+ * id-ordered md5 over each row's id, data, status and deleted_at (as epoch
+ * seconds, so the session time zone never changes it): what --drop-records
+ * compares against the cutover mark. '' for no rows.
+ */
+async function contentFingerprint(ex: Executor, source: ReturnType<typeof sql>, where: ReturnType<typeof sql>): Promise<string> {
+  const result = await ex.execute(sql`
+    SELECT coalesce(md5(string_agg(md5(concat_ws('|', id::text, data::text,
+             coalesce(status, '\\N'), coalesce(extract(epoch FROM deleted_at)::text, '\\N'))), '' ORDER BY id)), '') AS row_md5
+    FROM ${source} WHERE ${where}`);
+  return (result.rows[0] as { row_md5: string }).row_md5;
+}
+
+/** Sorted md5 over the documents alone (what marks without row_md5 carry). */
+async function dataFingerprint(ex: Executor, source: ReturnType<typeof sql>, where: ReturnType<typeof sql>): Promise<string> {
+  return (await fingerprint(ex, source, where)).data_md5;
+}
+
 async function copyCollection(tx: Executor, c: CollectionRow, log: (line: string) => void): Promise<CopyResult> {
   const registry = readRegistry(c.storage);
   if (registry.cutover) {
@@ -163,7 +183,10 @@ async function copyCollection(tx: Executor, c: CollectionRow, log: (line: string
     }
   }
 
-  const mark: CutoverMark = { at: new Date().toISOString(), rows: copied.rows, data_md5: copied.data_md5 };
+  // Over this collection's rows in `records` (not the new table, which may
+  // also hold rows written by the new code): what the drop re-checks.
+  const row_md5 = await contentFingerprint(tx, sql`records`, sql`collection_id = ${c.id}`);
+  const mark: CutoverMark = { at: new Date().toISOString(), rows: copied.rows, data_md5: copied.data_md5, row_md5 };
   await tx.execute(sql`UPDATE collections SET storage = ${JSON.stringify({ ...next, cutover: mark })}::jsonb WHERE id = ${c.id}`);
 
   const copy_ms = Math.round(performance.now() - started);
@@ -171,10 +194,13 @@ async function copyCollection(tx: Executor, c: CollectionRow, log: (line: string
   return { id: c.id, slug: c.slug, status: c.rows > 0 ? "copied" : "empty", rows: c.rows, live: c.live, copy_ms, data_md5: copied.data_md5, warnings };
 }
 
-/** ANALYZE and one inference batch over a copied collection, unless already done. */
+/**
+ * ANALYZE and one inference batch over a copied collection, unless already
+ * done. inferred_at is stamped only when inference succeeded, so a re-run
+ * retries a failed one.
+ */
 async function inferCollection(id: number, slug: string, docLimit: number, log: (line: string) => void): Promise<InferenceResult | null> {
-  const [row] = await db.select({ storage: collections.storage }).from(collections).where(eq(collections.id, id));
-  const before = readRegistry(row?.storage);
+  const before = readRegistry((await db.execute(sql`SELECT storage FROM collections WHERE id = ${id}`)).rows[0]?.storage);
   if (!before.cutover || before.cutover.inferred_at) return null;
   const table = ident(collectionTableName(id));
 
@@ -195,8 +221,9 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
   let error: string | undefined;
   if (docs.length > 0) {
     try {
-      after = await applyInference({ id, storage: before }, docs);
+      after = await applyInference({ id, storage: before }, docs, undefined, { retryFailed: true });
     } catch (err) {
+      console.error(`[storage] cutover inference failed for collection ${id}`, err);
       error = err instanceof Error ? err.message : String(err);
     }
   }
@@ -207,12 +234,14 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
   const unwinds = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path));
   const counts = await childTableCounts(unwinds.map((u) => u.table));
 
-  // Re-read: inference rewrote the registry; keep its result and stamp it.
-  const [fresh] = await db.select({ storage: collections.storage }).from(collections).where(eq(collections.id, id));
-  const current = readRegistry(fresh?.storage);
-  await db.update(collections)
-    .set({ storage: { ...current, cutover: { ...(current.cutover ?? before.cutover), inferred_at: new Date().toISOString() } } })
-    .where(eq(collections.id, id));
+  if (!error) {
+    // Under the registry row lock: inference rewrote the registry, keep its
+    // result and stamp it.
+    await updateRegistry(id, async (current) => {
+      if (!current.cutover) return null;
+      return { ...current, cutover: { ...current.cutover, inferred_at: new Date().toISOString() } };
+    });
+  }
 
   const result: InferenceResult = {
     id,
@@ -228,28 +257,40 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
     ...result.projections.map((p) => `projection ${p.field} (${p.type})`),
     ...result.unwinds.map((u) => `unwind ${u.path} -> ${u.rows} child rows`),
   ];
-  log(`  inferred ${slug} (#${id}) over ${docs.length} docs in ${analyze_ms + inference_ms} ms: ${created.length ? created.join(", ") : "nothing created"}${error ? `; FAILED: ${error}` : ""}`);
+  log(`  inferred ${slug} (#${id}) over ${docs.length} docs in ${analyze_ms + inference_ms} ms: ${created.length ? created.join(", ") : "nothing created"}${error ? `; FAILED: ${error} (not marked inferred; a re-run retries it)` : ""}`);
   return result;
 }
 
 /**
  * Check every collection is marked and `records` still holds exactly the
- * rows that were copied, then drop it.
+ * rows that were copied (count and content), then drop it.
  */
 async function dropRecordsTable(log: (line: string) => void): Promise<boolean> {
   const rows = await listCollections();
   const problems: string[] = [];
   for (const c of rows) {
     const mark = readRegistry(c.storage).cutover;
+    const where = sql`collection_id = ${c.id}`;
     if (!mark) problems.push(`${c.slug}: not copied`);
     else if (mark.rows !== c.rows) problems.push(`${c.slug}: records holds ${c.rows} rows, ${mark.rows} were copied`);
     else if (!(await collectionTableExists(db, c.id))) problems.push(`${c.slug}: ${collectionTableName(c.id)} is missing`);
+    else if (typeof mark.row_md5 === "string") {
+      if ((await contentFingerprint(db, sql`records`, where)) !== mark.row_md5) {
+        problems.push(`${c.slug}: its rows in records (data, status or deleted_at) changed since they were copied`);
+      }
+    } else if (typeof mark.data_md5 === "string") {
+      if ((await dataFingerprint(db, sql`records`, where)) !== mark.data_md5) {
+        problems.push(`${c.slug}: its documents in records changed since they were copied`);
+      }
+    } else {
+      problems.push(`${c.slug}: its cutover mark has no fingerprint to check; re-run the cutover first`);
+    }
   }
   const orphans = (await db.execute(sql`
     SELECT count(*)::int AS n FROM records r WHERE NOT EXISTS (SELECT 1 FROM collections c WHERE c.id = r.collection_id)`)).rows[0] as { n: number };
   if (orphans.n > 0) problems.push(`${orphans.n} records rows belong to no collection`);
   if (problems.length > 0) {
-    throw new CutoverError(`refusing to drop records:\n  ${problems.join("\n  ")}`);
+    throw new CutoverError(`refusing to drop records (the table is kept):\n  ${problems.join("\n  ")}`);
   }
   await db.execute(sql`DROP TABLE records`);
   log("dropped table records");

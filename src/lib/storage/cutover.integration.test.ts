@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from "vitest";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
@@ -22,6 +22,19 @@ import * as schema from "@/lib/db/schema";
 // ---------------------------------------------------------------------------
 
 const TEST_DB_URL = process.env.HUTCH_TEST_DATABASE_URL;
+
+// Lets a test make the cutover's inference step throw.
+const inferenceFault = vi.hoisted(() => ({ fail: false }));
+vi.mock("./apply", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./apply")>();
+  return {
+    ...actual,
+    applyInference: async (...args: Parameters<typeof actual.applyInference>) => {
+      if (inferenceFault.fail) throw new Error("forced inference failure");
+      return actual.applyInference(...args);
+    },
+  };
+});
 
 const USER_ID = "cutover-user";
 const ORG_ID = "cutover-org";
@@ -64,6 +77,7 @@ describe.skipIf(!TEST_DB_URL)("storage cutover against real Postgres", () => {
   });
 
   beforeEach(async () => {
+    inferenceFault.fail = false;
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
     for (const row of tables.rows as { tablename: string }[]) {
@@ -113,7 +127,7 @@ describe.skipIf(!TEST_DB_URL)("storage cutover against real Postgres", () => {
 
   async function storageOf(id: number) {
     const [row] = await rows(sql`SELECT storage FROM collections WHERE id = ${id}`);
-    return row.storage as Record<string, unknown> & { cutover?: { rows: number; data_md5: string; inferred_at?: string }; projections?: { field: string }[]; unique_key?: string[] };
+    return row.storage as Record<string, unknown> & { cutover?: { rows: number; data_md5: string; row_md5?: string; inferred_at?: string }; projections?: { field: string }[]; unique_key?: string[] };
   }
 
   it("copies every collection with ids, timestamps, status and soft deletes kept, then infers; a re-run does nothing", async () => {
@@ -225,5 +239,97 @@ describe.skipIf(!TEST_DB_URL)("storage cutover against real Postgres", () => {
     const page = ok(await recordsSvc.queryRecords("dropme", USER_ID, {}));
     expect(page.total).toBe(1);
     expect(await cutover.runCutover({ dropRecords: true })).toMatchObject({ recordsTable: "absent", copied: [], dropped: false });
+  });
+
+  it("refuses to drop records when a copied row's data or deleted_at changed in records, and drops once it matches again", async () => {
+    const id = await legacyCollection("content", [{ data: { a: 1 } }, { data: { a: 2 } }, { data: { a: 3 }, deleted: true }]);
+    await cutover.runCutover();
+    expect((await storageOf(id)).cutover?.row_md5).toMatch(/^[0-9a-f]{32}$/);
+    const [first] = await rows(sql`SELECT id FROM records WHERE collection_id = ${id} ORDER BY id LIMIT 1`);
+
+    // Same row count, different document.
+    await testDb.execute(sql`UPDATE records SET data = '{"a": 100}' WHERE id = ${first.id}`);
+    await expect(cutover.runCutover({ dropRecords: true })).rejects.toThrow(/content: its rows in records \(data, status or deleted_at\) changed since they were copied/);
+    expect(await cutover.recordsTableExists()).toBe(true);
+    await testDb.execute(sql`UPDATE records SET data = '{"a": 1}' WHERE id = ${first.id}`);
+
+    // Same documents, a live row soft-deleted.
+    await testDb.execute(sql`UPDATE records SET deleted_at = now() WHERE id = ${first.id}`);
+    await expect(cutover.runCutover({ dropRecords: true })).rejects.toThrow(/content: its rows in records/);
+    expect(await cutover.recordsTableExists()).toBe(true);
+    await testDb.execute(sql`UPDATE records SET deleted_at = NULL WHERE id = ${first.id}`);
+
+    // Unchanged again: the drop goes ahead.
+    const report = await cutover.runCutover({ dropRecords: true });
+    expect(report.dropped).toBe(true);
+    expect(await cutover.recordsTableExists()).toBe(false);
+  });
+
+  it("checks a mark written without row_md5 by its data_md5, and refuses a mark with neither", async () => {
+    const id = await legacyCollection("oldmark", [{ data: { a: 1 } }]);
+    await cutover.runCutover();
+    await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{cutover}', (storage->'cutover') - 'row_md5') WHERE id = ${id}`);
+    await testDb.execute(sql`UPDATE records SET data = '{"a": 2}' WHERE collection_id = ${id}`);
+    await expect(cutover.runCutover({ dropRecords: true })).rejects.toThrow(/oldmark: its documents in records changed since they were copied/);
+
+    await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{cutover}', (storage->'cutover') - 'data_md5') WHERE id = ${id}`);
+    await expect(cutover.runCutover({ dropRecords: true })).rejects.toThrow(/oldmark: its cutover mark has no fingerprint to check; re-run the cutover first/);
+    expect(await cutover.recordsTableExists()).toBe(true);
+  });
+
+  it("re-runs inference for a collection not marked inferred, and reports the copy as already done", async () => {
+    const id = await legacyCollection("resume", Array.from({ length: 6 }, (_, i) => ({ data: { name: `n${i}`, n: i } })));
+    await cutover.runCutover();
+    await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{cutover}', (storage->'cutover') - 'inferred_at') WHERE id = ${id}`);
+
+    const again = await cutover.runCutover();
+    expect(again.copied.map((c) => [c.slug, c.status])).toEqual([["resume", "already done"]]);
+    expect(again.inference.map((r) => [r.slug, r.docs, r.error])).toEqual([["resume", 6, undefined]]);
+    expect((await storageOf(id)).cutover?.inferred_at).toBeTruthy();
+  });
+
+  it("a failed inference is reported and left unmarked, and the next run retries it", async () => {
+    const id = await legacyCollection("flaky", Array.from({ length: 6 }, (_, i) => ({ data: { name: `n${i}`, n: i } })));
+    inferenceFault.fail = true;
+    const log: string[] = [];
+    const report = await cutover.runCutover({ log: (l) => log.push(l) });
+    expect(report.copied.map((c) => c.status)).toEqual(["copied"]);
+    expect(report.inference.map((r) => [r.slug, r.error])).toEqual([["flaky", "forced inference failure"]]);
+    expect(log.some((l) => /FAILED: forced inference failure \(not marked inferred; a re-run retries it\)/.test(l))).toBe(true);
+    const failed = await storageOf(id);
+    expect(failed.cutover?.rows).toBe(6);
+    expect(failed.cutover?.inferred_at).toBeUndefined();
+    expect(failed.projections ?? []).toEqual([]);
+
+    inferenceFault.fail = false;
+    const retry = await cutover.runCutover();
+    expect(retry.copied.map((c) => c.status)).toEqual(["already done"]);
+    expect(retry.inference.map((r) => [r.slug, r.error])).toEqual([["flaky", undefined]]);
+    const done = await storageOf(id);
+    expect(done.cutover?.inferred_at).toBeTruthy();
+    expect(done.projections?.map((p) => p.field)).toEqual(expect.arrayContaining(["name", "n"]));
+  });
+
+  it("a collection whose table already holds rows and that has none in records keeps them, and records still drops", async () => {
+    const id = await legacyCollection("newonly", []);
+    await testDb.execute(sql`CREATE TABLE ${sql.identifier(`hc_${id}`)} (id serial PRIMARY KEY, data jsonb NOT NULL, source text, status text DEFAULT 'active', deleted_at timestamptz, created_at timestamptz DEFAULT now(), updated_at timestamptz DEFAULT now())`);
+    await testDb.execute(sql`INSERT INTO ${sql.identifier(`hc_${id}`)} (data) VALUES ('{"fresh": true}')`);
+
+    const report = await cutover.runCutover({ dropRecords: true });
+    expect(report.copied.map((c) => [c.slug, c.status, c.rows, c.warnings])).toEqual([["newonly", "empty", 0, []]]);
+    expect(report.dropped).toBe(true);
+    expect(await rows(sql`SELECT data FROM ${sql.identifier(`hc_${id}`)}`)).toEqual([{ data: { fresh: true } }]);
+    const page = ok(await recordsSvc.queryRecords("newonly", USER_ID, {}));
+    expect(page.total).toBe(1);
+  });
+
+  it("a unique_key whose only duplicate is soft-deleted gets its index without a warning", async () => {
+    const id = await legacyCollection("ukdeleted", [{ data: { k: "x" } }, { data: { k: "x" }, deleted: true }, { data: { k: "y" } }], ["k"]);
+    const report = await cutover.runCutover();
+    expect(report.copied[0].warnings).toEqual([]);
+    expect((await storageOf(id)).unique_key).toEqual(["k"]);
+    expect(await rows(sql`SELECT to_regclass(${`hc_${id}_uk`}) IS NOT NULL AS present`)).toEqual([{ present: true }]);
+    const conflict = await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "ukdeleted", data: { k: "x" }, on_conflict: "error" });
+    expect(conflict).toMatchObject({ status: 409 });
   });
 });

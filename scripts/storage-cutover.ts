@@ -17,6 +17,7 @@ import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config } from "dotenv";
+import { splitPassword } from "../src/lib/storage/pg-url";
 
 const USAGE = "usage: npm run storage:cutover -- [--dry-run] [--drop-records] [--dump-dir <dir>] [--json]";
 
@@ -41,12 +42,17 @@ function parseArgs(argv: string[]) {
 
 /** pg_dump the whole database (custom format) and return the file path, or exit. */
 function dumpDatabase(url: string, dir: string): string {
-  // The dump holds every secret in the database: owner-only directory and file.
+  // The dump holds every secret in the database: owner-only directory and
+  // file, whatever the caller's umask, and even if the directory existed.
+  process.umask(0o077);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const file = resolve(join(dir, `hutch-before-cutover-${stamp}.dump`));
   console.log(`pg_dump -> ${file}`);
-  const result = spawnSync("pg_dump", ["--format=custom", "--no-owner", "--file", file, url], { stdio: ["ignore", "inherit", "inherit"] });
+  const { url: safeUrl, password } = splitPassword(url);
+  const env = { ...process.env, ...(password !== undefined ? { PGPASSWORD: password } : {}) };
+  const result = spawnSync("pg_dump", ["--format=custom", "--no-owner", "--file", file, safeUrl], { stdio: ["ignore", "inherit", "inherit"], env });
   if (result.error || result.status !== 0 || !existsSync(file) || statSync(file).size === 0) {
     console.error(`pg_dump failed (${result.error?.message ?? `exit ${result.status}`}); refusing to run the cutover.`);
     process.exit(1);
@@ -84,6 +90,10 @@ async function main() {
     console.log(`done: ${report.copied.filter((c) => c.status === "copied").length} copied, ${report.copied.filter((c) => c.status === "already done").length} already done, ${report.inference.length} inferred${report.dropped ? ", records dropped" : ""}${dump ? `; backup ${dump}` : ""}`);
     for (const w of warnings) console.log(`warning: ${w}`);
     for (const r of failed) console.log(`inference failed: ${r.slug}: ${r.error}`);
+    if (failed.length > 0) {
+      console.error(`rows copied and verified; inference failed for: ${failed.map((r) => r.slug).join(", ")}; re-run to retry`);
+      process.exitCode = 1;
+    }
   } catch (err) {
     if (err instanceof CutoverError) {
       console.error(`cutover stopped: ${err.message}`);
