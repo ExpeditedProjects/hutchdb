@@ -201,4 +201,15 @@ describe.skipIf(!TEST_DB_URL)("row helpers with and without a transaction", () =
     });
     expect(await live()).toEqual([{ k: "a", n: 1 }, { k: "b" }, { k: "c" }]);
   });
+
+  it("searchRecords ranks matches and runs inside a tx", async () => {
+    await rows.insertRecords(COLLECTION_ID, [{ t: "otter" }, { t: "otter otter otter" }, { t: "seal" }]);
+    const hits = await rows.searchRecords(COLLECTION_ID, "otter", 10);
+    expect(hits.map((h) => (h.data as { t: string }).t)).toEqual(["otter otter otter", "otter"]);
+    expect(hits[0].rank).toBeGreaterThan(hits[1].rank);
+    await db.transaction(async (tx) => {
+      await rows.insertRecords(COLLECTION_ID, [{ t: "sea otter" }], "api", { tx });
+      expect(await rows.searchRecords(COLLECTION_ID, "otter", 10, { tx })).toHaveLength(3);
+    });
+  });
 });

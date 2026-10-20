@@ -506,11 +506,18 @@ export async function importRecords(userId: string, organizationId: string, para
   };
 }
 
+/**
+ * hutch_search: at most `limit` matches in total (max 50) across every
+ * collection the user can read, the most relevant first (ts_rank), newest
+ * first among equals. Each collection contributes at most `limit`
+ * candidates, so the merged top `limit` is exact. Matches are grouped by
+ * collection, groups in the order of their best match, and every record
+ * keeps its collection's name and slug.
+ */
 export async function searchGlobal(userId: string, search: string, limit: number = 10) {
   if (!userId) return { search, results: [] };
-  const clampedLimit = Math.min(limit, 50);
+  const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
 
-  const grouped = new Map<number, { collection: { name: string; slug: string }; records: Record<string, unknown>[] }>();
   const accessible = await db
     .select({ id: collections.id, name: collections.name, slug: collections.slug })
     .from(collections)
@@ -518,22 +525,31 @@ export async function searchGlobal(userId: string, search: string, limit: number
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
+  const candidates: { coll: (typeof accessible)[number]; row: tableRows.SearchMatch }[] = [];
   for (const coll of accessible) {
-    const rows = await tableRows.searchRecords(coll.id, search, clampedLimit);
-    if (rows.length === 0) continue;
-    grouped.set(coll.id, {
-      collection: { name: coll.name, slug: coll.slug },
-      records: rows.map((r) => ({
-        collectionName: coll.name,
-        collectionSlug: coll.slug,
-        id: r.id,
-        collectionId: coll.id,
-        data: r.data,
-        source: r.source,
-        deletedAt: r.deletedAt,
-        createdAt: r.createdAt,
-        updatedAt: r.updatedAt,
-      })),
+    for (const row of await tableRows.searchRecords(coll.id, search, clampedLimit)) candidates.push({ coll, row });
+  }
+  const time = (d: Date | null) => d?.getTime() ?? 0;
+  candidates.sort((a, b) =>
+    b.row.rank - a.row.rank || time(b.row.createdAt) - time(a.row.createdAt) || b.row.id - a.row.id);
+
+  const grouped = new Map<number, { collection: { name: string; slug: string }; records: Record<string, unknown>[] }>();
+  for (const { coll, row } of candidates.slice(0, clampedLimit)) {
+    let group = grouped.get(coll.id);
+    if (!group) {
+      group = { collection: { name: coll.name, slug: coll.slug }, records: [] };
+      grouped.set(coll.id, group);
+    }
+    group.records.push({
+      collectionName: coll.name,
+      collectionSlug: coll.slug,
+      id: row.id,
+      collectionId: coll.id,
+      data: row.data,
+      source: row.source,
+      deletedAt: row.deletedAt,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
     });
   }
 

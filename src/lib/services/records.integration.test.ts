@@ -1025,5 +1025,31 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       const none = await recordsSvc.searchGlobal(USER_ID, "nonexistentterm");
       expect(none.results).toHaveLength(0);
     });
+
+    it("searchGlobal caps the total at limit, most relevant first, then newest", async () => {
+      // "otter otter otter" ranks above a single mention.
+      const a = await seed("otters_a", [{ text: "otter" }, { text: "otter otter otter" }]);
+      const b = await seed("otters_b", [{ text: "one otter" }, { text: "another otter" }, { text: "otter again" }]);
+      await seed("otters_c", [{ text: "an otter" }, { text: "seal" }]);
+
+      const result = await recordsSvc.searchGlobal(USER_ID, "otter", 3);
+      const flat = result.results.flatMap((g) => g.records as { collectionSlug: string; data: { text: string } }[]);
+      expect(flat).toHaveLength(3);
+      expect(result.results.reduce((n, g) => n + g.matches, 0)).toBe(3);
+      // Best match first; its group leads.
+      expect(result.results[0].collection.slug).toBe(a);
+      expect(flat[0]).toMatchObject({ collectionSlug: a, data: { text: "otter otter otter" } });
+      for (const g of result.results) {
+        for (const r of g.records as { collectionSlug: string }[]) expect(r.collectionSlug).toBe(g.collection.slug);
+      }
+      // Among equal ranks the newest wins: otters_c's "an otter" was stored
+      // last, then otters_b's three; otters_a's single "otter" is oldest.
+      const picked = flat.map((r) => `${r.collectionSlug}:${r.data.text}`);
+      expect(picked).not.toContain(`${a}:otter`);
+      expect(picked.some((p) => p.startsWith(`${b}:`))).toBe(true);
+
+      const all = await recordsSvc.searchGlobal(USER_ID, "otter", 50);
+      expect(all.results.reduce((n, g) => n + g.matches, 0)).toBe(6);
+    });
   });
 });

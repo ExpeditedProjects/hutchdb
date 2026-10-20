@@ -297,7 +297,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       description: "Full-text search across every collection the user has access to. Example: use when the user is looking for something but doesn't know which collection holds it.",
       inputSchema: z.object({
         search: z.string().describe("What to search for — matches against all fields in all collections"),
-        limit: z.number().optional().describe("Max results per collection (default 10, max 50)"),
+        limit: z.number().optional().describe("Max results in total across all collections (default 10, max 50), most relevant first, then newest; results are grouped by collection and each record carries its collection slug"),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },

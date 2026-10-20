@@ -463,13 +463,20 @@ function toIntArrayLiteral(ids: number[]): string {
   return `{${ids.map((id) => Math.trunc(id)).join(",")}}`;
 }
 
-/** Full-text matches for hutch_search. */
-export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<TableRecord[]> {
+export type SearchMatch = TableRecord & { rank: number };
+
+/**
+ * Full-text matches for hutch_search, best first: by ts_rank, then newest.
+ * `rank` lets matches from several collections be merged in one order.
+ */
+export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<SearchMatch[]> {
   const result = await tx.execute(sql`
-    SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
+    SELECT ${RECORD_COLUMNS}, m.rank FROM ${table(collectionId)} t,
+      LATERAL (SELECT ts_rank(to_tsvector('english', t.data::text), plainto_tsquery('english', ${search}))::float8 AS rank) m
     WHERE t.deleted_at IS NULL AND to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})
+    ORDER BY m.rank DESC, t.created_at DESC, t.id DESC
     LIMIT ${limit}`);
-  return (result.rows as RawRow[]).map((r) => toRecord(collectionId, r));
+  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
 }
 
 /** Top-level keys of a few live documents, for hutch_list_collections. */
