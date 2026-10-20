@@ -59,6 +59,16 @@ vi.mock('@/lib/db/queries', () => ({
   notDeleted: { __notDeleted: true },
 }))
 
+// Name resolution has its own tests (resolve.test.ts and the integration
+// suite); here a slug argument resolves exactly as the mocked slug lookup says.
+vi.mock('./resolve', async () => {
+  const queries = await import('@/lib/db/queries')
+  return {
+    findAccessibleCollection: (ref: string, userId: string, role?: string) =>
+      (queries.findAccessibleCollectionBySlug as (...a: unknown[]) => unknown)(ref, userId, role),
+  }
+})
+
 vi.mock('@/lib/revalidation', () => ({
   revalidateDashboard: vi.fn(),
 }))
