@@ -1,7 +1,8 @@
 import { db } from "@/lib/db";
+import { envInt } from "@/lib/constants";
 import { sql, TransactionRollbackError, type SQL } from "drizzle-orm";
 import { toTextArrayLiteral } from "./ddl";
-import { collectionTableName, ident, readRegistry } from "./registry";
+import { collectionTableName, ident, indexName, readQueryRegistry } from "./registry";
 
 /**
  * Row operations on a collection's hc_<id> table. Result rows are the
@@ -462,14 +463,30 @@ export type SearchMatch = TableRecord & { rank: number };
  * Full-text matches for hutch_search, best first: by ts_rank, then newest.
  * `rank` lets matches from several collections be merged in one order.
  */
-export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<SearchMatch[]> {
-  const result = await tx.execute(sql`
+export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db, timeoutMs }: RowOptions & { timeoutMs?: number } = {}): Promise<SearchMatch[]> {
+  // With timeoutMs, the statement runs under that (shorter) timeout:
+  // SET LOCAL in a transaction of its own (a savepoint in a passed one).
+  const result = timeoutMs === undefined
+    ? await tx.execute(searchRecordsQuery(collectionId, search, limit))
+    : await tx.transaction(async (inner) => {
+      await inner.execute(sql`SELECT set_config('statement_timeout', ${String(Math.max(1, Math.round(timeoutMs)))}, true)`);
+      return inner.execute(searchRecordsQuery(collectionId, search, limit));
+    });
+  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+}
+
+/**
+ * The searchRecords statement. Its match condition is the expression of
+ * the collection's search GIN (builder.ts), so the index serves it once
+ * built.
+ */
+export function searchRecordsQuery(collectionId: number, search: string, limit: number): SQL {
+  return sql`
     SELECT ${RECORD_COLUMNS}, m.rank FROM ${table(collectionId)} t,
       LATERAL (SELECT ts_rank(to_tsvector('english', t.data::text), plainto_tsquery('english', ${search}))::float8 AS rank) m
     WHERE t.deleted_at IS NULL AND to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})
     ORDER BY m.rank DESC, t.created_at DESC, t.id DESC
-    LIMIT ${limit}`);
-  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+    LIMIT ${limit}`;
 }
 
 /** Top-level keys of a few live documents, for hutch_list_collections. */
@@ -480,16 +497,94 @@ export async function sampleFieldNames(collectionId: number, limit: number): Pro
   return (result.rows as { key: string }[]).map((r) => r.key);
 }
 
-/** Sample documents for schema inference / describe. */
-export async function sampleDocuments(collectionId: number, limit: number, random = false): Promise<Record<string, unknown>[]> {
-  const order = random ? sql`ORDER BY random()` : sql``;
+/**
+ * Sample documents for schema inference / describe. With `random`, a
+ * pseudo-random sample spread over the whole table that is the same on
+ * every call while the data is unchanged (describe pages through one
+ * sample's field list with fields_offset, so each page must see the same
+ * sample): rows ordered by a hash of their id, and on a table with many
+ * more live rows than `limit` (`liveRows`, when the caller knows it) the
+ * candidates come from TABLESAMPLE BERNOULLI ... REPEATABLE (seeded with
+ * the collection id) instead of sorting every row, so a 1M-row table is
+ * not read in full.
+ */
+export async function sampleDocuments(collectionId: number, limit: number, random = false, liveRows?: number): Promise<Record<string, unknown>[]> {
+  const sample = random && liveRows !== undefined ? bernoulliPercent(limit, liveRows) : null;
+  const from = sample !== null ? sql`${table(collectionId)} TABLESAMPLE BERNOULLI (${sample}) REPEATABLE (${collectionId})` : table(collectionId);
+  const order = random ? sql`ORDER BY hashint4(id), id` : sql``;
   const result = await db.execute(sql`
-    SELECT data FROM ${table(collectionId)} WHERE deleted_at IS NULL ${order} LIMIT ${limit}`);
+    SELECT data FROM ${from} WHERE deleted_at IS NULL ${order} LIMIT ${limit}`);
   return (result.rows as { data: Record<string, unknown> }[]).map((r) => r.data);
 }
 
-/** The three result sets getCollectionStats needs. */
-export async function collectionStats(collectionId: number, maxFields: number) {
+/**
+ * The BERNOULLI percentage that yields about 1.5x `rows` of `liveRows`
+ * (the margin covers sampling variance and soft-deleted rows, which the
+ * sample also visits), or null when the table is small enough that
+ * sorting every row is as cheap.
+ */
+function bernoulliPercent(rows: number, liveRows: number): number | null {
+  if (liveRows <= rows * 4) return null;
+  return Math.min(100, (150 * rows) / liveRows);
+}
+
+/**
+ * Stored size of a collection's table: heap plus TOAST (the documents),
+ * without indexes. A catalog lookup, no scan. What a full pass over the
+ * documents costs follows this, not the row count: 10k long articles
+ * (330 MB) take seconds to read where 1M small events take less.
+ */
+export async function tableBytes(collectionId: number): Promise<number> {
+  const result = await db.execute(sql`SELECT pg_table_size(${collectionTableName(collectionId)}::regclass)::float8 AS bytes`);
+  return Number((result.rows[0] as { bytes: number } | undefined)?.bytes ?? 0);
+}
+
+/**
+ * Approximate table size (heap + TOAST) of several collections from
+ * pg_class (relpages, as of the last VACUUM, ANALYZE or index build): a
+ * catalog read that takes no lock on the tables, so a table another
+ * session holds locked does not block it the way pg_table_size would. A
+ * collection without a table is left out.
+ */
+export async function approxTableBytesOf(collectionIds: number[]): Promise<Map<number, number>> {
+  const sizes = new Map<number, number>();
+  if (collectionIds.length === 0) return sizes;
+  const result = await db.execute(sql`
+    SELECT w.id, ((c.relpages + coalesce(t.relpages, 0))::float8 * current_setting('block_size')::int) AS bytes
+    FROM unnest(${toIntArrayLiteral(collectionIds)}::int[]) AS w(id)
+    JOIN pg_class c ON c.relname = 'hc_' || w.id AND c.relnamespace = current_schema()::regnamespace
+    LEFT JOIN pg_class t ON t.oid = c.reltoastrelid`);
+  for (const row of result.rows as { id: number; bytes: number }[]) sizes.set(Number(row.id), Number(row.bytes));
+  return sizes;
+}
+
+/**
+ * Collections whose table (tableBytes) is at most this large get exact
+ * figures that read every document — field fill rates in
+ * hutch_collection_stats, distinct counts in describe; larger ones get
+ * sampled or estimated figures, labelled as such. One pass over 100 MB
+ * of documents takes well under a second warm (product-catalog, 70 MB:
+ * fill rates in ~0.3 s), where the 5 s statement timeout cut off 330 MB of
+ * articles. HUTCH_FULL_SCAN_MAX_BYTES overrides it.
+ */
+export const DEFAULT_FULL_SCAN_MAX_BYTES = 100 * 1024 * 1024;
+
+export function fullScanMaxBytes(env: Record<string, string | undefined> = process.env): number {
+  return envInt("HUTCH_FULL_SCAN_MAX_BYTES", DEFAULT_FULL_SCAN_MAX_BYTES, { min: 0, env });
+}
+
+/**
+ * Each live row's document, read (detoasted) once: an OFFSET 0 subquery
+ * the planner keeps, whose output the outer query reads as often as it
+ * likes. Without it every data->key re-reads the whole TOASTed document,
+ * once per key.
+ */
+function documentsOnce(collectionId: number): SQL {
+  return sql`(SELECT t.data || '{}'::jsonb AS d FROM ${table(collectionId)} t WHERE t.deleted_at IS NULL OFFSET 0)`;
+}
+
+/** The summary and by-status result sets getCollectionStats needs; field fill rates come from fieldFillRates. */
+export async function collectionStats(collectionId: number) {
   const t = table(collectionId);
   return Promise.all([
     db.execute(sql`
@@ -506,22 +601,65 @@ export async function collectionStats(collectionId: number, maxFields: number) {
       FROM ${t}
       WHERE deleted_at IS NULL
       GROUP BY status`),
-    db.execute(sql`
-      SELECT key, count(*)::int AS count
-      FROM ${t}, LATERAL jsonb_object_keys(data) AS key
-      WHERE deleted_at IS NULL AND jsonb_typeof(data) = 'object'
-      GROUP BY key
-      ORDER BY count DESC, key ASC
-      LIMIT ${maxFields}`),
   ]);
 }
 
-/** Live row counts of each child table, for describe. */
-export async function childTableCounts(tables: string[]): Promise<Record<string, number>> {
+export type FieldFillRates = {
+  /** Top-level keys, most common first, with how many (sampled) records have each. */
+  fields: { key: string; count: number }[];
+  /** Null for an exact count over every live record; else how many records the sample held. */
+  sampledRows: number | null;
+};
+
+/**
+ * How many live records have each top-level key (most common first, at
+ * most `maxFields`). With `sampleRows`, counted over a random sample of
+ * about that many records (TABLESAMPLE BERNOULLI over `liveRows`) instead
+ * of every record.
+ */
+export async function fieldFillRates(collectionId: number, maxFields: number, sample?: { rows: number; liveRows: number }): Promise<FieldFillRates> {
+  const keysOf = (doc: SQL) => sql`LATERAL jsonb_object_keys(CASE WHEN jsonb_typeof(${doc}) = 'object' THEN ${doc} ELSE '{}'::jsonb END) AS key`;
+  if (!sample) {
+    const result = await db.execute(sql`
+      SELECT key, count(*)::int AS count
+      FROM ${documentsOnce(collectionId)} s, ${keysOf(sql`s.d`)}
+      GROUP BY key
+      ORDER BY count DESC, key ASC
+      LIMIT ${maxFields}`);
+    return { fields: result.rows as { key: string; count: number }[], sampledRows: null };
+  }
+  const percent = bernoulliPercent(sample.rows, sample.liveRows) ?? 100;
+  const result = await db.execute(sql`
+    WITH s AS MATERIALIZED (
+      SELECT t.data FROM ${table(collectionId)} t TABLESAMPLE BERNOULLI (${percent})
+      WHERE t.deleted_at IS NULL ORDER BY random() LIMIT ${sample.rows})
+    SELECT k.key, k.count, (SELECT count(*)::int FROM s) AS sampled
+    FROM (SELECT key, count(*)::int AS count FROM s, ${keysOf(sql`s.data`)} GROUP BY key) k
+    RIGHT JOIN (SELECT 1) one ON true
+    ORDER BY k.count DESC, k.key ASC
+    LIMIT ${maxFields}`);
+  const rows = result.rows as { key: string | null; count: number | null; sampled: number }[];
+  return {
+    fields: rows.filter((r) => r.key !== null).map((r) => ({ key: r.key!, count: Number(r.count) })),
+    sampledRows: Number(rows[0]?.sampled ?? 0),
+  };
+}
+
+/**
+ * Row counts of each child table for describe, counting only elements of
+ * live records: the child rows of a soft-deleted record stay in the table
+ * (the triggers only follow inserts and updates), so they are subtracted —
+ * one lookup by parent_id (the primary key's first column) per deleted
+ * record.
+ */
+export async function childTableCounts(collectionId: number, tables: string[]): Promise<Record<string, number>> {
   const counts: Record<string, number> = {};
   for (const name of tables) {
-    const result = await db.execute(sql`SELECT count(*)::int AS count FROM ${ident(name)}`);
-    counts[name] = (result.rows[0] as { count: number } | undefined)?.count ?? 0;
+    const child = ident(name);
+    const result = await db.execute(sql`
+      SELECT (SELECT count(*) FROM ${child})
+           - (SELECT count(*) FROM ${child} c WHERE c.parent_id IN (SELECT p.id FROM ${table(collectionId)} p WHERE p.deleted_at IS NOT NULL)) AS count`);
+    counts[name] = Number((result.rows[0] as { count: number | string } | undefined)?.count ?? 0);
   }
   return counts;
 }
@@ -550,36 +688,68 @@ export async function recordCounts(collectionIds: number[]): Promise<Map<number,
 
 /**
  * Exact distinct-value counts of top-level keys over every live record
- * (JSON equality: 1 and "1" differ; a missing key is not a value).
+ * (JSON equality: 1 and "1" differ; a missing key is not a value). Each
+ * document is read once however many keys are counted (documentsOnce).
  */
 export async function exactDistinctCounts(collectionId: number, keys: string[]): Promise<Record<string, number>> {
   if (keys.length === 0) return {};
-  const cols = keys.map((k, i) => sql`count(DISTINCT t.data->${k}::text)::int AS ${sql.raw(`"d${i}"`)}`);
-  const result = await db.execute(sql`SELECT ${sql.join(cols, sql`, `)} FROM ${table(collectionId)} t WHERE t.deleted_at IS NULL`);
+  const result = await db.execute(exactDistinctCountsQuery(collectionId, keys));
   const row = result.rows[0] as Record<string, number>;
   return Object.fromEntries(keys.map((k, i) => [k, Number(row[`d${i}`])]));
 }
 
 /**
- * Postgres's estimate of distinct values for top-level keys that have a
- * projection column, from pg_stats (n_distinct, a fraction of reltuples
- * when negative). Keys without a column or without statistics yet are
- * left out.
+ * The exactDistinctCounts statement (columns d0, d1, ... for `keys`). The
+ * per-key values are projected first (inner OFFSET 0 subquery), so each
+ * count(DISTINCT ...) sorts only its values, not whole documents: on a
+ * large-document table (stress hc_5, 69 MB) sorting the documents spilled
+ * 254 MB to disk and took 1.3 s; projected, 0.4 s in memory.
  */
-export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[]): Promise<Record<string, number>> {
-  const registry = readRegistry(storage);
-  const columns = new Map(registry.projections.filter((p) => !p.path && keys.includes(p.field)).map((p) => [p.column, p.field]));
-  if (columns.size === 0) return {};
+export function exactDistinctCountsQuery(collectionId: number, keys: string[]): SQL {
+  const values = keys.map((k, i) => sql`s.d->${k}::text AS ${sql.raw(`"v${i}"`)}`);
+  const cols = keys.map((_, i) => sql`count(DISTINCT x.${sql.raw(`"v${i}"`)})::int AS ${sql.raw(`"d${i}"`)}`);
+  return sql`
+    SELECT ${sql.join(cols, sql`, `)}
+    FROM (SELECT ${sql.join(values, sql`, `)} FROM ${documentsOnce(collectionId)} s OFFSET 0) x`;
+}
+
+/**
+ * Postgres's estimate of distinct values for top-level keys that have a
+ * ready projection, from pg_stats (n_distinct, a fraction of reltuples
+ * when negative): the table's statistics for a legacy projection column,
+ * the projection index's own statistics (its first column) for an
+ * expression projection. Keys without a ready projection or without
+ * statistics yet (ANALYZE has not run since the index was built) are left
+ * out. reltuples counts soft-deleted rows too, so with `liveRows` (the
+ * live record count) a fractional n_distinct scales by that instead, and
+ * no estimate exceeds it.
+ */
+export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[], liveRows?: number): Promise<Record<string, number>> {
+  const registry = readQueryRegistry(storage);
   const name = collectionTableName(collectionId);
+  // pg_stats relation name and column -> field.
+  const sources = new Map<string, string>();
+  for (const p of registry.projections) {
+    if (p.path || !keys.includes(p.field)) continue;
+    // An index's expression column is named by Postgres ("case" for ours): matched as attnum 1 below, "" here.
+    sources.set(JSON.stringify(p.kind === "expression" ? [indexName(name, p.column), ""] : [name, p.column]), p.field);
+  }
+  if (sources.size === 0) return {};
+  const pairs = [...sources.keys()].map((k) => JSON.parse(k) as [string, string]);
   const result = await db.execute(sql`
-    SELECT s.attname, s.n_distinct, c.reltuples
-    FROM pg_stats s JOIN pg_class c ON c.relname = s.tablename AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname)
-    WHERE s.schemaname = current_schema() AND s.tablename = ${name} AND s.attname = ANY(${`{${[...columns.keys()].join(",")}}`}::text[])`);
+    SELECT w.rel AS tablename, w.col AS attname, s.n_distinct, c.reltuples
+    FROM unnest(${toTextArrayLiteral(pairs.map((p) => p[0]))}::text[], ${toTextArrayLiteral(pairs.map((p) => p[1]))}::text[]) AS w(rel, col)
+    JOIN pg_stats s ON s.schemaname = current_schema() AND s.tablename = w.rel
+      AND s.attname = CASE WHEN w.col = '' THEN (SELECT a.attname FROM pg_attribute a WHERE a.attrelid = to_regclass(w.rel) AND a.attnum = 1) ELSE w.col END
+    JOIN pg_class c ON c.relname = ${name} AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname)`);
   const out: Record<string, number> = {};
-  for (const row of result.rows as { attname: string; n_distinct: number; reltuples: number }[]) {
+  for (const row of result.rows as { tablename: string; attname: string; n_distinct: number; reltuples: number }[]) {
     const nd = Number(row.n_distinct);
-    const estimate = nd >= 0 ? nd : Math.round(-nd * Number(row.reltuples));
-    if (Number.isFinite(estimate) && estimate > 0) out[columns.get(row.attname)!] = Math.round(estimate);
+    const rows = liveRows ?? Number(row.reltuples);
+    const raw = nd >= 0 ? nd : Math.round(-nd * rows);
+    const estimate = liveRows !== undefined ? Math.min(raw, liveRows) : raw;
+    const field = sources.get(JSON.stringify([row.tablename, row.attname]));
+    if (field !== undefined && Number.isFinite(estimate) && estimate > 0) out[field] = Math.round(estimate);
   }
   return out;
 }

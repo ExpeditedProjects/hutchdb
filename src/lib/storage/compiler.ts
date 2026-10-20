@@ -3,13 +3,18 @@ import { sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import {
   AGGREGATION_OPS,
+  ARITHMETIC_OPERATORS,
   escapeBucket,
+  FILTER_OPERATORS,
   isOperatorSpec,
   MAX_GROUP_BY_KEYS,
   normalizeGroupBy,
+  SIZE_OPERATORS,
+  TIME_BUCKET_UNITS,
   type QueryParams,
 } from "@/lib/db/queries";
 import { isPlainObject } from "@/lib/validation";
+import { formatTimeout, isStatementTimeout } from "@/lib/db/errors";
 import {
   collectionTableName,
   findPathProjection,
@@ -17,7 +22,8 @@ import {
   findUnwind,
   ident,
   indexName,
-  readRegistry,
+  readQueryRegistry,
+  searchIndexName,
   type Projection,
   type ProjectionType,
   type StorageRegistry,
@@ -25,6 +31,7 @@ import {
   valueFitsType,
 } from "./registry";
 import { TtlCache } from "./ttl-cache";
+import { projectionValue } from "./expression";
 import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from "./rows";
 import { applyArrayOps, ARRAY_OPS_HELP, fieldHeads, fieldsCover, parseArrayOps, projectData, type ArrayOps } from "./projection";
 
@@ -76,7 +83,8 @@ export const SORT_HELP =
   "and with group_by/aggregate, an aggregate alias or a group_by key — optionally prefixed with - for descending; " +
   `up to ${MAX_SORT_KEYS} keys as a comma-separated list or an array, the first deciding first`;
 
-type Collection = { id: number; storage: unknown };
+/** `schema` (the saved field list, inferred from a sample) is optional: only error messages read it. */
+type Collection = { id: number; storage: unknown; schema?: unknown };
 
 /**
  * QueryParams for a collection table: `sort` may also be an array
@@ -308,7 +316,7 @@ function jsonpathConditions(data: SQL, path: string, conds: PathCondition[]): SQ
       const pattern = JSON.stringify(operand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
       same.push(`@${accessor} like_regex ${pattern} flag "i"`);
     } else {
-      throw new Error(`Unsupported filter operator '${op}'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains`);
+      throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
     }
   }
   if (same.length > 0) out.unshift(exists(same.join(" && ")));
@@ -382,9 +390,45 @@ function assertOperand(op: string, operand: unknown): void {
     if (typeof operand !== "string") {
       throw new Error("$contains requires a string operand (a case-insensitive substring). To match array elements exactly use {\"field\": \"value\"}, {\"field\": {\"$in\": [...]}}, or {\"field\": [\"a\", \"b\"]} for all of them");
     }
+  } else if (op === "$size") {
+    assertSizeOperand(operand);
   } else if (op !== "$ne") {
-    throw new Error(`Unsupported filter operator '${op}'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains`);
+    throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
   }
+}
+
+// ── $size ─────────────────────────────────────────────────────────────────────
+
+const SIZE_HELP = '$size takes a number (exact count) or an object of comparisons with numbers, e.g. {"members": {"$size": 3}} or {"members": {"$size": {"$gt": 30}}}';
+
+type SizeOperand = number | Partial<Record<(typeof SIZE_OPERATORS)[number], number>>;
+
+function assertSizeOperand(operand: unknown): asserts operand is SizeOperand {
+  if (typeof operand === "number") {
+    if (!Number.isFinite(operand)) throw new Error(SIZE_HELP);
+    return;
+  }
+  if (!isPlainObject(operand) || Object.keys(operand).length === 0) throw new Error(SIZE_HELP);
+  for (const [op, value] of Object.entries(operand)) {
+    if (!(SIZE_OPERATORS as readonly string[]).includes(op)) throw new Error(`Unsupported $size operator '${op}' (${SIZE_OPERATORS.join(", ")}): ${SIZE_HELP}`);
+    if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`$size ${op} takes a number: ${SIZE_HELP}`);
+  }
+}
+
+/** Element count of an array, key count of an object, NULL for anything else (scalars, missing). */
+function sizeExpr(json: SQL): SQL {
+  return sql`(CASE jsonb_typeof(${json}) WHEN 'array' THEN jsonb_array_length(${json}) WHEN 'object' THEN (SELECT count(*) FROM jsonb_object_keys(${json}))::int END)`;
+}
+
+const SIZE_COMPARISONS: Record<string, string> = { ...COMPARISONS, $ne: "<>" };
+
+/** $size: a value with no size (scalar, missing) never matches, not even $ne. */
+function sizeCondition(json: SQL, operand: SizeOperand): SQL {
+  const size = sizeExpr(json);
+  const tests = typeof operand === "number"
+    ? [sql`${size} = ${operand}::numeric`]
+    : Object.entries(operand).map(([op, n]) => sql`${size} ${sql.raw(SIZE_COMPARISONS[op])} ${n}::numeric`);
+  return sql`coalesce(${sql.join(tests, sql` AND `)}, false)`;
 }
 
 /**
@@ -445,6 +489,7 @@ function documentCondition(t: DocTarget, op: string | null, operand: unknown): C
     const match = viaPath ?? sql`coalesce(${valueMatch(t.json, t.text, "$in", list)} OR ${anyElement(t, "$in", list)}, false)`;
     return op === "$in" ? { condition: match, indexable: viaPath !== null } : { condition: sql`NOT ${match}`, indexable: false };
   }
+  if (op === "$size") return { condition: sizeCondition(t.json, operand as SizeOperand), indexable: false };
   if (op === "$exists") {
     const present = t.key !== undefined ? sql`${t.data} ? ${t.key}::text` : sql`${t.json} IS NOT NULL`;
     return { condition: operand ? present : sql`NOT (${present})`, indexable: false };
@@ -539,6 +584,9 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
       raw[rest.join(".")] = value;
       nestedRaw.set(path, raw);
       for (const cond of entries(value)) {
+        if (cond.op === "$size") {
+          throw new Error(`$size is not supported on '${key}', a path into an array of objects ('${path}'); use it on a top-level field or an object path, e.g. {"${path}": {"$size": {"$gt": 3}}}`);
+        }
         // Child columns carry no misfit flag; a text one may be NULL for an
         // over-long string, so it never answers a range.
         const routed = unwind && column ? columnCondition(sql`c.${ident(column.column)}`, column.type, cond.op, cond.operand, column.type === "text") : null;
@@ -628,7 +676,7 @@ function fieldConditions(ctx: Ctx, key: string, target: DocTarget, projection: P
   const out: SQL[] = [];
   for (const cond of entries(value)) {
     const label = `filter on ${key}${cond.op ? ` (${cond.op})` : ""}`;
-    const routed = projection ? projectedCondition(target, sql`t.${ident(projection.column)}`, projection, cond.op, cond.operand) : null;
+    const routed = projection ? projectedCondition(target, projectionValue(projection, "t"), projection, cond.op, cond.operand) : null;
     if (routed && projection) {
       out.push(routed);
       const indexes = [indexName(ctx.parent, projection.column), ...(projection.mixed && cond.op === null ? [ctx.gin] : [])];
@@ -735,7 +783,7 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   if (parsed.kind === "object") {
     const projection = findPathProjection(registry, parsed.segments);
     if (projection && !projection.mixed) {
-      const column = sql`t.${ident(projection.column)}`;
+      const column = projectionValue(projection, "t");
       return { orderBy: sql`${column} ${dir} NULLS LAST`, clause: { label, indexes: [indexName(parent, projection.column)] }, ...(sort.startsWith("-") ? { descendingColumn: column } : {}) };
     }
     // `#>` keeps jsonb typing so numbers order numerically.
@@ -746,7 +794,7 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   }
   const projection = findProjection(registry, field);
   if (projection && !projection.mixed) {
-    const column = sql`t.${ident(projection.column)}`;
+    const column = projectionValue(projection, "t");
     return {
       orderBy: sql`${column} ${dir} NULLS LAST`,
       clause: { label, indexes: [indexName(parent, projection.column)] },
@@ -758,7 +806,7 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
 
 // ── Aggregation ──────────────────────────────────────────────────────────────
 
-type AggregateSpec = Record<string, string | Record<string, string>>;
+type AggregateSpec = Record<string, string | Record<string, unknown>>;
 
 function aliasIdent(alias: string): SQL {
   assertPathName(alias);
@@ -807,7 +855,7 @@ function documentExprs(json: SQL, text: SQL): FieldExprs {
  */
 function withProjection(exprs: FieldExprs, projection: Projection | undefined): FieldExprs {
   if (!projection) return exprs;
-  const col = sql`t.${ident(projection.column)}`;
+  const col = projectionValue(projection, "t");
   const out = { ...exprs };
   if (projection.type === "number") out.numeric = exactNumeric(col);
   if (projection.type === "boolean") out.boolean = col;
@@ -886,14 +934,128 @@ function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
   }
 }
 
+/**
+ * Each results row is one object keyed by the group_by keys and aggregate
+ * aliases, plus time_bucket (with time_bucket) and parent_id/record (with
+ * per_record). Two of those sharing a name would silently drop one value,
+ * so the names must be distinct. Top-level response fields (plan, total,
+ * indexed) are outside the rows and never collide.
+ */
+function assertDistinctColumns(groupKeys: string[], aliases: string[], opts: { timeBucket: boolean; perRecord: boolean }): void {
+  const reserved = new Set([...(opts.timeBucket ? ["time_bucket"] : []), ...(opts.perRecord ? ["parent_id", "record"] : [])]);
+  for (const name of [...groupKeys, ...aliases]) {
+    if (reserved.has(name) || name.startsWith("__")) {
+      const why = name.startsWith("__") ? "names starting with __ are used internally"
+        : name === "time_bucket" ? "with time_bucket, each row carries its bucket as time_bucket"
+        : "with per_record, each row carries parent_id and record";
+      throw new Error(`'${name}' is reserved in this aggregate's rows (${why}); ${groupKeys.includes(name) ? "a field with this name can't be a group_by key in this query" : "use another alias"}.`);
+    }
+  }
+  for (const alias of aliases) {
+    if (groupKeys.includes(alias)) {
+      throw new Error(`'${alias}' is both a group_by key and an aggregate alias; each results row would hold only one of them. Use a different alias, e.g. {"n": "count"}.`);
+    }
+  }
+  if (aliases.length === 0 && groupKeys.includes("count")) {
+    throw new Error(`group_by key 'count' collides with the default count column; pass an aggregate with another alias, e.g. {"n": "count"}.`);
+  }
+}
+
 export const AGGREGATE_SPEC_EXAMPLE = '{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}';
+
+// ── Aggregate expressions ────────────────────────────────────────────────────
+
+/** Deepest nesting of arithmetic operators in one expression ({"$multiply": [{"$add": [...]}, ...]} is 2). */
+export const MAX_EXPRESSION_DEPTH = 3;
+/** Most operands one $multiply/$add takes ($subtract and $divide take exactly 2). */
+export const MAX_EXPRESSION_OPERANDS = 10;
+/** Aggregates that take an expression operand. */
+const EXPRESSION_AGGREGATES = ["sum", "avg", "min", "max"];
+
+const EXPRESSION_HELP = 'An expression is {"$multiply"|"$add": [2 to 10 operands]}, {"$subtract"|"$divide": [a, b]} or {"$size": "field"}; each operand is a field path, a number or another expression, e.g. {"sum": {"$multiply": ["items.qty", "items.price"]}}';
+
+/**
+ * A numeric expression in an aggregate: a field path (its numbers), a
+ * number, the size of an array/object at a path, or arithmetic over those.
+ */
+type Expr =
+  | { kind: "path"; field: string }
+  | { kind: "num"; value: number }
+  | { kind: "size"; field: string }
+  | { kind: "arith"; op: (typeof ARITHMETIC_OPERATORS)[number]; args: Expr[] };
+
+function parseExpr(raw: unknown, depth: number): Expr {
+  if (typeof raw === "string") {
+    assertPathName(raw);
+    return { kind: "path", field: raw };
+  }
+  if (typeof raw === "number") {
+    if (!Number.isFinite(raw)) throw new Error(`Expression operands must be finite numbers. ${EXPRESSION_HELP}`);
+    return { kind: "num", value: raw };
+  }
+  const entries = isPlainObject(raw) ? Object.entries(raw) : [];
+  if (entries.length !== 1) throw new Error(`Invalid expression operand ${JSON.stringify(raw)}: each operand is a field path, a number or an object with one operator. ${EXPRESSION_HELP}`);
+  const [op, args] = entries[0];
+  if (op === "$size") {
+    if (typeof args !== "string") throw new Error(`$size takes a field path, e.g. {"$size": "members"}`);
+    assertPathName(args);
+    return { kind: "size", field: args };
+  }
+  if (!(ARITHMETIC_OPERATORS as readonly string[]).includes(op)) {
+    throw new Error(`Unsupported expression operator '${op}'. Supported: ${ARITHMETIC_OPERATORS.join(", ")}, $size. ${EXPRESSION_HELP}`);
+  }
+  if (depth > MAX_EXPRESSION_DEPTH) throw new Error(`Expressions can be nested at most ${MAX_EXPRESSION_DEPTH} operators deep`);
+  const binary = op === "$subtract" || op === "$divide";
+  if (!Array.isArray(args) || (binary ? args.length !== 2 : args.length < 2 || args.length > MAX_EXPRESSION_OPERANDS)) {
+    throw new Error(binary ? `${op} takes exactly 2 operands, e.g. {"${op}": ["total", "count"]}` : `${op} takes 2 to ${MAX_EXPRESSION_OPERANDS} operands in an array, e.g. {"${op}": ["items.qty", "items.price"]}`);
+  }
+  return { kind: "arith", op: op as (typeof ARITHMETIC_OPERATORS)[number], args: args.map((a) => parseExpr(a, depth + 1)) };
+}
+
+/** Every field path an expression reads, and whether it reads it through $size. */
+function exprFields(e: Expr): { field: string; size: boolean }[] {
+  if (e.kind === "path") return [{ field: e.field, size: false }];
+  if (e.kind === "size") return [{ field: e.field, size: true }];
+  if (e.kind === "arith") return e.args.flatMap(exprFields);
+  return [];
+}
+
+/**
+ * The expression as numeric SQL. A path operand reads numbers only (any
+ * other value makes that row's result NULL, which sum/avg/min/max skip);
+ * $divide by zero is NULL.
+ */
+function exprSql(e: Expr, exprsFor: (field: string) => FieldExprs): SQL {
+  switch (e.kind) {
+    case "num": return sql`${e.value}::numeric`;
+    case "path": return sql`(${exprsFor(e.field).numeric})`;
+    case "size": return sql`${sizeExpr(exprsFor(e.field).jsonb)}::numeric`;
+    case "arith": {
+      const args = e.args.map((a) => exprSql(a, exprsFor));
+      if (e.op === "$divide") return sql`(${args[0]} / NULLIF(${args[1]}, 0))`;
+      const op = e.op === "$multiply" ? sql` * ` : e.op === "$add" ? sql` + ` : sql` - `;
+      return sql`(${sql.join(args, op)})`;
+    }
+  }
+}
+
+/** Field paths named anywhere in an aggregate spec value (field strings and expression operands). */
+function specFields(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(specFields);
+  if (isPlainObject(value)) return Object.values(value).flatMap(specFields);
+  return [];
+}
+
+type ParsedAggregate = { alias: string; op: string; field: string | null; expr?: Expr };
 
 /**
  * An aggregate spec: alias -> "count" (rows in the group), or {op: field}.
  * {"count": "path"} counts rows (or array elements) with a non-null value
  * at the path; {"count": "*"} (or any non-path operand) is "count".
+ * sum/avg/min/max also take an expression ({"$multiply": [...]}, {"$size": path}).
  */
-function parseAggregate(aggregate: AggregateSpec | undefined): { alias: string; op: string; field: string | null }[] {
+function parseAggregate(aggregate: AggregateSpec | undefined): ParsedAggregate[] {
   if (!aggregate) return [];
   return Object.entries(aggregate).map(([alias, spec]) => {
     if (spec === "count") return { alias, op: "count", field: null };
@@ -906,16 +1068,61 @@ function parseAggregate(aggregate: AggregateSpec | undefined): { alias: string; 
     if (op === "count") {
       return typeof field === "string" && field !== "*" && field !== "" ? (assertPathName(field), { alias, op, field }) : { alias, op, field: null };
     }
-    if (typeof field !== "string") throw new Error(`Aggregation '${op}' for '${alias}' takes a field name, e.g. {"${op}": "score"}`);
+    if (isPlainObject(field)) {
+      if (!EXPRESSION_AGGREGATES.includes(op)) {
+        throw new Error(`Aggregation '${op}' for '${alias}' takes a field name; expressions work with sum, avg, min and max. ${EXPRESSION_HELP}`);
+      }
+      return { alias, op, field: null, expr: parseExpr(field, 1) };
+    }
+    if (typeof field !== "string") throw new Error(`Aggregation '${op}' for '${alias}' takes a field name, e.g. {"${op}": "score"}, or for sum/avg/min/max an expression. ${EXPRESSION_HELP}`);
     assertPathName(field);
     return { alias, op, field };
   });
 }
 
+// ── time_bucket ──────────────────────────────────────────────────────────────
+
+const TIME_BUCKET_HELP = `time_bucket takes a unit ("day": buckets by insert time, created_at) or {"field": "<data field>", "unit": "<unit>"} to bucket by a field holding ISO date/datetime strings, in UTC; units: ${TIME_BUCKET_UNITS.join(", ")}`;
+
+type TimeBucket = { unit: string; field: string | null };
+
+/** The string form keeps its old leniency (an unknown unit is "day"); the object form is strict. */
+export function parseTimeBucket(raw: unknown): TimeBucket | null {
+  if (raw === undefined || raw === null || raw === "") return null;
+  if (typeof raw === "string") return { unit: escapeBucket(raw), field: null };
+  if (!isPlainObject(raw) || typeof raw.field !== "string" || typeof raw.unit !== "string" || Object.keys(raw).some((k) => k !== "field" && k !== "unit")) {
+    throw new Error(TIME_BUCKET_HELP);
+  }
+  if (!(TIME_BUCKET_UNITS as readonly string[]).includes(raw.unit)) throw new Error(`Invalid time_bucket unit '${raw.unit}': ${TIME_BUCKET_HELP}`);
+  assertPathName(raw.field);
+  return { unit: raw.unit, field: raw.field };
+}
+
+/**
+ * An ISO 8601 date or datetime: YYYY-MM-DD, optionally with a time
+ * ("T" or a space) and a zone (Z or ±HH[:MM]). Values that match and are
+ * valid timestamps bucket; anything else (other strings, numbers, missing)
+ * lands in the null bucket.
+ */
+const ISO_DATE_RE = "^\\d{4}-\\d{2}-\\d{2}([Tt ]\\d{2}:\\d{2}(:\\d{2}(\\.\\d+)?)?([Zz]|[+-]\\d{2}(:?\\d{2})?)?)?$";
+const ZONED_RE = "[Tt ]\\d{2}:\\d{2}(:\\d{2}(\\.\\d+)?)?([Zz]|[+-]\\d{2}(:?\\d{2})?)$";
+
+/**
+ * The UTC bucket of a jsonb value as 'YYYY-MM-DDTHH:MI:SSZ' text, NULL when
+ * it is not an ISO date/datetime string. A value without a zone is read as
+ * UTC (never the session time zone), so the answer doesn't depend on the
+ * server. pg_input_is_valid (Postgres 16+) keeps 2026-02-30 from erroring.
+ */
+function dataTimeBucket(json: SQL, unit: string): SQL {
+  const text = sql`(${json} #>> '{}')`;
+  const u = sql.raw(`'${escapeBucket(unit)}'`);
+  return sql`(CASE WHEN jsonb_typeof(${json}) = 'string' AND ${text} ~ ${ISO_DATE_RE} AND pg_input_is_valid(${text}, 'timestamptz') THEN to_char(date_trunc(${u}, CASE WHEN ${text} ~ ${ZONED_RE} THEN ${text}::timestamptz AT TIME ZONE 'UTC' ELSE ${text}::timestamp END), 'YYYY-MM-DD"T"HH24:MI:SS"Z"') END)`;
+}
+
 // ── compile ──────────────────────────────────────────────────────────────────
 
 export function compileQuery(collection: Collection, params: TableQueryParams, options: CompileOptions = {}): CompiledQuery {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const parentTable = collectionTableName(collection.id);
   const ctx: Ctx = {
     registry,
@@ -931,8 +1138,9 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
   const clauses = [...parsed.clauses];
   const parent: SQL[] = [sql`t.deleted_at IS NULL`, ...parsed.parent];
   if (search) {
+    // The same expression as the search GIN (builder.ts), so it serves this once built.
     parent.push(sql`to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})`);
-    clauses.push({ label: "search", indexes: [] });
+    clauses.push({ label: "search", indexes: registry.search_index ? [searchIndexName(parentTable)] : [] });
   }
   if (createdAfter) {
     parent.push(sql`t.created_at >= ${createdAfter}::timestamptz`);
@@ -1007,7 +1215,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
  * compiles to, for statements other than a query: transform's set_field.
  */
 export function compileFilterWhere(collection: Collection, filter: Record<string, unknown>, options: CompileOptions = {}): SQL {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const parentTable = collectionTableName(collection.id);
   const ctx: Ctx = { registry, arrayPaths: new Set(options.arrayPaths ?? []), parent: parentTable, gin: indexName(parentTable, "data_gin") };
   const parsed = compileFilter(ctx, filter);
@@ -1031,14 +1239,17 @@ function compileAggregate(
   parsed: ParsedFilter,
   parent: SQL[],
   clauses: Clause[],
-  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; offset: number; countOnly: boolean; perRecord: boolean; scalarArrayKeys: Set<string> },
+  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: unknown; sortKeys: string[]; limit: number; offset: number; countOnly: boolean; perRecord: boolean; scalarArrayKeys: Set<string> },
 ): CompiledQuery {
   const { registry } = ctx;
   const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, offset, countOnly, perRecord, scalarArrayKeys } = params;
   const aggs = parseAggregate(aggregate);
+  const bucket = parseTimeBucket(timeBucket);
+  const exprRefs = aggs.flatMap((a) => (a.expr ? exprFields(a.expr) : []));
+  assertDistinctColumns(groupKeys, aggs.map((a) => a.alias), { timeBucket: !!timeBucket, perRecord });
 
   // Which nested array (if any) this aggregation runs over.
-  const refs = [...groupKeys, ...aggs.flatMap((a) => (a.field ? [a.field] : []))].map((f) => ({ field: f, parsed: parsePath(registry, ctx.arrayPaths, f) }));
+  const refs = [...groupKeys, ...aggs.flatMap((a) => (a.field ? [a.field] : [])), ...exprRefs.map((r) => r.field), ...(bucket?.field ? [bucket.field] : [])].map((f) => ({ field: f, parsed: parsePath(registry, ctx.arrayPaths, f) }));
   const nested = refs.filter((r) => r.parsed.kind === "nested") as { field: string; parsed: Extract<ParsedPath, { kind: "nested" }> }[];
   const nestedPaths = new Set(nested.map((r) => r.parsed.path));
   if (nestedPaths.size > 1) {
@@ -1055,7 +1266,15 @@ function compileAggregate(
   // count-with-path and first read the element's own value, which a child
   // column does not hold when it has another type (the column is NULL), so
   // they unnest the array.
-  const readsElementValue = aggs.some((a) => a.field && (a.op === "first" || a.op === "count") && parsePath(registry, ctx.arrayPaths, a.field).kind === "nested");
+  // Likewise an expression operand reads numbers (a child column that is
+  // not a number column is NULL where the element may hold one), $size reads
+  // arrays and objects (never in a child column), and a time bucket reads
+  // strings (only a text child column holds every string, dates included).
+  const isNested = (field: string) => parsePath(registry, ctx.arrayPaths, field).kind === "nested";
+  const childType = (field: string) => unwind?.fields.find((f) => f.field === field.split(".").slice(1).join("."))?.type;
+  const readsElementValue = aggs.some((a) => a.field && (a.op === "first" || a.op === "count") && isNested(a.field))
+    || exprRefs.some((r) => isNested(r.field) && (r.size || childType(r.field) !== "number"))
+    || (bucket?.field != null && isNested(bucket.field) && childType(bucket.field) !== "text");
   const route: "child" | "lateral" | null = !path ? null
     : unwind && !parsed.unrouted.has(path) && !readsElementValue && nested.every((r) => r.parsed.rest.length === 1 && unwind.fields.some((f) => f.field === r.parsed.rest[0])) ? "child"
     : "lateral";
@@ -1089,9 +1308,11 @@ function compileAggregate(
   const unnests: SQL[] = [];
 
   if (path && perRecord) add(sql`t.id AS parent_id`, "parent_id", true);
-  if (timeBucket) {
-    const bucket = sql.raw(`'${escapeBucket(timeBucket)}'`);
-    add(sql`date_trunc(${bucket}, t.created_at) AS time_bucket`, "time_bucket", true);
+  if (bucket) {
+    // A data field keeps its JSON reading (projection column or child
+    // column only where it holds every value, as for a group key).
+    const expr = bucket.field ? dataTimeBucket(exprsFor(bucket.field).group, bucket.unit) : sql`date_trunc(${sql.raw(`'${bucket.unit}'`)}, t.created_at)`;
+    add(sql`${expr} AS time_bucket`, "time_bucket", true);
     defaultOrder.unshift(defaultOrder.pop()!);
   }
   for (const key of groupKeys) {
@@ -1113,6 +1334,12 @@ function compileAggregate(
   const typeChecks: { alias: string; op: string; field: string; column: string }[] = [];
   const firstOrder = route === "lateral" ? sql`t.id, e.ord` : route === "child" ? sql`t.id, c.idx` : sql`t.id`;
   for (const a of aggs) {
+    if (a.expr) {
+      // Arithmetic is numeric throughout, so no value-type check: a row
+      // whose operands are not all numbers is NULL and skipped.
+      add(sql`to_jsonb(${sql.raw(a.op)}(${exprSql(a.expr, exprsFor)})) AS ${aliasIdent(a.alias)}`, a.alias, false);
+      continue;
+    }
     if (!a.field) {
       add(sql`count(*)::int AS ${aliasIdent(a.alias)}`, a.alias, false);
       continue;
@@ -1302,8 +1529,10 @@ function dottedHeads(params: TableQueryParams): string[] {
   filterKeys(params.filter ?? {});
   for (const k of normalizeGroupBy(params.groupBy)) take(k);
   for (const spec of Object.values(params.aggregate ?? {})) {
-    if (isPlainObject(spec)) for (const f of Object.values(spec)) if (typeof f === "string") take(f);
+    if (isPlainObject(spec)) for (const f of specFields(spec)) take(f);
   }
+  const bucket = params.timeBucket;
+  if (isPlainObject(bucket) && typeof bucket.field === "string") take(bucket.field);
   for (const k of sortKeys(params.sort)) take(k);
   return [...heads];
 }
@@ -1364,7 +1593,7 @@ async function detectArrayPaths(collection: Collection, registry: StorageRegistr
  * with the same array detection a query does: transform's set_field.filter.
  */
 export async function tableFilterWhere(collection: Collection, filter: Record<string, unknown>): Promise<SQL> {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const heads = dottedHeads({ filter });
   const arrayPaths = await detectArrayPaths(collection, registry, heads);
   return compileFilterWhere(collection, filter, { arrayPaths });
@@ -1391,11 +1620,13 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
   let exists = sortPathCache.get(key);
   if (exists === undefined) {
     const table = ident(collectionTableName(collection.id));
-    const r = await db.execute(sql`
-      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
-             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-    const row = r.rows[0] as { found: boolean; empty: boolean };
-    exists = row.found || row.empty;
+    exists = await probeExists(collection, field, "sort field", async () => {
+      const r = await db.execute(sql`
+        SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
+               (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+      const row = r.rows[0] as { found: boolean; empty: boolean };
+      return row.found || row.empty;
+    });
     sortPathCache.set(key, exists);
   }
   if (!exists) {
@@ -1426,13 +1657,47 @@ async function pathExists(collection: Collection, registry: StorageRegistry, fie
   const test = asArray
     ? sql`jsonb_typeof(data #> ${pathArray(segments)}) = 'array'`
     : sql`(data @? ${`lax $${segments.map(jsonpathKey).join("")}`}::jsonpath OR data ? ${field}::text)`;
-  const r = await db.execute(sql`
-    SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
-           (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-  const row = r.rows[0] as { found: boolean; empty: boolean };
-  const exists = row.found || row.empty;
+  const exists = await probeExists(collection, field, asArray ? "array path" : "field", async () => {
+    const r = await db.execute(sql`
+      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
+             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+    const row = r.rows[0] as { found: boolean; empty: boolean };
+    return row.found || row.empty;
+  });
   fieldPathCache.set(key, exists);
   return exists;
+}
+
+/** Top-level field names in the collection's saved schema (inferred from a sample of records). */
+function schemaFieldNames(collection: Collection): string[] {
+  const fields = (collection.schema as { fields?: { name?: unknown }[] } | null | undefined)?.fields;
+  return Array.isArray(fields) ? fields.map((f) => f?.name).filter((n): n is string => typeof n === "string") : [];
+}
+
+/**
+ * Run an existence probe for a field the request names. The probe scans
+ * until it finds a record with the field, so for a name no record has (a
+ * typo) it reads the whole table and can hit the statement timeout; that
+ * is reported as the validation problem it most likely is, not as a
+ * database failure. A top-level field in the saved schema is known to
+ * exist, so its probe timing out is not held against it.
+ */
+async function probeExists(collection: Collection, field: string, what: string, probe: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await probe();
+  } catch (err) {
+    if (!isStatementTimeout(err)) throw err;
+    const known = schemaFieldNames(collection);
+    if (!field.includes(".") && known.includes(field)) return true;
+    const head = field.split(".")[0];
+    const listed = known.length > 0
+      ? ` Known top-level fields: ${known.slice(0, 25).join(", ")}${known.length > 25 ? `, … (${known.length - 25} more)` : ""}.`
+      : "";
+    const why = field.includes(".") && known.includes(head)
+      ? `no record with the path '${field}' was found before checking every record timed out (${formatTimeout()})`
+      : `'${field}' is not in this collection's saved schema, and checking every record for it timed out (${formatTimeout()})`;
+    throw new Error(`Unknown ${what} '${field}': ${why}.${listed} Check the name with hutch_describe_collection or hutch_get_collection.`);
+  }
 }
 
 /**
@@ -1477,7 +1742,7 @@ function shapeRecord<R extends { data: unknown }>(record: R, fields: string[] | 
 }
 
 export async function queryTable(collection: Collection, params: TableQueryParams): Promise<TableRecordsResult | TableAggregateResult> {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const arrayPaths = await detectArrayPaths(collection, registry, dottedHeads(params));
   const scalarArrayKeys = await detectScalarArrayKeys(collection, registry, arrayPaths, params);
   const compiled = compileQuery(collection, params, { arrayPaths, scalarArrayKeys });
@@ -1496,7 +1761,7 @@ export async function queryTable(collection: Collection, params: TableQueryParam
       : compiled.offset > 0 ? ((await db.execute(compiled.countQuery)).rows[0] as { count: number }).count
       : 0;
     const hidden = new Set(["__total", ...compiled.typeChecks.map((c) => c.column)]);
-    const warnings = typeCheckWarnings(compiled.typeChecks, raw);
+    const warnings = [...typeCheckWarnings(compiled.typeChecks, raw), ...(await unresolvedKeyWarnings(collection, params, raw, total, compiled.offset))];
     let results = compiled.limit === 0 ? [] : raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
     if (compiled.nested && params.record !== false && results.length > 0) {
       const ids = [...new Set(results.map((r) => Number(r.parent_id)))];
@@ -1562,6 +1827,50 @@ export async function queryTable(collection: Collection, params: TableQueryParam
     next_offset: hasMore ? offset + rows.length : null,
     ...report,
   };
+}
+
+/**
+ * A group_by key (or time_bucket field) that is null in every group is
+ * almost always a path that never resolves: a typo, or a path through a map
+ * (an object keyed by id, such as members.u123) that dotted paths cannot
+ * cross. Warn, naming the path, when every group is in view (first page,
+ * all groups returned); never an error.
+ */
+async function unresolvedKeyWarnings(collection: Collection, params: TableQueryParams, raw: Record<string, unknown>[], total: number, offset: number): Promise<string[]> {
+  if (raw.length === 0 || offset > 0 || raw.length < total) return [];
+  const out: string[] = [];
+  for (const key of normalizeGroupBy(params.groupBy)) {
+    if (!raw.every((r) => r[key] == null)) continue;
+    const hint = await objectPrefixHint(collection, key);
+    out.push(`group_by '${key}' is null in every group: no matching record has a value at that path.${hint} Check the field paths with hutch_describe_collection.`);
+  }
+  const bucket = parseTimeBucket(params.timeBucket);
+  if (bucket?.field && raw.every((r) => r.time_bucket == null)) {
+    out.push(`time_bucket field '${bucket.field}' held no ISO date or datetime string (YYYY-MM-DD, optionally with a time and zone) in any matching record, so every row is in the null bucket. Check the field with hutch_describe_collection.`);
+  }
+  return out;
+}
+
+/** For a dotted key that never resolves: the longest prefix that holds objects in some live record, explained as a possible map. */
+async function objectPrefixHint(collection: Collection, key: string): Promise<string> {
+  const segments = key.split(".");
+  if (segments.length < 2 || !PATH_RE.test(key)) return "";
+  const table = ident(collectionTableName(collection.id));
+  for (let i = segments.length - 1; i >= 1; i--) {
+    const prefix = segments.slice(0, i);
+    const cacheKey = `${collection.id}:object:${prefix.join(".")}`;
+    let isObject = fieldPathCache.get(cacheKey);
+    if (isObject === undefined) {
+      const r = await db.execute(sql`SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND jsonb_typeof(data #> ${pathArray(prefix)}) = 'object' LIMIT 1`);
+      isObject = r.rows.length > 0;
+      fieldPathCache.set(cacheKey, isObject);
+    }
+    if (isObject) {
+      const p = prefix.join(".");
+      return ` '${p}' holds objects with no '${segments.slice(i).join(".")}' key: if it is a map keyed by id (its keys are data, not field names), a dotted path cannot reach inside its entries. Count its keys with {"${p}": {"$size": {"$gt": 0}}} in a filter or {"avg": {"$size": "${p}"}} in an aggregate.`;
+    }
+  }
+  return "";
 }
 
 /**

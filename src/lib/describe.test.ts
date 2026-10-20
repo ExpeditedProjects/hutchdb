@@ -2,7 +2,16 @@ import { describe, it, expect, vi } from 'vitest'
 
 vi.mock('./db', () => ({ db: {} }))
 
-import { truncateSample, MAX_SAMPLE_STRING } from './describe'
+const { sampleMock } = vi.hoisted(() => ({ sampleMock: vi.fn() }))
+vi.mock('./storage/rows', () => ({
+  sampleDocuments: sampleMock,
+  exactDistinctCounts: vi.fn().mockResolvedValue({}),
+  estimatedDistinctCounts: vi.fn().mockResolvedValue({}),
+  tableBytes: vi.fn().mockResolvedValue(0),
+  fullScanMaxBytes: () => 100,
+}))
+
+import { describeFields, truncateSample, MAX_SAMPLE_STRING } from './describe'
 
 describe('truncateSample', () => {
   it('cuts long strings to MAX_SAMPLE_STRING characters with an ellipsis', () => {
@@ -23,5 +32,15 @@ describe('truncateSample', () => {
     expect((first.body as string).length).toBe(MAX_SAMPLE_STRING + 1)
     expect(first.author).toEqual({ name: 'A', id: 0, rep: 1, '…': '1 more keys' })
     expect(JSON.stringify(sample).length).toBeLessThan(2000)
+  })
+})
+
+describe('describeFields frequency', () => {
+  it('divides by the records actually sampled, not the sample size asked for', async () => {
+    // A BERNOULLI sample of a 10k-record table can come back smaller than the 500 asked for.
+    sampleMock.mockResolvedValue([{ a: 1, b: 1 }, { a: 2 }, { a: 3, b: 3 }, { a: 4 }])
+    const { fields } = await describeFields(1, 10_000, null)
+    expect(sampleMock).toHaveBeenCalledWith(1, 500, true, 10_000)
+    expect(fields.map((f) => [f.name, f.frequency])).toEqual([['a', 1], ['b', 0.5]])
   })
 })

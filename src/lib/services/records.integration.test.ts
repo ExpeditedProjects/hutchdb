@@ -133,6 +133,50 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     return ok(await recordsSvc.queryRecords(slug, USER_ID, params));
   }
 
+  describe("values a query cut short are never written back", () => {
+    const long = "word ".repeat(1000); // 5000 chars, over the 2000 default
+    const reject = /^Nothing was written: field 'notes.*' .*contains a "\[truncated: N more chars …\]" marker.*Re-read the record with max_string_length: 0/;
+
+    async function readCut(slug: string) {
+      const page = ok(await recordsSvc.queryRecords(slug, USER_ID, {}, { maxStringLength: 2000 })) as { records: { id: number; data: Record<string, unknown> }[]; truncated_strings?: number };
+      expect(page.truncated_strings).toBe(1);
+      return page.records[0];
+    }
+
+    it("hutch_update_record with a truncated value read back is rejected and the record is unchanged", async () => {
+      const slug = await seed("cut_update", [{ title: "t", notes: { body: long } }]);
+      const record = await readCut(slug);
+      const edited = { ...record.data, title: "changed" };
+      const result = await recordsSvc.updateRecord(slug, USER_ID, record.id, edited);
+      expect(result).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect((result as { error: string }).error).toContain("field 'notes.body'");
+      expect(await rawData(slug)).toEqual([{ title: "t", notes: { body: long } }]);
+    });
+
+    it("hutch_store_records with on_conflict replace and a truncated value is rejected and the record is unchanged; so are import and transform", async () => {
+      const slug = await seed("cut_store", [{ key: "a", notes: long }]);
+      ok(await (await import("@/lib/services/collections")).updateCollection(slug, USER_ID, { unique_key: ["key"] }));
+      const record = await readCut(slug);
+      const stored = await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: slug, records: [{ key: "b", notes: "fine" }, record.data], on_conflict: "replace" });
+      expect(stored).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect((stored as { error: string }).error).toContain("(record 2 of 2)");
+      const imported = await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: slug, format: "json", content: JSON.stringify([record.data]), on_conflict: "replace" });
+      expect(imported).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      const transformed = await recordsSvc.transformRecords(slug, USER_ID, { set_field: { field: "notes", value: record.data.notes } });
+      expect(transformed).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect(await rawData(slug)).toEqual([{ key: "a", notes: long }]);
+    });
+
+    it("a value that merely talks about truncation is stored", async () => {
+      const prose = { key: "p", notes: "The log was truncated: 40 more chars were lost [truncated] — see the full values elsewhere." };
+      const slug = await seed("cut_prose", [prose]);
+      expect(await rawData(slug)).toEqual([prose]);
+      const id = (ok(await recordsSvc.queryRecords(slug, USER_ID, {})) as { records: { id: number }[] }).records[0].id;
+      ok(await recordsSvc.updateRecord(slug, USER_ID, id, { ...prose, extra: true }));
+      expect(await rawData(slug)).toEqual([{ ...prose, extra: true }]);
+    });
+  });
+
   // ── a. transformRecords ───────────────────────────────────────────────────
 
   describe("transformRecords", () => {

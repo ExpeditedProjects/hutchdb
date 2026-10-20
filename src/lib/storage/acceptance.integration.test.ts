@@ -206,7 +206,21 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
 
   async function store(collection: string, recs: Record<string, unknown>[]): Promise<string> {
     const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, return: "summary" }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    await settle();
     return (result as { collection: { slug: string } }).collection.slug;
+  }
+
+  /** What the MCP route runs after a response: build every queued index and unwind. */
+  async function settle() {
+    const { buildPendingIndexes } = await import("./builder");
+    const report = await buildPendingIndexes();
+    // Every build must succeed, or a "projected vs plain" comparison could have both sides reading documents.
+    expect(report.failed, JSON.stringify(report)).toBe(0);
+    expect(report.collections.filter((c) => c.skipped)).toEqual([]);
+    const { buildEntries, readRegistry } = await import("./registry");
+    const rows = (await testDb.execute(sql`SELECT id, storage FROM collections`)).rows as { id: number; storage: unknown }[];
+    expect(rows.flatMap((r) => buildEntries(readRegistry(r.storage)).filter((e) => e.build && e.build.state !== "ready").map((e) => `${r.id} ${e.kind} ${e.key}: ${e.build!.state}`))).toEqual([]);
   }
 
   async function collectionRow(slug: string) {
@@ -540,7 +554,8 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       const id = (await collectionRow(slug)).id;
       const column = (await registry(slug)).projections.find((p) => p.field === "owner_user_id")!.column;
       const def = await testDb.execute(sql`SELECT indexdef FROM pg_indexes WHERE indexname = ${`hc_${id}_${column}_idx`}`);
-      expect((def.rows[0] as { indexdef: string }).indexdef).toMatch(/\(p_owner_user_id, created_at DESC, id DESC\)$/);
+      // An expression index over the guarded cast of owner_user_id (no column), then the default order.
+      expect((def.rows[0] as { indexdef: string }).indexdef).toMatch(/hc_safe_float8\(\(data -> 'owner_user_id'::text\)\)[\s\S]*END\), created_at DESC, id DESC\)$/);
 
       const matching = docs.filter((d) => d.owner_user_id === 4);
       const r = await query(slug, { filter: { owner_user_id: 4 }, fields: ["question_id"], limit: 1 });
@@ -578,7 +593,7 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
     it("lists every index that can serve a query, including the GIN on the documents, and each exists", async () => {
       const docs = makeQuestions(300);
       const slug = await store("questions", docs);
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; on: string; serves: string }[] } };
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; field: string; kind: string; serves?: string }[] } };
       const names = described.storage.indexes.map((i) => i.index);
       const id = (await collectionRow(slug)).id;
       expect(names[0]).toBe(`hc_${id}_data_gin_idx`);
@@ -607,13 +622,14 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
   // ── 8. the store response says when a batch built indexes ─────────────────
 
   describe("store response storage note", () => {
-    it("says which fields became queryable and which arrays were unwound, only on the batch that did it", async () => {
+    it("says which fields and arrays were queued for indexing, only on the batch that did it", async () => {
       thresholds(200);
       const docs = makeQuestions(150);
       const first = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(0, 50), return: "summary" })) as Record<string, unknown>;
       expect(first.storage_note).toBeUndefined();
       const second = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(50), return: "summary" })) as Record<string, unknown>;
-      expect(second.storage_note).toMatch(/^This batch made fields .*'owner_user_id'.* queryable as indexed columns and unwound 'answers' into a queryable table .* took \d+ ms of this write/);
+      // The write only queues the builds; they run in the background after the response.
+      expect(second.storage_note).toMatch(/^This batch queued indexes on fields .*'owner_user_id'.*, unwinding 'answers' into a queryable table .*\. Indexes are built in the background shortly after this write/);
       expect(second.summary).toContain(second.storage_note as string);
       expect(first.use).toBe(`Pass slug "${(first.collection as { slug: string }).slug}" to other tools for this collection; its name "Questions" works too.`);
       const third = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: makeQuestions(3), return: "summary" })) as Record<string, unknown>;
@@ -621,7 +637,7 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       // Import passes it through too.
       thresholds(100);
       const imported = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "fresh", format: "json", content: JSON.stringify(makeQuestions(120)) })) as Record<string, unknown>;
-      expect(imported.storage_note).toMatch(/This batch made fields/);
+      expect(imported.storage_note).toMatch(/This batch queued indexes on fields/);
     });
   });
 

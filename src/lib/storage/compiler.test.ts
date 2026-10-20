@@ -745,3 +745,79 @@ describe('indexed reason wording', () => {
     expect(report.reason).not.toMatch(/sort on/)
   })
 })
+
+describe('compileQuery: $size, expressions and time_bucket on a data field', () => {
+  it('compiles $size to a bound comparison on element/key count, and never routes it to a column', () => {
+    const { sql, params } = compile({ filter: { price: { $size: { $gt: 3 } }, tags: { $size: 2 } } })
+    expect(sql).toContain("jsonb_array_length")
+    expect(sql).toContain("jsonb_object_keys")
+    expect(sql).not.toContain('t."p_price" >')
+    expect(params).toEqual(expect.arrayContaining([3, 2]))
+    expect(() => compile({ filter: { 'votes.label': { $size: 1 } } })).toThrow(/array of objects/)
+    expect(() => compile({ filter: { tags: { $size: { $gt: '1' } } } })).toThrow(/\$size \$gt takes a number/)
+  })
+
+  it('runs an expression over unwound number columns on the child table, and binds every path and literal', () => {
+    const { sql, params } = compile({ groupBy: 'votes.label', aggregate: { r: { sum: { $multiply: ['votes.points', 'votes.category_id', 2] } } } })
+    expect(sql).toContain('FROM "hc_12__votes" c JOIN "hc_12" t ON t.id = c.parent_id')
+    expect(sql).toContain('to_jsonb(sum(((c."p_points"::text::numeric) * (c."p_category_id"::text::numeric) * $')
+    expect(params).toContain(2)
+    expect(sql).not.toContain('votes.points')
+  })
+
+  it('unnests the array for an operand no number column holds ($size, a text column, a deeper path)', () => {
+    for (const expr of [{ $size: 'votes.tags' }, { $add: ['votes.label', 1] }, { $add: ['votes.points.veterans', 1] }]) {
+      const { sql } = compile({ aggregate: { x: { max: expr } }, groupBy: 'votes.category_id' })
+      expect(sql, JSON.stringify(expr)).toContain('jsonb_array_elements')
+      expect(sql).not.toContain('"hc_12__votes" c JOIN')
+    }
+  })
+
+  it('divides through NULLIF so a zero divisor is null, not an error', () => {
+    expect(compile({ aggregate: { x: { avg: { $divide: ['price', 'price'] } } } }).sql).toContain('NULLIF(')
+  })
+
+  it('buckets a data field in UTC with a validity guard, from an unmixed projection column', () => {
+    const { sql, params } = compile({ timeBucket: { field: 'day', unit: 'month' }, aggregate: { n: 'count' } })
+    expect(sql).toContain("pg_input_is_valid(")
+    expect(sql).toContain("AT TIME ZONE 'UTC'")
+    expect(sql).toContain("date_trunc('month'")
+    expect(sql).toContain('to_jsonb(t."p_day")')
+    expect(sql).not.toContain('t.created_at)')
+    expect(params.some((p) => typeof p === 'string' && p.startsWith('^\\d{4}'))).toBe(true)
+  })
+
+  it('keeps the string form on created_at and rejects a malformed object form', () => {
+    expect(compile({ timeBucket: 'week', aggregate: { n: 'count' } }).sql).toContain("date_trunc('week', t.created_at) AS time_bucket")
+    expect(() => compile({ timeBucket: { field: 'day', unit: 'decade' }, aggregate: { n: 'count' } })).toThrow(/Invalid time_bucket unit 'decade'/)
+    expect(() => compile({ timeBucket: { field: 'a b', unit: 'day' }, aggregate: { n: 'count' } })).toThrow(/Invalid field name/)
+  })
+})
+
+describe('compileQuery: result column names never collide', () => {
+  it('rejects an aggregate alias that is also a group_by key', () => {
+    expect(() => compileQuery(collection, { groupBy: 'plan', aggregate: { plan: 'count' } })).toThrow(/'plan' is both a group_by key and an aggregate alias/)
+  })
+
+  it('rejects grouping by a field named count without an aggregate (the default count column)', () => {
+    expect(() => compileQuery(collection, { groupBy: 'count' })).toThrow(/group_by key 'count' collides with the default count column.*aggregate/)
+    expect(() => compileQuery(collection, { groupBy: 'count', aggregate: { n: 'count' } })).not.toThrow()
+  })
+
+  it('rejects names the response adds to each row: time_bucket, parent_id and record', () => {
+    expect(() => compileQuery(collection, { groupBy: 'time_bucket', timeBucket: 'day' })).toThrow(/'time_bucket'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: 'status', aggregate: { time_bucket: 'count' }, timeBucket: 'day' })).toThrow(/'time_bucket'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: 'items.sku', aggregate: { record: 'count' }, perRecord: true }, { arrayPaths: ['items'] })).toThrow(/'record'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: ['parent_id', 'items.sku'], perRecord: true }, { arrayPaths: ['items'] })).toThrow(/'parent_id'.*reserved/)
+    // Without per_record / time_bucket those names are ordinary fields.
+    expect(() => compileQuery(collection, { groupBy: 'record', aggregate: { parent_id: 'count' } })).not.toThrow()
+  })
+
+  it('rejects aliases starting with __ (internal columns)', () => {
+    expect(() => compileQuery(collection, { groupBy: 'status', aggregate: { __total: 'count' } })).toThrow(/'__total'.*reserved/)
+  })
+
+  it('allows group keys named like response fields (plan, total, indexed): they live inside each results object', () => {
+    expect(() => compileQuery(collection, { groupBy: ['plan', 'total', 'indexed'], aggregate: { n: 'count' } })).not.toThrow()
+  })
+})

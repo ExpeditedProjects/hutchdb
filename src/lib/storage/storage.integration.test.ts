@@ -96,7 +96,22 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
   });
 
   async function store(collection: string, recs: Record<string, unknown>[], on_conflict?: string) {
-    return ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, on_conflict }));
+    const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, on_conflict }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    await settle();
+    return result;
+  }
+
+  /** What the MCP route runs after a response: build every queued index and unwind. */
+  async function settle() {
+    const { buildPendingIndexes } = await import("./builder");
+    const report = await buildPendingIndexes();
+    // Every build must succeed, or a "projected vs plain" comparison could have both sides reading documents.
+    expect(report.failed, JSON.stringify(report)).toBe(0);
+    expect(report.collections.filter((c) => c.skipped)).toEqual([]);
+    const { buildEntries, readRegistry } = await import("./registry");
+    const rows = (await testDb.execute(sql`SELECT id, storage FROM collections`)).rows as { id: number; storage: unknown }[];
+    expect(rows.flatMap((r) => buildEntries(readRegistry(r.storage)).filter((e) => e.build && e.build.state !== "ready").map((e) => `${r.id} ${e.kind} ${e.key}: ${e.build!.state}`))).toEqual([]);
   }
 
   async function collectionRow(slug: string) {
@@ -354,8 +369,8 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
 
     it("describe reports storage and deleting the collection drops its tables", async () => {
       const described = (await collectionsSvc.describeCollection(slug, USER_ID)) as Record<string, unknown>;
-      const storage = described.storage as { projections: { field: string }[]; unwinds: { path: string; rows: number; reason: string }[] };
-      expect(storage.projections.map((p) => p.field)).toEqual(["id", "name", "score"]);
+      const storage = described.storage as { indexes: { index: string; field: string; kind: string }[]; unwinds: { path: string; rows: number }[] };
+      expect(storage.indexes.filter((i) => i.index.includes("_p_") && !i.kind.includes("unwound")).map((i) => i.field)).toEqual(["id", "name", "score"]);
       expect(storage.unwinds[0]).toMatchObject({ path: "votes", rows: 180 });
 
       ok(await collectionsSvc.deleteCollection(slug, USER_ID));

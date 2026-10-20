@@ -13,7 +13,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "smoke": "npx tsx scripts/smoke.ts",
-    "storage:cutover": "npx tsx scripts/storage-cutover.ts"
+    "storage:cutover": "npx tsx scripts/storage-cutover.ts",
+    "storage:build-indexes": "npx tsx scripts/storage-build-indexes.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",

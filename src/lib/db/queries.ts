@@ -260,8 +260,10 @@ export type QueryParams = {
   arrayLimit?: Record<string, number>;
   /** One field, or up to MAX_GROUP_BY_KEYS fields; each may be a dotted object path. */
   groupBy?: string | string[];
-  aggregate?: Record<string, string | Record<string, string>>;
-  timeBucket?: string;
+  /** alias -> "count" or {op: operand}; an operand is a field path or, for sum/avg/min/max, an expression ({"$multiply": ["items.qty", "items.price"]}, {"$size": "members"}). */
+  aggregate?: Record<string, string | Record<string, unknown>>;
+  /** A unit ("day") to bucket by insert time (created_at), or {field, unit} to bucket by a data field holding ISO date/datetime strings (UTC). */
+  timeBucket?: string | TimeBucketSpec;
   /** Aggregates over a nested array only: false omits the embedded parent `record`. */
   record?: boolean;
   createdAfter?: string;
@@ -272,9 +274,17 @@ export type QueryParams = {
   limitCap?: number;
 };
 
+export type TimeBucketSpec = { field: string; unit: string };
+
 export const MAX_GROUP_BY_KEYS = 5;
 
-export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
+export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains", "$size"] as const;
+
+/** Comparison operators inside {"$size": {...}}: {"members": {"$size": {"$gt": 30}}}. */
+export const SIZE_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne"] as const;
+
+/** Arithmetic operators in aggregate expressions: {"sum": {"$multiply": ["items.qty", "items.price"]}}. */
+export const ARITHMETIC_OPERATORS = ["$multiply", "$add", "$subtract", "$divide"] as const;
 
 /**
  * An operator spec is an object value whose keys ALL start with `$`
@@ -316,7 +326,8 @@ function escapeFieldPath(field: string): string {
   return field;
 }
 
+export const TIME_BUCKET_UNITS = ["second", "minute", "hour", "day", "week", "month", "quarter", "year"] as const;
+
 export function escapeBucket(bucket: string): string {
-  const allowed = ["second", "minute", "hour", "day", "week", "month", "quarter", "year"];
-  return allowed.includes(bucket) ? bucket : "day";
+  return (TIME_BUCKET_UNITS as readonly string[]).includes(bucket) ? bucket : "day";
 }

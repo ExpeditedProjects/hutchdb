@@ -1,9 +1,10 @@
 import { db } from "@/lib/db";
 import { sql } from "drizzle-orm";
 import { applyInference, updateRegistry } from "./apply";
+import { buildPendingIndexes, type BuildReport } from "./builder";
 import { childTableCounts } from "./rows";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "./ddl";
-import { collectionTableName, ident, projectionKey, readRegistry, type CutoverMark, type StorageRegistry } from "./registry";
+import { collectionTableName, ident, isReady, projectionKey, readRegistry, type CutoverMark, type StorageRegistry } from "./registry";
 
 /**
  * One-shot move of an existing database from the old shared `records` table
@@ -18,9 +19,12 @@ import { collectionTableName, ident, projectionKey, readRegistry, type CutoverMa
  *    finished collection is marked in its storage registry (`cutover`), so a
  *    re-run skips it.
  * 2. Inference, per collection: ANALYZE, then the inference rules over all of
- *    its live documents as one batch; what it created is reported. A
- *    collection whose inference failed is not stamped, so a re-run retries
- *    it.
+ *    its live documents as one batch, which queues projections and unwinds
+ *    (pending, like any write). A collection whose inference failed is not
+ *    stamped, so a re-run retries it. Then the builder (builder.ts) builds
+ *    everything queued — in this run or left failed or pending by an
+ *    earlier one — before the cutover returns; a failed build is reported
+ *    and retried by a re-run or `npm run storage:build-indexes`.
  * 3. Only with dropRecords, and only once every collection is marked and
  *    its rows in `records` still match the mark (count, and a content md5
  *    over id, data, status and deleted_at): DROP TABLE records.
@@ -61,12 +65,18 @@ export type InferenceResult = {
   error?: string;
 };
 
+export type BuildResult = { slug: string; kind: string; key: string; state: "ready" | "failed"; ms: number; error?: string };
+
 export type CutoverReport = {
   dryRun: boolean;
   recordsTable: "present" | "absent";
   copied: CopyResult[];
   copy_ms: number;
   inference: InferenceResult[];
+  /** Background builds the cutover ran after inference (every collection with due work). */
+  builds: BuildResult[];
+  /** Collections whose builds were skipped because another builder held them: still pending; the script exits 1. */
+  skipped_builds: string[];
   dropped: boolean;
 };
 
@@ -221,7 +231,7 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
   let error: string | undefined;
   if (docs.length > 0) {
     try {
-      after = await applyInference({ id, storage: before }, docs, undefined, { retryFailed: true });
+      after = await applyInference({ id, storage: before }, docs);
     } catch (err) {
       console.error(`[storage] cutover inference failed for collection ${id}`, err);
       error = err instanceof Error ? err.message : String(err);
@@ -232,7 +242,6 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
   const known = new Set(before.projections.map(projectionKey));
   const projections = after.projections.filter((p) => !known.has(projectionKey(p)));
   const unwinds = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path));
-  const counts = await childTableCounts(unwinds.map((u) => u.table));
 
   if (!error) {
     // Under the registry row lock: inference rewrote the registry, keep its
@@ -250,14 +259,15 @@ async function inferCollection(id: number, slug: string, docLimit: number, log: 
     analyze_ms,
     inference_ms,
     projections: projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
-    unwinds: unwinds.map((u) => ({ path: u.path, fields: u.fields.map((f) => f.field), rows: counts[u.table] ?? 0, reason: u.reason })),
+    // rows: filled in once the builder has created and backfilled the child table (runCutover).
+    unwinds: unwinds.map((u) => ({ path: u.path, fields: u.fields.map((f) => f.field), rows: 0, reason: u.reason })),
     ...(error ? { error } : {}),
   };
   const created = [
     ...result.projections.map((p) => `projection ${p.field} (${p.type})`),
-    ...result.unwinds.map((u) => `unwind ${u.path} -> ${u.rows} child rows`),
+    ...result.unwinds.map((u) => `unwind ${u.path}`),
   ];
-  log(`  inferred ${slug} (#${id}) over ${docs.length} docs in ${analyze_ms + inference_ms} ms: ${created.length ? created.join(", ") : "nothing created"}${error ? `; FAILED: ${error} (not marked inferred; a re-run retries it)` : ""}`);
+  log(`  inferred ${slug} (#${id}) over ${docs.length} docs in ${analyze_ms + inference_ms} ms: ${created.length ? `queued ${created.join(", ")}` : "nothing to build"}${error ? `; FAILED: ${error} (not marked inferred; a re-run retries it)` : ""}`);
   return result;
 }
 
@@ -297,10 +307,15 @@ async function dropRecordsTable(log: (line: string) => void): Promise<boolean> {
   return true;
 }
 
+function describeBuilds(report: BuildReport, targets: CollectionRow[]): BuildResult[] {
+  const slugs = new Map(targets.map((c) => [c.id, c.slug]));
+  return report.collections.flatMap((c) => c.outcomes.map((o) => ({ slug: slugs.get(c.collectionId) ?? String(c.collectionId), ...o })));
+}
+
 export async function runCutover(options: CutoverOptions = {}): Promise<CutoverReport> {
   const log = options.log ?? (() => {});
   const dryRun = options.dryRun === true;
-  const report: CutoverReport = { dryRun, recordsTable: "present", copied: [], copy_ms: 0, inference: [], dropped: false };
+  const report: CutoverReport = { dryRun, recordsTable: "present", copied: [], copy_ms: 0, inference: [], builds: [], skipped_builds: [], dropped: false };
 
   if (!(await recordsTableExists())) {
     report.recordsTable = "absent";
@@ -334,6 +349,25 @@ export async function runCutover(options: CutoverOptions = {}): Promise<CutoverR
   for (const c of targets) {
     const result = await inferCollection(c.id, c.slug, docLimit, log);
     if (result) report.inference.push(result);
+  }
+
+  // Build what inference queued (and anything an earlier run left pending
+  // or failed) before returning, so the script exits with every index
+  // ready or a failure reported.
+  log("building queued indexes and unwinds");
+  const built = await buildPendingIndexes({ retryFailed: true, log });
+  report.builds = describeBuilds(built, targets);
+  const slugs = new Map(targets.map((c) => [c.id, c.slug]));
+  report.skipped_builds = built.collections.filter((c) => c.skipped).map((c) => slugs.get(c.collectionId) ?? String(c.collectionId));
+  if (report.skipped_builds.length > 0) {
+    log(`builds skipped (another builder holds them, so they are still pending): ${report.skipped_builds.join(", ")}; run \`npm run storage:build-indexes\` once it is done`);
+  }
+  for (const r of report.inference) {
+    if (r.unwinds.length === 0) continue;
+    const registry = readRegistry((await db.execute(sql`SELECT storage FROM collections WHERE id = ${r.id}`)).rows[0]?.storage);
+    const ready = registry.unwinds.filter((u) => r.unwinds.some((x) => x.path === u.path) && isReady(u));
+    const counts = await childTableCounts(r.id, ready.map((u) => u.table));
+    r.unwinds = r.unwinds.map((u) => ({ ...u, rows: counts[ready.find((x) => x.path === u.path)?.table ?? ""] ?? 0 }));
   }
 
   if (options.dropRecords) report.dropped = await dropRecordsTable(log);

@@ -51,10 +51,13 @@ vi.mock('@/lib/storage/rows', async (importOriginal) => ({
   countRecords: vi.fn().mockResolvedValue(7),
   lastRecordAt: vi.fn().mockResolvedValue(new Date('2026-01-01T00:00:00.000Z')),
   childTableCounts: vi.fn().mockResolvedValue({}),
+  tableBytes: vi.fn().mockResolvedValue(0),
 }))
 
 vi.mock('@/lib/storage/ddl', () => ({
   dropCollectionTable: vi.fn().mockResolvedValue(undefined),
+  setRequestDdlLockTimeout: vi.fn().mockResolvedValue(undefined),
+  INDEX_BUILD_BUSY_MESSAGE: 'busy',
 }))
 
 vi.mock('@/lib/db/queries', () => ({
@@ -63,7 +66,8 @@ vi.mock('@/lib/db/queries', () => ({
 }))
 
 vi.mock('@/lib/describe', () => ({
-  describeCollection: vi.fn().mockResolvedValue([]),
+  DESCRIBE_FIELDS_PAGE: 60,
+  describeFields: vi.fn().mockResolvedValue({ fields: [], total: 0, matched: 0, offset: 0 }),
 }))
 
 // Name resolution has its own tests (resolve.test.ts and the integration
@@ -109,6 +113,7 @@ import { sortCollections } from '@/lib/collections/sort'
 import { findAccessibleCollectionBySlug, createCollectionWithOwner } from '@/lib/db/queries'
 import { seedAutoViews } from './views'
 import { dropCollectionTable } from '@/lib/storage/ddl'
+import * as tableRows from '@/lib/storage/rows'
 
 const baseCollection = {
   id: 1,
@@ -291,7 +296,7 @@ describe('describeCollection', () => {
       name: 'Bookmarks',
       slug: 'bookmarks',
       recordCount: 7,
-      storage: { evaluated_rows: 0, projections: [], unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
+      storage: { unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
     }))
   })
 })
@@ -627,6 +632,22 @@ describe('getCollectionStats', () => {
         { name: 'notes', count: 1, percent: 25 },
       ],
     })
+  })
+
+  it('reports an empty sample (sampledRows 0) as sampled, with no fields and no division by zero', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'viewer' })
+    vi.mocked(tableRows.tableBytes).mockResolvedValueOnce(10 * 1024 * 1024 * 1024)
+    dbExecute
+      .mockResolvedValueOnce({ rows: [{ record_count: 6000, first_created_at: null, last_created_at: null, first_updated_at: null, last_updated_at: null, approx_storage_bytes: '0' }] })
+      .mockResolvedValueOnce({ rows: [{ status: 'active', count: 6000 }] })
+      // The sampled fill-rate query: its RIGHT JOIN returns one row with no key when the sample is empty.
+      .mockResolvedValueOnce({ rows: [{ key: null, count: null, sampled: 0 }] })
+
+    const result = await getCollectionStats('bookmarks', 'user-test')
+
+    expect(result).toMatchObject({ record_count: 6000, fields: [], fields_sampled: { rows: 0, of: 6000 } })
+    expect((result as { fields_note: string }).fields_note).toMatch(/random sample of 0 of 6000 records/)
+    expect(JSON.stringify(result)).not.toMatch(/NaN|Infinity/)
   })
 
   it('handles an empty collection without dividing by zero', async () => {

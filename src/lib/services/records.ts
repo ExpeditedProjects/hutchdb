@@ -11,12 +11,15 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
-import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
-import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
-import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
+import { isReady, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
+import { collectionTableExists, createCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout, setUniqueKey } from "@/lib/storage/ddl";
+import { applyInference, markMixedProjections, recheckMixedProjections, searchIndexThresholdFromEnv, updateRegistry } from "@/lib/storage/apply";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
+import { limitQueryOutput, rejectTruncatedValues, truncateStrings, type OutputLimits } from "./output-limits";
+import { classifyDbError, describeDbError, findPgError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -77,6 +80,9 @@ export async function createRecords(userId: string, organizationId: string, para
   }
 
   const recordsToInsert = bulkRecords || [singleData!];
+
+  const truncated = rejectTruncatedValues(recordsToInsert, (i) => (bulkRecords ? ` (record ${i + 1} of ${bulkRecords.length})` : ""));
+  if (truncated) return truncated;
 
   // Validate size and capture total bytes for the quota hook.
   let totalBytes = 0;
@@ -142,15 +148,16 @@ export async function createRecords(userId: string, organizationId: string, para
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
 
-  // Storage inference (projections, unwinds) runs after every successful
-  // write. It must never fail the write.
+  // Storage inference (projections, unwinds, search index) runs after every
+  // successful write and only queues builds; they run in the background
+  // after the response (build-queue.ts). It must never fail the write.
   let storageNote: string | undefined;
   try {
     const before = readRegistry(collection.storage);
     await markMixedProjections(collection.id, storedDocs);
-    const started = Date.now();
     const after = await applyInference(collection, storedDocs);
-    storageNote = storageChangeNote(before, after, Date.now() - started);
+    storageNote = storageChangeNote(before, after);
+    queueDueIndexBuild({ id: collection.id, storage: after });
   } catch (err) {
     console.error(`[storage] inference failed for collection ${collection.id}`, err);
   }
@@ -203,18 +210,20 @@ export function slugNote(collection: { name: string; slug: string }): { use: str
 }
 
 /**
- * What this write's inference added — fields made queryable as indexed
- * columns, arrays unwound into child tables — and that building them is
- * why the write took longer. Undefined when it added nothing.
+ * What this write's inference queued — fields to index, arrays to unwind
+ * into child tables, the full-text search index — and that they are built
+ * in the background. Undefined when it queued nothing.
  */
-export function storageChangeNote(before: StorageRegistry, after: StorageRegistry, ms: number): string | undefined {
+export function storageChangeNote(before: StorageRegistry, after: StorageRegistry): string | undefined {
   const projected = after.projections.filter((p) => !before.projections.some((b) => b.column === p.column)).map((p) => p.field);
   const unwound = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path)).map((u) => u.path);
-  if (projected.length === 0 && unwound.length === 0) return undefined;
+  const search = after.search_index !== undefined && before.search_index === undefined;
+  if (projected.length === 0 && unwound.length === 0 && !search) return undefined;
   const parts: string[] = [];
-  if (projected.length > 0) parts.push(`made ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")} queryable as indexed ${projected.length === 1 ? "column" : "columns"}`);
-  if (unwound.length > 0) parts.push(`unwound ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can now use indexes)`);
-  return `This batch ${parts.join(" and ")}; building them over the existing records took ${ms} ms of this write, which is why it was slower than usual. This is one-time work.`;
+  if (projected.length > 0) parts.push(`indexes on ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")}`);
+  if (unwound.length > 0) parts.push(`unwinding ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (so filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can use indexes)`);
+  if (search) parts.push("a full-text index for search");
+  return `This batch queued ${parts.join(", ")}. Indexes are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until one is ready, queries return the same results without it.`;
 }
 
 type CollectionRow = typeof collections.$inferSelect;
@@ -263,14 +272,20 @@ async function ensureUniqueKeyIndex(collection: CollectionRow, uniqueKey: string
   try {
     await updateRegistry(collection.id, async (current, tx) => {
       if (JSON.stringify(current.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+      // A background build holds a lock on the table: fail fast instead of
+      // queueing every read and write of it behind the key change.
+      await setRequestDdlLockTimeout(tx);
       await setUniqueKey(tx, collection.id, uniqueKey);
       return { ...current, unique_key: uniqueKey };
     });
     return null;
   } catch (err) {
-    const pg = (err as { cause?: { code?: string } }).cause ?? (err as { code?: string });
-    if (pg && (pg as { code?: string }).code === "23505") {
+    const code = findPgError(err)?.code;
+    if (code === "23505") {
       return { error: `Existing records already contain duplicates of unique key [${uniqueKey.join(", ")}] — remove them before storing with on_conflict`, status: 409 };
+    }
+    if (code === "55P03") {
+      return { error: `Nothing was stored: the collection's unique key [${uniqueKey.join(", ")}] could not be applied because ${INDEX_BUILD_BUSY_MESSAGE}.`, status: 409 };
     }
     throw err;
   }
@@ -341,11 +356,18 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
+/**
+ * With `limits` (the MCP tool passes them), long strings are cut and an
+ * oversized page is cut short with has_more/next_offset continuing it;
+ * without, the result is returned whole.
+ */
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>, limits?: OutputLimits) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
-  return queryTable(access.collection, params);
+  queueDueIndexBuild(access.collection);
+  const result = await queryTable(access.collection, params);
+  return limits ? limitQueryOutput(result, limits) : result;
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -504,28 +526,67 @@ export async function importRecords(userId: string, organizationId: string, para
 }
 
 /**
+ * Time limits for hutch_search: each collection gets half the statement
+ * timeout, and none starts after the whole timeout has passed.
+ * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off, and then
+ * no collection gets a limit either.
+ */
+export function searchTimeLimits(now: number): { perCollectionMs: number | undefined; deadline: number } {
+  const budgetMs = statementTimeoutMs();
+  if (budgetMs === 0) return { perCollectionMs: undefined, deadline: Infinity };
+  return { perCollectionMs: Math.max(1, Math.floor(budgetMs / 2)), deadline: now + budgetMs };
+}
+
+/**
  * hutch_search: at most `limit` matches in total (max 50) across every
  * collection the user can read, the most relevant first (ts_rank), newest
  * first among equals. Each collection contributes at most `limit`
  * candidates, so the merged top `limit` is exact. Matches are grouped by
  * collection, groups in the order of their best match, and every record
  * keeps its collection's name and slug.
+ *
+ * One collection that cannot answer in time (a large one whose full-text
+ * index is missing or not built yet reads every document) must not fail
+ * the whole call: each collection's search runs under its own timeout of
+ * half the statement timeout, none starts after the statement timeout has
+ * elapsed since the call began, and the collections that timed out or
+ * were not reached are named in not_searched with incomplete: true, while
+ * the others' matches are returned.
  */
-export async function searchGlobal(userId: string, search: string, limit: number = 10) {
+export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
 
   const accessible = await db
-    .select({ id: collections.id, name: collections.name, slug: collections.slug })
+    .select({ id: collections.id, name: collections.name, slug: collections.slug, storage: collections.storage })
     .from(collections)
     .innerJoin(
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
+  for (const coll of accessible) queueDueIndexBuild(coll);
+  const { perCollectionMs, deadline } = searchTimeLimits(Date.now());
+  const limited = perCollectionMs === undefined ? new Set<number>() : await searchMayBeSlow(accessible);
+  const missed = new Map<number, string>();
   // Bounded concurrency; results are concatenated in collection order, as
   // the serial loop did, so the stable sort below ranks ties the same way.
-  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) =>
-    (await tableRows.searchRecords(coll.id, search, clampedLimit)).map((row) => ({ coll, row })));
+  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) => {
+    const remaining = deadline - Date.now();
+    if (remaining < SEARCH_MIN_SLICE_MS) {
+      missed.set(coll.id, "not searched: the time for this call ran out before its turn");
+      return [];
+    }
+    try {
+      // Only a collection that may read every document gets its own time
+      // limit (a transaction of its own); the rest run as one statement.
+      const timeoutMs = perCollectionMs !== undefined && limited.has(coll.id) ? Math.min(perCollectionMs, remaining) : undefined;
+      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs })).map((row) => ({ coll, row }));
+    } catch (err) {
+      if (classifyDbError(err) !== "timeout") throw err;
+      missed.set(coll.id, searchTimeoutReason(coll.storage));
+      return [];
+    }
+  });
   const candidates = perCollection.flat();
   const time = (d: Date | null) => d?.getTime() ?? 0;
   candidates.sort((a, b) =>
@@ -551,13 +612,63 @@ export async function searchGlobal(userId: string, search: string, limit: number
     });
   }
 
-  const results = Array.from(grouped.values()).map((g) => ({
-    collection: g.collection,
-    matches: g.records.length,
-    records: g.records,
-  }));
+  let truncatedStrings = 0;
+  const results = Array.from(grouped.values()).map((g) => {
+    // Long strings in each match's data are cut when the caller set a cap.
+    const records = g.records.map((r) => {
+      const { value, truncated } = truncateStrings(r.data, limits.maxStringLength ?? 0);
+      truncatedStrings += truncated;
+      return truncated > 0 ? { ...r, data: value } : r;
+    });
+    return { collection: g.collection, matches: records.length, records };
+  });
 
-  return { search, results };
+  const notSearched = accessible.filter((c) => missed.has(c.id)).map((c) => ({ collection: { name: c.name, slug: c.slug }, reason: missed.get(c.id)! }));
+  return {
+    search,
+    results,
+    ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}),
+    ...(notSearched.length > 0
+      ? {
+        incomplete: true,
+        not_searched: notSearched,
+        note: `${notSearched.length} of ${accessible.length} collections did not answer in time, so any matches in them are missing: ${notSearched.map((n) => `'${n.collection.name}'`).join(", ")}. To search one of them, use hutch_query_records with search on that collection (add a filter to narrow it).`,
+      }
+      : {}),
+  };
+}
+
+/**
+ * The collections whose search may be slow, so they get the per-collection
+ * time limit: no ready full-text index, and either one is queued, being
+ * built or failed, or the table is over the search-index threshold (by
+ * its pg_class size estimate, for collections inference never queued an
+ * index for: inference queues one on the write that crosses it).
+ * Small or indexed collections answer quickly.
+ */
+async function searchMayBeSlow(colls: { id: number; storage: unknown }[]): Promise<Set<number>> {
+  const slow = new Set<number>();
+  const unqueued: number[] = [];
+  for (const coll of colls) {
+    const index = readRegistry(coll.storage).search_index;
+    if (!index) unqueued.push(coll.id);
+    else if (!isReady(index)) slow.add(coll.id);
+  }
+  const threshold = searchIndexThresholdFromEnv();
+  for (const [id, bytes] of await tableRows.approxTableBytesOf(unqueued)) if (bytes >= threshold) slow.add(id);
+  return slow;
+}
+
+/** Collections not started with less than this left of the call's time are reported as not searched. */
+const SEARCH_MIN_SLICE_MS = 50;
+
+/** Why a collection's search ran out of time, from its search index state. */
+function searchTimeoutReason(storage: unknown): string {
+  const build = readRegistry(storage).search_index?.build;
+  if (!build) return "timed out: it has no full-text index, so searching it reads every document";
+  if (build.state === "pending" || build.state === "building") return "timed out: its full-text index is still being built, so searching it reads every document";
+  if (build.state === "failed") return "timed out: building its full-text index failed, so searching it reads every document";
+  return "timed out although its full-text index is ready (the server may be busy)";
 }
 
 export async function truncateRecords(slug: string, userId: string) {
@@ -578,6 +689,8 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   // The argument may be the collection's name; continue with its slug.
   slug = access.collection.slug;
   const collection = access.collection;
+  const truncated = rejectTruncatedValues([data]);
+  if (truncated) return truncated;
   const updated = await tableRows.updateRecordData(collection.id, recordId, data);
 
   if (!updated) return { error: "Record not found", status: 404 };
@@ -632,24 +745,48 @@ export async function transformRecords(slug: string, userId: string, params: {
   if (!fieldNames.every((f) => FIELD_NAME_RE.test(f))) {
     return { error: "Invalid field name", status: 400 };
   }
+  if (set_field) {
+    const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");
+    if (truncated) return truncated;
+  }
 
-  // Database failures return this clean message instead of surfacing raw
-  // driver/SQL text through the MCP tool output.
-  const transformFailed = {
-    error: "Transform failed while updating records — check the field names and values and try again",
-    status: 500,
+  // Database failures return a clean message that says what happened (a
+  // timeout, a value of the wrong type) instead of raw driver/SQL text.
+  const collection = access.collection;
+  const transformFailed = (err: unknown) => {
+    const kind = classifyDbError(err);
+    if (kind === "timeout") {
+      // Each updated record is rewritten whole; with unwound arrays its
+      // child rows are rebuilt too, so a few hundred large records can
+      // take longer than the timeout.
+      const unwound = readRegistry(collection.storage).unwinds.map((u) => `'${u.path}'`);
+      const why = unwound.length > 0
+        ? ` Every updated record also rebuilds its rows for the queryable array${unwound.length > 1 ? "s" : ""} ${unwound.join(", ")}, which is slow for many large records.`
+        : "";
+      return {
+        error: `Transform timed out after ${formatTimeout()} on collection '${slug}' and was rolled back: no records were changed.${why} Narrow set_field.filter so each call touches fewer records (for example by an id or date range) and run it in batches.`,
+        status: 504,
+      };
+    }
+    if (kind === "invalid_input") {
+      return { error: `${describeDbError(err, { tool: "Transform", collection: slug })} No records were changed.`, status: 400 };
+    }
+    return { error: "Transform failed while updating records and was rolled back: no records were changed. Try again; if it keeps failing, transform fewer records per call.", status: 500 };
   };
 
   // set_field.filter takes the full query filter language (operators,
   // dotted paths, array elements), as in hutch_query_records.
-  const collection = access.collection;
   let setFilter: SQL | undefined;
   if (set_field?.filter && Object.keys(set_field.filter).length > 0) {
     try {
       setFilter = await tableFilterWhere(collection, set_field.filter);
     } catch (err) {
+      // A malformed filter (unknown operator, bad path) is the caller's to fix: say exactly what is wrong.
+      if (!isDatabaseError(err)) {
+        return { error: `Invalid set_field.filter: ${(err as Error)?.message ?? String(err)}`, status: 400 };
+      }
       console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
-      return transformFailed;
+      return transformFailed(err);
     }
   }
 
@@ -667,7 +804,7 @@ export async function transformRecords(slug: string, userId: string, params: {
   } catch (err) {
     if (err instanceof tableRows.TransformStepError) {
       console.error(`transformRecords ${err.step} failed for collection ${collection.id}`, err.cause);
-      return transformFailed;
+      return transformFailed(err.cause);
     }
     throw err;
   }

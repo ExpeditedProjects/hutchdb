@@ -4,15 +4,17 @@ import { alias } from "drizzle-orm/pg-core";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { createCollectionWithOwner } from "@/lib/db/queries";
 import { findAccessibleCollection } from "./resolve";
-import { describeCollection as describeCollectionFields } from "@/lib/describe";
+import { DESCRIBE_FIELDS_PAGE, describeFields, type DescribePage } from "@/lib/describe";
 import { uniqueSlug } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectableField, MAX_OPTION_VALUE_LENGTH, MAX_OPTIONS_PER_FIELD } from "@/lib/schema-inference";
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { queryIndexes, readRegistry } from "@/lib/storage/registry";
-import { dropCollectionTable } from "@/lib/storage/ddl";
+import { isReady, queryIndexes, readRegistry, stateOf } from "@/lib/storage/registry";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
+import { dropCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout } from "@/lib/storage/ddl";
+import { findPgError } from "@/lib/db/errors";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 
@@ -227,7 +229,13 @@ export async function createCollection(userId: string, organizationId: string, p
   return { collection: created };
 }
 
-export async function getCollection(slug: string, userId: string) {
+/**
+ * One collection with its record count. With `page` (the MCP tool always
+ * passes one), schema.fields is cut to one page in schema order — a wide
+ * collection's saved schema can list thousands of fields — with the same
+ * paging metadata as describe; without it, the whole schema.
+ */
+export async function getCollection(slug: string, userId: string, page?: FieldPage) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
@@ -236,7 +244,17 @@ export async function getCollection(slug: string, userId: string) {
     tableRows.countRecords(collection.id),
     tableRows.lastRecordAt(collection.id),
   ]);
-  return { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
+  const result = { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
+  const schema = collection.schema as CollectionSchema | null;
+  if (!page || !schema || !Array.isArray(schema.fields)) return result;
+  const offset = Math.max(0, Math.floor(page.fields_offset ?? 0));
+  const matching = page.field_prefix ? schema.fields.filter((f) => f.name.startsWith(page.field_prefix!)) : schema.fields;
+  const fields = matching.slice(offset, offset + DESCRIBE_FIELDS_PAGE);
+  return {
+    ...result,
+    schema: { ...schema, fields },
+    ...fieldPageInfo(page, matching.length, schema.fields.length, fields.length, offset, "schema.fields, in schema order"),
+  };
 }
 
 export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
@@ -274,10 +292,18 @@ export async function deleteCollection(slug: string, userId: string) {
   // The argument may be the collection's name; continue with its slug.
   slug = access.collection.slug;
 
-  await db.transaction(async (tx) => {
-    await dropCollectionTable(tx, access.collection.id);
-    await tx.delete(collections).where(eq(collections.id, access.collection.id));
-  });
+  try {
+    await db.transaction(async (tx) => {
+      // A background build holds a lock on the table: fail fast instead of
+      // queueing every read and write of it behind DROP TABLE.
+      await setRequestDdlLockTimeout(tx);
+      await dropCollectionTable(tx, access.collection.id);
+      await tx.delete(collections).where(eq(collections.id, access.collection.id));
+    });
+  } catch (err) {
+    if (findPgError(err)?.code === "55P03") return { error: `Collection '${slug}' was not deleted: ${INDEX_BUILD_BUSY_MESSAGE}.`, status: 409 };
+    throw err;
+  }
   revalidateDashboard(slug);
   return { deleted: true, slug };
 }
@@ -468,9 +494,23 @@ export async function addFieldOption(
 const STATS_MAX_FIELDS = 50;
 
 /**
+ * Records sampled for fill rates on a collection too large to scan
+ * (rows.fullScanMaxBytes): STATS_SAMPLE_BYTES of documents, between
+ * STATS_SAMPLE_MIN_ROWS and STATS_SAMPLE_MAX_ROWS records — 10k long
+ * articles give 500, 1M small events 5,000.
+ */
+const STATS_SAMPLE_BYTES = 16 * 1024 * 1024;
+const STATS_SAMPLE_MIN_ROWS = 500;
+const STATS_SAMPLE_MAX_ROWS = 5000;
+
+/**
  * Collection statistics: record count, counts by status, first/last
  * created/updated timestamps, approximate storage bytes, and per-field
- * fill rates for top-level keys (most common first, capped at 50).
+ * fill rates for top-level keys (most common first, capped at 50). The
+ * counts, timestamps and bytes are exact (they read no documents); fill
+ * rates are exact when the collection's documents fit a full scan
+ * (rows.fullScanMaxBytes) and otherwise come from a random sample, with
+ * fields_sampled saying so and estimated_count in place of count.
  */
 export async function getCollectionStats(slug: string, userId: string) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
@@ -479,7 +519,7 @@ export async function getCollectionStats(slug: string, userId: string) {
   slug = access.collection.slug;
   const collection = access.collection;
 
-  const [summaryResult, statusResult, fieldResult] = await tableRows.collectionStats(collection.id, STATS_MAX_FIELDS);
+  const [summaryResult, statusResult] = await tableRows.collectionStats(collection.id);
 
   const summary = (summaryResult.rows[0] ?? {}) as {
     record_count?: number;
@@ -496,11 +536,21 @@ export async function getCollectionStats(slug: string, userId: string) {
     byStatus[row.status ?? DEFAULT_RECORD_STATUS] = row.count;
   }
 
-  const fields = (fieldResult.rows as { key: string; count: number }[]).map((row) => ({
-    name: row.key,
-    count: row.count,
-    percent: recordCount > 0 ? Math.round((row.count / recordCount) * 1000) / 10 : 0,
-  }));
+  const bytes = recordCount > 0 ? await tableRows.tableBytes(collection.id) : 0;
+  const sampleRows = Math.min(STATS_SAMPLE_MAX_ROWS, Math.max(STATS_SAMPLE_MIN_ROWS, Math.floor(STATS_SAMPLE_BYTES / Math.max(1, bytes / Math.max(1, recordCount)))));
+  const sampled = recordCount > 0 && bytes > tableRows.fullScanMaxBytes() && recordCount > sampleRows;
+  const fill = recordCount > 0
+    ? await tableRows.fieldFillRates(collection.id, STATS_MAX_FIELDS, sampled ? { rows: sampleRows, liveRows: recordCount } : undefined)
+    : { fields: [], sampledRows: null };
+
+  const percentOf = (count: number, of: number) => (of > 0 ? Math.round((count / of) * 1000) / 10 : 0);
+  const fields = fill.sampledRows === null
+    ? fill.fields.map((row) => ({ name: row.key, count: row.count, percent: percentOf(row.count, recordCount) }))
+    : fill.fields.map((row) => ({
+      name: row.key,
+      percent: percentOf(row.count, fill.sampledRows!),
+      estimated_count: fill.sampledRows! > 0 ? Math.round((row.count / fill.sampledRows!) * recordCount) : 0,
+    }));
 
   return {
     name: collection.name,
@@ -513,10 +563,40 @@ export async function getCollectionStats(slug: string, userId: string) {
     last_updated_at: summary.last_updated_at ?? null,
     approx_storage_bytes: Number(summary.approx_storage_bytes ?? 0),
     fields,
+    ...(fill.sampledRows !== null
+      ? {
+        fields_sampled: { rows: fill.sampledRows, of: recordCount },
+        fields_note: `Fill rates are estimated from a random sample of ${fill.sampledRows} of ${recordCount} records (percent of the sample; estimated_count scales it to the collection): this collection's documents are too large to count every key within the request time limit. record_count, by_status, the timestamps and approx_storage_bytes are exact.`,
+      }
+      : {}),
   };
 }
 
-export async function describeCollection(slug: string, userId: string) {
+export type FieldPage = { fields_offset?: number; field_prefix?: string };
+
+/**
+ * Paging metadata for a bounded field list: how many fields exist, how
+ * many this call returned, and how to get the rest.
+ */
+function fieldPageInfo(page: FieldPage, matched: number, total: number, returned: number, offset: number, source: string) {
+  const omitted = Math.max(0, matched - offset - returned);
+  const nextOffset = omitted > 0 ? offset + returned : null;
+  const info: Record<string, unknown> = {
+    fields_total: total,
+    ...(page.field_prefix ? { fields_matching_prefix: matched } : {}),
+    fields_offset: offset,
+    fields_returned: returned,
+    fields_omitted: Math.max(0, matched - returned),
+    fields_next_offset: nextOffset,
+  };
+  if (nextOffset !== null) {
+    const which = page.field_prefix ? ` starting with '${page.field_prefix}'` : "";
+    info.fields_hint = `Fields ${offset + 1}–${offset + returned} of ${matched}${which} (${source}). Pass fields_offset: ${nextOffset} for the next ${DESCRIBE_FIELDS_PAGE}, or field_prefix (the start of a field name) to find specific fields.`;
+  }
+  return info;
+}
+
+export async function describeCollection(slug: string, userId: string, page: FieldPage = {}) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   // The argument may be the collection's name; continue with its slug.
@@ -524,38 +604,78 @@ export async function describeCollection(slug: string, userId: string) {
   const collection = access.collection;
 
   const recordCount = await tableRows.countRecords(collection.id);
-  const fields = await describeCollectionFields(collection.id, recordCount, collection.storage);
+  const describePage: DescribePage = { offset: page.fields_offset, prefix: page.field_prefix };
+  const described = await describeFields(collection.id, recordCount, collection.storage, describePage);
 
+  // The storage section is the same on every page: shown on the first
+  // page, narrowed to the matching fields on a field_prefix lookup, and
+  // left out of later fields_offset pages, which only continue the list.
+  const laterPage = !page.field_prefix && (page.fields_offset ?? 0) > 0;
   return {
     name: collection.name,
     slug: collection.slug,
     description: collection.description,
     recordCount,
     uniqueKey: collection.uniqueKey,
-    fields,
-    storage: await describeStorage(collection),
+    fields: described.fields,
+    ...fieldPageInfo(page, described.matched, described.total, described.fields.length, described.offset, "most common first, from a sample of up to 500 records; hutch_collection_stats has exact fill rates"),
+    ...(laterPage
+      ? { storage_omitted: "storage (indexes, unwound arrays) is listed on the first page (no fields_offset) and is the same on every page." }
+      : { storage: await describeStorage(collection, page.field_prefix) }),
   };
 }
 
 /**
- * What inference has created for a collection: projected fields and
- * unwound arrays with their reasons and child row counts.
+ * What inference has created for a collection, compactly: every index
+ * that can serve a query (one short entry each), unwound arrays with their
+ * live element counts and build states, and arrays not unwound yet with
+ * the reason. With `prefix` (a field_prefix lookup), only entries for
+ * fields starting with it.
  */
-async function describeStorage(collection: { id: number; storage: unknown }) {
+async function describeStorage(collection: { id: number; storage: unknown }, prefix?: string) {
+  queueDueIndexBuild(collection);
   const registry = readRegistry(collection.storage);
-  const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
+  const matches = (field: string) => !prefix || field.startsWith(prefix);
+  const unwinds = registry.unwinds.filter((u) => matches(u.path));
+  const ready = unwinds.filter(isReady);
+  const counts = await tableRows.childTableCounts(collection.id, ready.map((u) => u.table));
   return {
-    evaluated_rows: registry.evaluated_rows,
-    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
-    unwinds: registry.unwinds.map((u) => ({
+    // Every index that can serve a query, including the GIN on the documents.
+    indexes: queryIndexes(collection.id, registry).filter((i) => matches(i.field) && (!prefix || i.field !== "*")),
+    // Arrays of objects made queryable; rows = elements across live records.
+    unwinds: unwinds.map((u) => ({
       path: u.path,
-      fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
-      rows: counts[u.table] ?? 0,
-      reason: u.reason,
+      ...(ready.includes(u) ? { rows: counts[u.table] ?? 0 } : {}),
+      ...stateOf(u.build),
     })),
     // Arrays of objects that are not unwound yet, and why.
-    not_unwound: registry.pending_unwinds ?? [],
-    // Every index that can serve a query, including the GIN on the documents.
-    indexes: queryIndexes(collection.id, registry),
+    not_unwound: (registry.pending_unwinds ?? []).filter((p) => matches(p.path)),
   };
+}
+
+/**
+ * One sentence for a timeout message when some of the collection's indexes
+ * (projections, unwinds, the search index) are not ready — queued, being
+ * built, or failed — so queries on those fields read every document;
+ * undefined when every index is ready. One indexed lookup of the
+ * collection row, run only after a timeout.
+ */
+export async function storageTimeoutHint(slug: string, userId: string): Promise<string | undefined> {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
+  if (!access) return undefined;
+  const registry = readRegistry(access.collection.storage);
+  const label = (kind: string, key: string) => (kind === "search" ? "full-text search" : `'${key}'`);
+  const names = (states: string[]) => [
+    ...registry.projections.filter((p) => p.build && states.includes(p.build.state)).map((p) => label("projection", p.path ? p.path.join(".") : p.field)),
+    ...registry.unwinds.filter((u) => u.build && states.includes(u.build.state)).map((u) => label("unwind", u.path)),
+    ...(registry.search_index?.build && states.includes(registry.search_index.build.state) ? [label("search", "")] : []),
+  ];
+  const failed = names(["failed"]);
+  const waiting = names(["pending", "building"]);
+  const parts: string[] = [];
+  if (failed.length > 0) parts.push(`Building indexes for ${failed.join(", ")} on this collection failed and will be retried`);
+  if (waiting.length > 0) parts.push(`indexes for ${waiting.join(", ")} are still being built in the background`);
+  if (parts.length === 0) return undefined;
+  const sentence = parts.join("; ");
+  return `${sentence[0].toUpperCase()}${sentence.slice(1)} (see hutch_describe_collection storage.indexes), so until they are ready queries on those fields read every document.`;
 }

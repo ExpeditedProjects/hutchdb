@@ -94,7 +94,21 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
 
   async function store(collection: string, recs: Record<string, unknown>[]): Promise<string> {
     const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, return: "summary" }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    await settle();
     return (result as { collection: { slug: string } }).collection.slug;
+  }
+
+  /** What the MCP route runs after a response: build every queued index and unwind. */
+  async function settle() {
+    const { buildPendingIndexes } = await import("./builder");
+    const report = await buildPendingIndexes();
+    // Every build must succeed, or a "projected vs plain" comparison could have both sides reading documents.
+    expect(report.failed, JSON.stringify(report)).toBe(0);
+    expect(report.collections.filter((c) => c.skipped)).toEqual([]);
+    const { buildEntries, readRegistry } = await import("./registry");
+    const rows = (await testDb.execute(sql`SELECT id, storage FROM collections`)).rows as { id: number; storage: unknown }[];
+    expect(rows.flatMap((r) => buildEntries(readRegistry(r.storage)).filter((e) => e.build && e.build.state !== "ready").map((e) => `${r.id} ${e.kind} ${e.key}: ${e.build!.state}`))).toEqual([]);
   }
 
   async function collectionRow(slug: string) {
@@ -333,7 +347,8 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
       expect(found.results.map((r) => r.collection.slug).sort()).toEqual([alpha, beta].sort());
 
       const describedBeta = ok(await collectionsSvc.describeCollection(beta, USER_ID));
-      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { projections: [], unwinds: [] } });
+      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { unwinds: [] } });
+      expect((describedBeta as { storage: { indexes: { field: string }[] } }).storage.indexes.map((i) => i.field)).toEqual(["*", "created_at"]);
 
       ok(await collectionsSvc.deleteCollection(beta, USER_ID));
       const gone = await testDb.execute(sql`SELECT to_regclass(${`hc_${betaRow.id}`}) IS NULL AS gone`);
