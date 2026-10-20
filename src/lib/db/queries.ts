@@ -1,12 +1,10 @@
 import { cache } from "react";
 import { db } from "./index";
-import { collections, records, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, desc, asc, isNull, inArray, SQL } from "drizzle-orm";
-import { FIELD_NAME_RE } from "@/lib/constants";
+import { collections, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
+import { eq, and, sql, asc, inArray, type SQL } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
+import { createCollectionTable } from "@/lib/storage/ddl";
 import { ClientInputError } from "@/lib/errors/client-input-error";
-
-export const notDeleted = isNull(records.deletedAt);
 
 export type CollectionAccess = {
   collection: typeof collections.$inferSelect;
@@ -67,6 +65,37 @@ function resolveEffectiveRole(
   }
 
   return effective;
+}
+
+// ── SQL mirror of resolveEffectiveRole (visibility) ────────────────────────
+//
+// For queries that can't call resolveEffectiveRole per row. References the
+// OUTER query's unaliased `"collections"` table by literal name, so the
+// caller must select FROM `collections` without an alias. `userId` is the
+// only bind parameter. Keep in lockstep with resolveEffectiveRole.
+
+/**
+ * Predicate: `"collections"` row is visible to `userId` (effective role ≥
+ * viewer). An `IN (… UNION …)` id set rather than joins, so a user holding
+ * several grants on one collection never duplicates rows, and both arms are
+ * index-driven (collection_members by user, organization_members by user).
+ */
+export function collectionVisibleTo(userId: string): SQL {
+  return sql`"collections"."id" IN (${visibleCollectionIdsSql(userId)})`;
+}
+
+/** Subquery yielding the ids of every collection `userId` can at least view. */
+export function visibleCollectionIdsSql(userId: string): SQL {
+  return sql`
+    SELECT vcm.collection_id FROM collection_members vcm
+     WHERE vcm.user_id = ${userId} AND vcm.role IN ('owner', 'editor', 'viewer')
+    UNION
+    SELECT vc.id FROM collections vc
+      JOIN organization_members vom
+        ON vom.organization_id = vc.organization_id AND vom.user_id = ${userId}
+     WHERE vom.role = 'admin'
+        OR (vom.role = 'member' AND vc.visibility = 'org'
+            AND vc.org_default_role IN ('owner', 'editor', 'viewer'))`;
 }
 
 /**
@@ -173,7 +202,7 @@ export async function findCollectionBySlugInOrg(slug: string, organizationId: st
 }
 
 /**
- * Insert a collection and its owner row atomically. The collection lands in
+ * Insert a collection, its owner row and its hc_<id> table atomically. The collection lands in
  * the supplied org; the caller becomes its owner via collection_members.
  */
 export async function createCollectionWithOwner(
@@ -189,6 +218,8 @@ export async function createCollectionWithOwner(
       .insert(collectionMembers)
       .values({ collectionId: created.id, userId: ownerUserId, role: "owner" })
       .onConflictDoNothing();
+    // Every collection's rows live in its own table (src/lib/storage).
+    await createCollectionTable(tx, created.id);
     return created;
   });
 }
@@ -216,33 +247,26 @@ export async function findPublishedCollectionBySlug(slug: string) {
   return collection;
 }
 
-export async function getCollectionRecordCount(collectionId: number): Promise<number> {
-  const [result] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted));
-  return result?.count ?? 0;
-}
-
-export async function getLastRecordAt(collectionId: number): Promise<Date | null> {
-  const [result] = await db
-    .select({ lastAt: sql<Date>`max(${records.createdAt})` })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted))
-    .limit(1);
-  return result?.lastAt ?? null;
-}
-
 export type QueryParams = {
   collectionId: number;
   filter?: Record<string, unknown>;
   search?: string;
   searchFields?: string[];
   sort?: string;
+  /** Keys of each document to return: top-level keys or dotted paths into objects and arrays of objects. */
   fields?: string[];
-  groupBy?: string;
-  aggregate?: Record<string, string | Record<string, string>>;
-  timeBucket?: string;
+  /** Records only: sort keys for an embedded array of objects, by its path ({"answers": "-score"}). */
+  arraySort?: Record<string, string | string[]>;
+  /** Records only: how many elements of an embedded array to return, by its path ({"answers": 10}). */
+  arrayLimit?: Record<string, number>;
+  /** One field, or up to MAX_GROUP_BY_KEYS fields; each may be a dotted object path. */
+  groupBy?: string | string[];
+  /** alias -> "count" or {op: operand}; an operand is a field path or, for sum/avg/min/max, an expression ({"$multiply": ["items.qty", "items.price"]}, {"$size": "members"}). */
+  aggregate?: Record<string, string | Record<string, unknown>>;
+  /** A unit ("day") to bucket by insert time (created_at), or {field, unit} to bucket by a data field holding ISO date/datetime strings (UTC). */
+  timeBucket?: string | TimeBucketSpec;
+  /** Aggregates over a nested array only: false omits the embedded parent `record`. */
+  record?: boolean;
   createdAfter?: string;
   createdBefore?: string;
   limit?: number;
@@ -251,318 +275,60 @@ export type QueryParams = {
   limitCap?: number;
 };
 
-export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
-export type FilterOperator = (typeof FILTER_OPERATORS)[number];
+export type TimeBucketSpec = { field: string; unit: string };
 
-type ComparisonOp = Extract<FilterOperator, "$gt" | "$gte" | "$lt" | "$lte">;
-const COMPARISON_OPS: Record<ComparisonOp, string> = { $gt: ">", $gte: ">=", $lt: "<", $lte: "<=" };
+export const MAX_GROUP_BY_KEYS = 5;
 
-const IN_ARRAY_LIMIT = 1000;
+export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains", "$size"] as const;
+
+/** Comparison operators inside {"$size": {...}}: {"members": {"$size": {"$gt": 30}}}. */
+export const SIZE_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne"] as const;
+
+/** Arithmetic operators in aggregate expressions: {"sum": {"$multiply": ["items.qty", "items.price"]}}. */
+export const ARITHMETIC_OPERATORS = ["$multiply", "$add", "$subtract", "$divide"] as const;
 
 /**
  * An operator spec is an object value whose keys ALL start with `$`
  * (e.g. {"$gte": 10, "$lt": 100}). Anything else — plain values, arrays,
- * nested objects, mixed keys — falls back to JSONB containment, which
- * keeps existing filter call shapes byte-for-byte compatible.
+ * nested objects, mixed keys — is a plain value (containment).
  */
-function isOperatorSpec(value: unknown): value is Record<string, unknown> {
+export function isOperatorSpec(value: unknown): value is Record<string, unknown> {
   if (!isPlainObject(value)) return false;
   const keys = Object.keys(value);
   return keys.length > 0 && keys.every((k) => k.startsWith("$"));
 }
 
+export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg, first";
+
+export function normalizeGroupBy(groupBy: string | string[] | undefined): string[] {
+  if (Array.isArray(groupBy)) {
+    if (groupBy.length > MAX_GROUP_BY_KEYS) throw new ClientInputError(`group_by accepts at most ${MAX_GROUP_BY_KEYS} keys`);
+    for (const key of groupBy) {
+      if (typeof key !== "string") throw new ClientInputError("group_by must be a field name or an array of field names");
+      escapeFieldPath(key);
+    }
+    return groupBy;
+  }
+  return groupBy ? [groupBy] : [];
+}
+
 /**
- * Build WHERE conditions for a filter object. Plain (non-operator) pairs
- * are collected into a single JSONB containment condition, exactly as
- * before; operator pairs each compile to a guarded, fully parameterized
- * comparison. Numeric comparisons only apply where
- * jsonb_typeof(data->field) = 'number' so mixed-type fields can't raise
- * cast errors; string operands compare lexicographically as text (which
- * also works for ISO-8601 date strings).
+ * A field name, or a dotted path into nested objects ("totals.veterans.points").
+ * Every segment is letters, digits and underscores only, so a validated path
+ * can never carry quotes, braces or commas into SQL.
  */
-export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
-  const conditions: SQL[] = [];
-  const containment: Record<string, unknown> = {};
+const FIELD_PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
 
-  for (const [field, value] of Object.entries(filter)) {
-    if (isOperatorSpec(value)) {
-      for (const [op, operand] of Object.entries(value)) {
-        conditions.push(buildOperatorCondition(field, op, operand));
-      }
-    } else {
-      containment[field] = value;
-    }
-  }
-
-  if (Object.keys(containment).length > 0) {
-    conditions.unshift(sql`${records.data} @> ${JSON.stringify(containment)}::jsonb`);
-  }
-
-  return conditions;
-}
-
-function buildOperatorCondition(field: string, op: string, operand: unknown): SQL {
-  if (Object.hasOwn(COMPARISON_OPS, op)) {
-    const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
-    if (typeof operand === "number") {
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'number' AND (${records.data}->>${field})::numeric ${cmp} ${operand})`;
-    }
-    if (typeof operand === "string") {
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ${cmp} ${operand})`;
-    }
-    throw new ClientInputError(`${op} requires a number or string operand`);
-  }
-
-  switch (op) {
-    case "$ne":
-      // Mongo semantics: matches records where the field differs OR is absent.
-      return sql`NOT (${records.data} @> ${JSON.stringify({ [field]: operand })}::jsonb)`;
-    case "$in":
-    case "$nin": {
-      if (!Array.isArray(operand)) throw new ClientInputError(`${op} requires an array operand`);
-      if (operand.length > IN_ARRAY_LIMIT) {
-        throw new ClientInputError(`$in/$nin arrays are limited to ${IN_ARRAY_LIMIT} elements`);
-      }
-      if (operand.length === 0) {
-        // $in [] matches nothing; $nin [] matches everything.
-        return op === "$in" ? sql`false` : sql`true`;
-      }
-      const list = sql.join(operand.map((v) => sql`${JSON.stringify(v)}::jsonb`), sql`, `);
-      const inCondition = sql`${records.data}->${field} = ANY(ARRAY[${list}])`;
-      return op === "$in"
-        ? inCondition
-        : sql`(${records.data}->${field} IS NULL OR NOT (${inCondition}))`;
-    }
-    case "$exists":
-      if (typeof operand !== "boolean") throw new ClientInputError("$exists requires a boolean operand");
-      return operand ? sql`${records.data} ? ${field}` : sql`NOT (${records.data} ? ${field})`;
-    case "$contains": {
-      if (typeof operand !== "string") throw new ClientInputError("$contains requires a string operand");
-      const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-      return sql`(jsonb_typeof(${records.data}->${field}) = 'string' AND (${records.data}->>${field}) ILIKE ${pattern})`;
-    }
-    default:
-      throw new ClientInputError(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
-  }
-}
-
-/** Keep only the requested top-level keys of a record's data (projection). */
-function projectData(data: unknown, fields: string[]): unknown {
-  if (!isPlainObject(data)) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (Object.hasOwn(data, field)) projected[field] = data[field];
-  }
-  return projected;
-}
-
-export async function queryRecords(params: QueryParams) {
-  const {
-    collectionId,
-    filter,
-    search,
-    sort,
-    fields,
-    createdAfter,
-    createdBefore,
-    limit = 50,
-    offset = 0,
-    limitCap = 1000,
-    groupBy,
-    aggregate,
-    timeBucket,
-  } = params;
-
-  const conditions: SQL[] = [eq(records.collectionId, collectionId), notDeleted];
-
-  if (filter && Object.keys(filter).length > 0) {
-    conditions.push(...buildFilterConditions(filter));
-  }
-
-  if (search) {
-    conditions.push(
-      sql`to_tsvector('english', ${records.data}::text) @@ plainto_tsquery('english', ${search})`
-    );
-  }
-
-  if (createdAfter) {
-    conditions.push(sql`${records.createdAt} >= ${createdAfter}::timestamptz`);
-  }
-
-  if (createdBefore) {
-    conditions.push(sql`${records.createdAt} < ${createdBefore}::timestamptz`);
-  }
-
-  const whereClause = conditions.length > 1
-    ? and(...conditions)!
-    : conditions[0];
-
-  // Handle aggregation queries
-  if (groupBy || aggregate) {
-    return queryWithAggregation(whereClause, { groupBy, aggregate, timeBucket, limit });
-  }
-
-  // Build sort
-  let orderBy: SQL;
-  if (sort) {
-    const descending = sort.startsWith("-");
-    const field = descending ? sort.slice(1) : sort;
-    if (field === "created_at") {
-      orderBy = descending ? desc(records.createdAt) : asc(records.createdAt);
-    } else if (field === "updated_at") {
-      orderBy = descending ? desc(records.updatedAt) : asc(records.updatedAt);
-    } else if (/^[a-zA-Z0-9_]+$/.test(field)) {
-      // `->` keeps jsonb typing so numbers sort numerically; `->>` would cast
-      // to text and sort them lexicographically ("12" < "3" < "5").
-      orderBy = descending
-        ? sql`${records.data}->${field} DESC NULLS LAST`
-        : sql`${records.data}->${field} ASC NULLS LAST`;
-    } else {
-      orderBy = desc(records.createdAt);
-    }
-  } else {
-    orderBy = desc(records.createdAt);
-  }
-
-  const clampedLimit = Math.min(Math.max(limit, 1), limitCap);
-
-  const selectQuery = db
-    .select()
-    .from(records)
-    .where(whereClause)
-    .orderBy(orderBy)
-    .limit(clampedLimit)
-    .offset(offset);
-
-  let results: typeof selectQuery extends Promise<infer R> ? R : never;
-  let total: number;
-
-  if (offset === 0) {
-    // First page: wait for results; if they fit in one page, results.length is the total.
-    results = await selectQuery;
-    total = results.length < clampedLimit ? results.length : await runCount(whereClause);
-  } else {
-    // Paginated read: count and results are independent — run in parallel.
-    const [rs, [{ count }]] = await Promise.all([selectQuery, runCountQuery(whereClause)]);
-    results = rs;
-    total = count;
-  }
-
-  const projected = fields && fields.length > 0
-    ? results.map((r) => ({ ...r, data: projectData(r.data, fields) }))
-    : results;
-
-  const hasMore = offset + results.length < total;
-  return {
-    records: projected,
-    total,
-    count: results.length,
-    limit: clampedLimit,
-    offset,
-    has_more: hasMore,
-    next_offset: hasMore ? offset + results.length : null,
-  };
-}
-
-function runCountQuery(whereClause: SQL) {
-  return db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(records)
-    .where(whereClause);
-}
-
-async function runCount(whereClause: SQL): Promise<number> {
-  const [{ count }] = await runCountQuery(whereClause);
-  return count;
-}
-
-const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
-
-async function queryWithAggregation(
-  whereClause: SQL,
-  params: { groupBy?: string; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; limit?: number }
-) {
-  const { groupBy, aggregate, timeBucket, limit = 50 } = params;
-
-  const selectParts: string[] = [];
-  const groupByParts: string[] = [];
-
-  if (timeBucket) {
-    selectParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at) as time_bucket`);
-    groupByParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at)`);
-  }
-
-  if (groupBy) {
-    selectParts.push(`data->>'${escapeField(groupBy)}' as "${escapeField(groupBy)}"`);
-    groupByParts.push(`data->>'${escapeField(groupBy)}'`);
-  }
-
-  if (aggregate) {
-    for (const [alias, spec] of Object.entries(aggregate)) {
-      if (spec === "count" || (isPlainObject(spec) && "count" in spec)) {
-        selectParts.push(`count(*)::int as "${escapeField(alias)}"`);
-        continue;
-      }
-      const specEntry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
-      if (!specEntry) {
-        const label = typeof spec === "string" ? spec : JSON.stringify(spec);
-        throw new ClientInputError(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
-      }
-      const [op, field] = specEntry;
-      const safeField = escapeField(field);
-      const safeAlias = escapeField(alias);
-      // Numeric values only (jsonb_typeof guard), so mixed-type fields can't
-      // raise cast errors. Results go through to_jsonb because node-postgres
-      // returns a bare numeric as a string; jsonb comes back as a JS number.
-      const numeric = `CASE WHEN jsonb_typeof(data->'${safeField}') = 'number' THEN (data->>'${safeField}')::numeric END`;
-      switch (op) {
-        case "min":
-        case "max":
-          // Numeric when the field holds any numbers (as text "10" < "9"),
-          // otherwise text so strings and ISO dates still order correctly.
-          selectParts.push(`coalesce(to_jsonb(${op}(${numeric})), to_jsonb(${op}(data->>'${safeField}'))) as "${safeAlias}"`);
-          break;
-        case "distinct":
-          selectParts.push(`array_agg(distinct data->>'${safeField}') as "${safeAlias}"`);
-          break;
-        case "sum":
-        case "avg":
-          // NULL when the group has no numeric values.
-          selectParts.push(`to_jsonb(${op}(${numeric})) as "${safeAlias}"`);
-          break;
-        default:
-          throw new ClientInputError(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
-      }
-    }
-  } else {
-    selectParts.push("count(*)::int as count");
-  }
-
-  const selectClause = selectParts.join(", ");
-  const groupClause = groupByParts.length > 0 ? `GROUP BY ${groupByParts.join(", ")}` : "";
-  const orderClause = timeBucket ? "ORDER BY time_bucket ASC" : (groupBy ? `ORDER BY "${escapeField(groupBy)}" ASC` : "");
-
-  const query = sql`
-    SELECT ${sql.raw(selectClause)}
-    FROM records
-    WHERE ${whereClause}
-    ${sql.raw(groupClause)}
-    ${sql.raw(orderClause)}
-    LIMIT ${Math.min(limit, 1000)}
-  `;
-
-  const rows = await db.execute(query);
-  return { results: rows.rows };
-}
-
-function escapeField(field: string): string {
-  if (!FIELD_NAME_RE.test(field)) {
-    throw new ClientInputError(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
+/** A field or a dotted path into nested objects (each segment as strict as a field name). */
+function escapeFieldPath(field: string): string {
+  if (typeof field !== "string" || !FIELD_PATH_RE.test(field)) {
+    throw new ClientInputError(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed, with dots separating nested object keys`);
   }
   return field;
 }
 
-function escapeBucket(bucket: string): string {
-  const allowed = ["second", "minute", "hour", "day", "week", "month", "quarter", "year"];
-  return allowed.includes(bucket) ? bucket : "day";
+export const TIME_BUCKET_UNITS = ["second", "minute", "hour", "day", "week", "month", "quarter", "year"] as const;
+
+export function escapeBucket(bucket: string): string {
+  return (TIME_BUCKET_UNITS as readonly string[]).includes(bucket) ? bucket : "day";
 }

@@ -1,15 +1,25 @@
 import { db } from "@/lib/db";
-import { collections, records, collectionMembers } from "@/lib/db/schema";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, QueryParams, notDeleted } from "@/lib/db/queries";
+import { collections, collectionMembers } from "@/lib/db/schema";
+import { createCollectionWithOwner, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
-import { eq, and, sql, desc } from "drizzle-orm";
+import { eq, and, type SQL } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, CollectionSchema } from "@/lib/schema-inference";
 import { seedAutoViews } from "./views";
+import { findAccessibleCollection } from "./resolve";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
+import { isReady, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
+import { collectionTableExists, createCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout, setUniqueKey } from "@/lib/storage/ddl";
+import { applyInference, markMixedProjections, recheckMixedProjections, searchIndexThresholdFromEnv, updateRegistry } from "@/lib/storage/apply";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
+import * as tableRows from "@/lib/storage/rows";
+import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
+import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
+import { limitQueryOutput, rejectTruncatedValues, truncateStrings, type OutputLimits } from "./output-limits";
+import { classifyDbError, describeDbError, findPgError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -56,8 +66,10 @@ export async function createRecords(userId: string, organizationId: string, para
   data?: Record<string, unknown>;
   records?: Record<string, unknown>[];
   on_conflict?: string;
+  /** "summary" leaves the stored records out of the response (bulk loads). */
+  return?: "records" | "summary";
 }) {
-  const { collection: collectionName, data: singleData, records: bulkRecords, on_conflict: onConflict = "replace" } = params;
+  const { collection: collectionName, data: singleData, records: bulkRecords, on_conflict: onConflict = "replace", return: returnMode = "records" } = params;
 
   if (!collectionName) {
     return { error: "Missing 'collection' field", status: 400 };
@@ -68,6 +80,9 @@ export async function createRecords(userId: string, organizationId: string, para
   }
 
   const recordsToInsert = bulkRecords || [singleData!];
+
+  const truncated = rejectTruncatedValues(recordsToInsert, (i) => (bulkRecords ? ` (record ${i + 1} of ${bulkRecords.length})` : ""));
+  if (truncated) return truncated;
 
   // Validate size and capture total bytes for the quota hook.
   let totalBytes = 0;
@@ -116,79 +131,12 @@ export async function createRecords(userId: string, organizationId: string, para
     }
   }
 
-  const uniqueKey = (collection.uniqueKey as string[]) || [];
-  const results: { action: string; record: Record<string, unknown> }[] = [];
-
-  if (uniqueKey.length === 0) {
-    // Fast path: batch insert all records in a single query
-    const created = await db
-      .insert(records)
-      .values(recordsToInsert.map((data) => ({
-        collectionId: collection.id,
-        data,
-        source: "api" as const,
-      })))
-      .returning();
-    for (const rec of created) {
-      results.push({ action: "created", record: rec as unknown as Record<string, unknown> });
-    }
-  } else {
-    // Upsert path: per-record conflict resolution
-    for (const data of recordsToInsert) {
-      const keyFilter: Record<string, unknown> = {};
-      for (const field of uniqueKey) {
-        if (data[field] !== undefined) {
-          keyFilter[field] = data[field];
-        }
-      }
-
-      if (Object.keys(keyFilter).length === uniqueKey.length) {
-        const [existing] = await db
-          .select()
-          .from(records)
-          .where(
-            and(
-              eq(records.collectionId, collection.id),
-              sql`${records.data} @> ${JSON.stringify(keyFilter)}::jsonb`,
-              notDeleted
-            )
-          )
-          .limit(1);
-
-        if (existing) {
-          let newData: Record<string, unknown>;
-          if (onConflict === "merge") {
-            newData = { ...(existing.data as Record<string, unknown>), ...data };
-          } else if (onConflict === "skip") {
-            results.push({ action: "skipped", record: existing as unknown as Record<string, unknown> });
-            continue;
-          } else if (onConflict === "error") {
-            return { error: "Record with matching unique key already exists", status: 409 };
-          } else {
-            newData = data;
-          }
-
-          const [updated] = await db
-            .update(records)
-            .set({ data: newData, updatedAt: new Date(), source: "api" })
-            .where(eq(records.id, existing.id))
-            .returning();
-          results.push({ action: "updated", record: updated as unknown as Record<string, unknown> });
-          continue;
-        }
-      }
-
-      const [created] = await db
-        .insert(records)
-        .values({
-          collectionId: collection.id,
-          data,
-          source: "api",
-        })
-        .returning();
-      results.push({ action: "created", record: created as unknown as Record<string, unknown> });
-    }
-  }
+  const stored = await storeInTable(collection, recordsToInsert, onConflict, collectionWasCreated);
+  if ("error" in stored) return stored;
+  const results = stored.results;
+  // The documents as stored (merged documents after an on_conflict merge),
+  // which inference evaluates.
+  const storedDocs = results.map((r) => r.record.data).filter(isPlainObject);
 
   // Auto-infer schema if records contain fields not yet in the schema
   const existingSchema = collection.schema as CollectionSchema | null;
@@ -200,6 +148,20 @@ export async function createRecords(userId: string, organizationId: string, para
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
 
+  // Storage inference (projections, unwinds, search index) runs after every
+  // successful write and only queues builds; they run in the background
+  // after the response (build-queue.ts). It must never fail the write.
+  let storageNote: string | undefined;
+  try {
+    const before = readRegistry(collection.storage);
+    await markMixedProjections(collection.id, storedDocs);
+    const after = await applyInference(collection, storedDocs);
+    storageNote = storageChangeNote(before, after);
+    queueDueIndexBuild({ id: collection.id, storage: after });
+  } catch (err) {
+    console.error(`[storage] inference failed for collection ${collection.id}`, err);
+  }
+
   revalidateDashboard(collection.slug);
 
   // Seed default views the first time this collection appears, using the
@@ -209,7 +171,20 @@ export async function createRecords(userId: string, organizationId: string, para
     await seedAutoViews(collection.slug, userId, inferredFromData);
   }
 
-  const summary = buildSaveSummary(collection.name, results, collectionWasCreated);
+  const saved = buildSaveSummary(collection.name, results, collectionWasCreated);
+  const summary = storageNote ? `${saved}${/[.)]$/.test(saved) ? "" : "."} ${storageNote}` : saved;
+  const note = { ...slugNote(collection), ...(storageNote ? { storage_note: storageNote } : {}) };
+
+  if (returnMode === "summary") {
+    return {
+      collection: { name: collection.name, slug: collection.slug },
+      count: results.length,
+      ...tallyActions(results),
+      ...(bulkRecords ? {} : { action: results[0]?.action, id: (results[0]?.record as { id?: number } | undefined)?.id }),
+      summary,
+      ...note,
+    };
+  }
 
   if (bulkRecords) {
     return {
@@ -217,6 +192,7 @@ export async function createRecords(userId: string, organizationId: string, para
       results,
       count: results.length,
       summary,
+      ...note,
     };
   }
 
@@ -224,7 +200,95 @@ export async function createRecords(userId: string, organizationId: string, para
     collection: { name: collection.name, slug: collection.slug },
     ...results[0],
     summary,
+    ...note,
   };
+}
+
+/** Which identifier other tools take for this collection: the slug, and the exact name works too. */
+export function slugNote(collection: { name: string; slug: string }): { use: string } {
+  return { use: `Pass slug "${collection.slug}" to other tools for this collection; its name "${collection.name}" works too.` };
+}
+
+/**
+ * What this write's inference queued — fields to index, arrays to unwind
+ * into child tables, the full-text search index — and that they are built
+ * in the background. Undefined when it queued nothing.
+ */
+export function storageChangeNote(before: StorageRegistry, after: StorageRegistry): string | undefined {
+  const projected = after.projections.filter((p) => !before.projections.some((b) => b.column === p.column)).map((p) => p.field);
+  const unwound = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path)).map((u) => u.path);
+  const search = after.search_index !== undefined && before.search_index === undefined;
+  if (projected.length === 0 && unwound.length === 0 && !search) return undefined;
+  const parts: string[] = [];
+  if (projected.length > 0) parts.push(`indexes on ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")}`);
+  if (unwound.length > 0) parts.push(`unwinding ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (so filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can use indexes)`);
+  if (search) parts.push("a full-text index for search");
+  return `This batch queued ${parts.join(", ")}. Indexes are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until one is ready, queries return the same results without it.`;
+}
+
+type CollectionRow = typeof collections.$inferSelect;
+
+type StoreResult = { results: { action: string; record: Record<string, unknown> }[] } | { error: string; status: number };
+
+/**
+ * Write path: the rows go to the collection's hc_<id> table.
+ * Upserts use a unique index over the key (see hc_set_unique_key) and
+ * honour every on_conflict mode (replace, merge, skip, error).
+ */
+async function storeInTable(
+  collection: CollectionRow,
+  docs: Record<string, unknown>[],
+  onConflict: string,
+  collectionWasCreated: boolean,
+): Promise<StoreResult> {
+  // createCollectionWithOwner creates the table; this covers a collection
+  // inserted by other means.
+  if (!collectionWasCreated && !(await collectionTableExists(db, collection.id))) {
+    await createCollectionTable(db, collection.id);
+  }
+
+  const uniqueKey = (collection.uniqueKey as string[]) || [];
+  if (uniqueKey.length === 0) {
+    const inserted = await tableRows.insertRecords(collection.id, docs);
+    return { results: inserted.map((record) => ({ action: "created", record: record as unknown as Record<string, unknown> })) };
+  }
+
+  const mode = onConflict === "skip" || onConflict === "error" || onConflict === "merge" ? onConflict : "replace";
+
+  const keyError = await ensureUniqueKeyIndex(collection, uniqueKey);
+  if (keyError) return keyError;
+
+  const result = await tableRows.upsertRecords(collection.id, docs, uniqueKey, mode);
+  if ("conflict" in result) {
+    return { error: "Record with matching unique key already exists", status: 409 };
+  }
+  return { results: result.results.map((r) => ({ action: r.action, record: r.record as unknown as Record<string, unknown> })) };
+}
+
+/** Make the table's unique index match the collection's unique_key, if it changed. */
+async function ensureUniqueKeyIndex(collection: CollectionRow, uniqueKey: string[]): Promise<{ error: string; status: number } | null> {
+  const registry = readRegistry(collection.storage);
+  if (JSON.stringify(registry.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+  try {
+    await updateRegistry(collection.id, async (current, tx) => {
+      if (JSON.stringify(current.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+      // A background build holds a lock on the table: fail fast instead of
+      // queueing every read and write of it behind the key change.
+      await setRequestDdlLockTimeout(tx);
+      await setUniqueKey(tx, collection.id, uniqueKey);
+      return { ...current, unique_key: uniqueKey };
+    });
+    return null;
+  } catch (err) {
+    const code = findPgError(err)?.code;
+    if (code === "23505") {
+      return { error: `Existing records already contain duplicates of unique key [${uniqueKey.join(", ")}] — remove them before storing with on_conflict`, status: 409 };
+    }
+    if (code === "55P03") {
+      return { error: `Nothing was stored: the collection's unique key [${uniqueKey.join(", ")}] could not be applied because ${INDEX_BUILD_BUSY_MESSAGE}.`, status: 409 };
+    }
+    throw err;
+  }
 }
 
 function tallyActions(results: { action: string }[]): { created: number; updated: number; skipped: number } {
@@ -279,30 +343,31 @@ function buildSaveSummary(
 }
 
 export async function listRecords(slug: string, userId: string, limit: number = 50, offset: number = 0) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
 
   const clampedLimit = Math.min(limit, 200);
 
-  const recs = await db
-    .select()
-    .from(records)
-    .where(and(eq(records.collectionId, collection.id), notDeleted))
-    .orderBy(desc(records.createdAt))
-    .limit(clampedLimit)
-    .offset(offset);
-
-  const total = await getCollectionRecordCount(collection.id);
-
+  const [recs, total] = await Promise.all([
+    tableRows.listRecords(collection.id, clampedLimit, offset),
+    tableRows.countRecords(collection.id),
+  ]);
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+/**
+ * With `limits` (the MCP tool passes them), long strings are cut and an
+ * oversized page is cut short with has_more/next_offset continuing it;
+ * without, the result is returned whole.
+ */
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>, limits?: OutputLimits) {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
-  return queryRecordsEngine({ ...params, collectionId: access.collection.id });
+  queueDueIndexBuild(access.collection);
+  const result = await queryTable(access.collection, params);
+  return limits ? limitQueryOutput(result, limits) : result;
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -323,18 +388,19 @@ export async function exportRecords(slug: string, userId: string, params: {
   format?: "json" | "csv";
   filter?: Record<string, unknown>;
   search?: string;
-  sort?: string;
+  sort?: string | string[];
   fields?: string[];
   limit?: number;
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
 
   const format = params.format ?? "json";
   const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
 
-  const result = await queryRecordsEngine({
-    collectionId: access.collection.id,
+  const result = await queryTable(access.collection, {
     filter: params.filter,
     search: params.search,
     sort: params.sort,
@@ -383,8 +449,10 @@ export async function importRecords(userId: string, organizationId: string, para
   format?: "csv" | "json";
   content: string;
   on_conflict?: string;
+  /** "records" echoes the stored records; the default is a summary. */
+  return?: "records" | "summary";
 }) {
-  const { collection, format = "csv", content, on_conflict } = params;
+  const { collection, format = "csv", content, on_conflict, return: returnMode = "summary" } = params;
 
   if (content.length > IMPORT_MAX_CONTENT_BYTES) {
     return { error: "Import content exceeds 10MB limit", status: 400 };
@@ -428,101 +496,210 @@ export async function importRecords(userId: string, organizationId: string, para
     collection,
     records: recordsToStore,
     on_conflict,
+    return: returnMode,
   });
   if ("error" in result) return result;
 
   const bulk = result as {
     collection: { name: string; slug: string };
-    results?: { action: string }[];
+    results?: { action: string; record: Record<string, unknown> }[];
     count?: number;
+    created?: number;
+    updated?: number;
+    skipped?: number;
     summary?: string;
+    use?: string;
+    storage_note?: string;
   };
 
-  const counts = tallyActions(bulk.results ?? []);
+  const counts = bulk.results ? tallyActions(bulk.results) : { created: bulk.created ?? 0, updated: bulk.updated ?? 0, skipped: bulk.skipped ?? 0 };
 
   return {
     collection: bulk.collection,
     count: bulk.count ?? 0,
     ...counts,
+    ...(returnMode === "records" && bulk.results ? { results: bulk.results } : {}),
     summary: bulk.summary,
+    ...(bulk.use ? { use: bulk.use } : {}),
+    ...(bulk.storage_note ? { storage_note: bulk.storage_note } : {}),
   };
 }
 
-export async function searchGlobal(userId: string, search: string, limit: number = 10) {
-  if (!userId) return { search, results: [] };
-  const clampedLimit = Math.min(limit, 50);
+/**
+ * Time limits for hutch_search: each collection gets half the statement
+ * timeout, and none starts after the whole timeout has passed.
+ * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off, and then
+ * no collection gets a limit either.
+ */
+export function searchTimeLimits(now: number): { perCollectionMs: number | undefined; deadline: number } {
+  const budgetMs = statementTimeoutMs();
+  if (budgetMs === 0) return { perCollectionMs: undefined, deadline: Infinity };
+  return { perCollectionMs: Math.max(1, Math.floor(budgetMs / 2)), deadline: now + budgetMs };
+}
 
-  const matches = await db
-    .select({
-      collectionName: collections.name,
-      collectionSlug: collections.slug,
-      id: records.id,
-      collectionId: records.collectionId,
-      data: records.data,
-      source: records.source,
-      deletedAt: records.deletedAt,
-      createdAt: records.createdAt,
-      updatedAt: records.updatedAt,
-    })
-    .from(records)
-    .innerJoin(collections, eq(records.collectionId, collections.id))
+/**
+ * hutch_search: at most `limit` matches in total (max 50) across every
+ * collection the user can read, the most relevant first (ts_rank), newest
+ * first among equals. Each collection contributes at most `limit`
+ * candidates, so the merged top `limit` is exact. Matches are grouped by
+ * collection, groups in the order of their best match, and every record
+ * keeps its collection's name and slug.
+ *
+ * One collection that cannot answer in time (a large one whose full-text
+ * index is missing or not built yet reads every document) must not fail
+ * the whole call: each collection's search runs under its own timeout of
+ * half the statement timeout, none starts after the statement timeout has
+ * elapsed since the call began, and the collections that timed out or
+ * were not reached are named in not_searched with incomplete: true, while
+ * the others' matches are returned.
+ */
+export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
+  if (!userId) return { search, results: [] };
+  const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
+
+  const accessible = await db
+    .select({ id: collections.id, name: collections.name, slug: collections.slug, storage: collections.storage })
+    .from(collections)
     .innerJoin(
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(
-      and(
-        sql`to_tsvector('english', ${records.data}::text) @@ plainto_tsquery('english', ${search})`,
-        notDeleted
-      )
-    )
-    .limit(clampedLimit * 10);
+    );
+  for (const coll of accessible) queueDueIndexBuild(coll);
+  const { perCollectionMs, deadline } = searchTimeLimits(Date.now());
+  const limited = perCollectionMs === undefined ? new Set<number>() : await searchMayBeSlow(accessible);
+  const missed = new Map<number, string>();
+  // Bounded concurrency; results are concatenated in collection order, as
+  // the serial loop did, so the stable sort below ranks ties the same way.
+  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) => {
+    const remaining = deadline - Date.now();
+    if (remaining < SEARCH_MIN_SLICE_MS) {
+      missed.set(coll.id, "not searched: the time for this call ran out before its turn");
+      return [];
+    }
+    try {
+      // Only a collection that may read every document gets its own time
+      // limit (a transaction of its own); the rest run as one statement.
+      const timeoutMs = perCollectionMs !== undefined && limited.has(coll.id) ? Math.min(perCollectionMs, remaining) : undefined;
+      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs })).map((row) => ({ coll, row }));
+    } catch (err) {
+      if (classifyDbError(err) !== "timeout") throw err;
+      missed.set(coll.id, searchTimeoutReason(coll.storage));
+      return [];
+    }
+  });
+  const candidates = perCollection.flat();
+  const time = (d: Date | null) => d?.getTime() ?? 0;
+  candidates.sort((a, b) =>
+    b.row.rank - a.row.rank || time(b.row.createdAt) - time(a.row.createdAt) || b.row.id - a.row.id);
 
-  const grouped = new Map<number, { collection: { name: string; slug: string }; records: typeof matches }>();
-  for (const row of matches) {
-    if (!grouped.has(row.collectionId)) {
-      grouped.set(row.collectionId, {
-        collection: { name: row.collectionName, slug: row.collectionSlug },
-        records: [],
-      });
+  const grouped = new Map<number, { collection: { name: string; slug: string }; records: Record<string, unknown>[] }>();
+  for (const { coll, row } of candidates.slice(0, clampedLimit)) {
+    let group = grouped.get(coll.id);
+    if (!group) {
+      group = { collection: { name: coll.name, slug: coll.slug }, records: [] };
+      grouped.set(coll.id, group);
     }
-    const group = grouped.get(row.collectionId)!;
-    if (group.records.length < clampedLimit) {
-      group.records.push(row);
-    }
+    group.records.push({
+      collectionName: coll.name,
+      collectionSlug: coll.slug,
+      id: row.id,
+      collectionId: coll.id,
+      data: row.data,
+      source: row.source,
+      deletedAt: row.deletedAt,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+    });
   }
 
-  const results = Array.from(grouped.values()).map((g) => ({
-    collection: g.collection,
-    matches: g.records.length,
-    records: g.records,
-  }));
+  let truncatedStrings = 0;
+  const results = Array.from(grouped.values()).map((g) => {
+    // Long strings in each match's data are cut when the caller set a cap.
+    const records = g.records.map((r) => {
+      const { value, truncated } = truncateStrings(r.data, limits.maxStringLength ?? 0);
+      truncatedStrings += truncated;
+      return truncated > 0 ? { ...r, data: value } : r;
+    });
+    return { collection: g.collection, matches: records.length, records };
+  });
 
-  return { search, results };
+  const notSearched = accessible.filter((c) => missed.has(c.id)).map((c) => ({ collection: { name: c.name, slug: c.slug }, reason: missed.get(c.id)! }));
+  return {
+    search,
+    results,
+    ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}),
+    ...(notSearched.length > 0
+      ? {
+        incomplete: true,
+        not_searched: notSearched,
+        note: `${notSearched.length} of ${accessible.length} collections did not answer in time, so any matches in them are missing: ${notSearched.map((n) => `'${n.collection.name}'`).join(", ")}. To search one of them, use hutch_query_records with search on that collection (add a filter to narrow it).`,
+      }
+      : {}),
+  };
+}
+
+/**
+ * The collections whose search may be slow, so they get the per-collection
+ * time limit: no ready full-text index, and either one is queued, being
+ * built or failed, or the table is over the search-index threshold (by
+ * its pg_class size estimate, for collections inference never queued an
+ * index for: inference queues one on the write that crosses it).
+ * Small or indexed collections answer quickly.
+ */
+async function searchMayBeSlow(colls: { id: number; storage: unknown }[]): Promise<Set<number>> {
+  const slow = new Set<number>();
+  const unqueued: number[] = [];
+  for (const coll of colls) {
+    const index = readRegistry(coll.storage).search_index;
+    if (!index) unqueued.push(coll.id);
+    else if (!isReady(index)) slow.add(coll.id);
+  }
+  const threshold = searchIndexThresholdFromEnv();
+  for (const [id, bytes] of await tableRows.approxTableBytesOf(unqueued)) if (bytes >= threshold) slow.add(id);
+  return slow;
+}
+
+/** Collections not started with less than this left of the call's time are reported as not searched. */
+const SEARCH_MIN_SLICE_MS = 50;
+
+/** Why a collection's search ran out of time, from its search index state. */
+function searchTimeoutReason(storage: unknown): string {
+  const build = readRegistry(storage).search_index?.build;
+  if (!build) return "timed out: it has no full-text index, so searching it reads every document";
+  if (build.state === "pending" || build.state === "building") return "timed out: its full-text index is still being built, so searching it reads every document";
+  if (build.state === "failed") return "timed out: building its full-text index failed, so searching it reads every document";
+  return "timed out although its full-text index is ready (the server may be busy)";
 }
 
 export async function truncateRecords(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
-  await db.update(records).set({ deletedAt: new Date() }).where(and(eq(records.collectionId, collection.id), notDeleted));
+  await tableRows.softDeleteAll(collection.id);
   revalidateDashboard(slug);
   return { truncated: true, slug };
 }
 
 export async function updateRecord(slug: string, userId: string, recordId: number, data: Record<string, unknown>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
-
-  const [updated] = await db
-    .update(records)
-    .set({ data, updatedAt: new Date() })
-    .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
-    .returning();
+  const truncated = rejectTruncatedValues([data]);
+  if (truncated) return truncated;
+  const updated = await tableRows.updateRecordData(collection.id, recordId, data);
 
   if (!updated) return { error: "Record not found", status: 404 };
+
+  try {
+    await markMixedProjections(collection.id, [data]);
+  } catch (err) {
+    console.error(`[storage] projection check failed for collection ${collection.id}`, err);
+  }
 
   // Re-infer schema if the updated record has new fields
   const existingSchema = collection.schema as CollectionSchema | null;
@@ -533,7 +710,7 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   }
 
   revalidateDashboard(slug);
-  return { updated: true, record: updated };
+  return { updated: true, record: updated, slug };
 }
 
 export async function transformRecords(slug: string, userId: string, params: {
@@ -541,10 +718,10 @@ export async function transformRecords(slug: string, userId: string, params: {
   rename_fields?: Record<string, string>;
   set_field?: { field: string; value: unknown; filter?: Record<string, unknown> };
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
-  const collection = access.collection;
-
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const { remove_fields, rename_fields, set_field } = params;
 
   const hasOperation =
@@ -558,103 +735,85 @@ export async function transformRecords(slug: string, userId: string, params: {
     };
   }
 
-  // Distinct ids, not summed rowCounts: one call can run several UPDATEs
-  // over the same records (rename + remove + set), and the caller wants to
-  // know how many records changed.
-  const touched = new Set<number>();
-  const track = (result: { rows: Record<string, unknown>[] }) => {
-    for (const row of result.rows) touched.add(Number(row.id));
-  };
-
-  // Database failures return this clean message instead of surfacing raw
-  // driver/SQL text through the MCP tool output.
-  const transformFailed = {
-    error: "Transform failed while updating records — check the field names and values and try again",
-    status: 500,
-  };
-
-  if (remove_fields && remove_fields.length > 0) {
-    for (const field of remove_fields) {
-      if (!FIELD_NAME_RE.test(field)) {
-        return { error: "Invalid field name", status: 400 };
-      }
-    }
-    // Remove all fields in a single query using array subtraction
-    // Field names are validated by FIELD_NAME_RE (alphanumeric + underscore only)
-    const fieldsLiteral = `{${remove_fields.join(",")}}`;
-    try {
-      const result = await db.execute(
-        sql`UPDATE records SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-            WHERE collection_id = ${collection.id} AND data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
-            RETURNING id`
-      );
-      track(result);
-    } catch (err) {
-      console.error(`transformRecords remove_fields failed for collection ${collection.id}`, err);
-      return transformFailed;
-    }
+  const fieldNames = [
+    ...(remove_fields ?? []),
+    ...Object.entries(rename_fields ?? {}).flat(),
+    ...(set_field ? [set_field.field] : []),
+  ];
+  // Field names are validated by FIELD_NAME_RE (alphanumeric + underscore
+  // only) before any statement runs.
+  if (!fieldNames.every((f) => FIELD_NAME_RE.test(f))) {
+    return { error: "Invalid field name", status: 400 };
   }
-
-  if (rename_fields && Object.keys(rename_fields).length > 0) {
-    for (const [oldName, newName] of Object.entries(rename_fields)) {
-      if (!FIELD_NAME_RE.test(oldName) || !FIELD_NAME_RE.test(newName)) {
-        return { error: "Invalid field name", status: 400 };
-      }
-      // Every ::text cast is load-bearing: `->` and `-` are overloaded on
-      // (jsonb, text)/(jsonb, integer), and jsonb_build_object is VARIADIC
-      // "any" — an untyped bind param in any of these makes Postgres reject
-      // the statement ("could not determine data type of parameter").
-      // Verified against node-postgres, which sends params untyped.
-      try {
-        const result = await db.execute(
-          sql`UPDATE records
-              SET data = (data || jsonb_build_object(${newName}::text, data->${oldName}::text)) - ${oldName}::text,
-                  updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND data ? ${oldName}
-              AND deleted_at IS NULL
-              RETURNING id`
-        );
-        track(result);
-      } catch (err) {
-        console.error(`transformRecords rename_fields failed for collection ${collection.id}`, err);
-        return transformFailed;
-      }
-    }
-  }
-
   if (set_field) {
-    const { field, value, filter } = set_field;
-    if (!FIELD_NAME_RE.test(field)) {
-      return { error: "Invalid field name", status: 400 };
+    const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");
+    if (truncated) return truncated;
+  }
+
+  // Database failures return a clean message that says what happened (a
+  // timeout, a value of the wrong type) instead of raw driver/SQL text.
+  const collection = access.collection;
+  const transformFailed = (err: unknown) => {
+    const kind = classifyDbError(err);
+    if (kind === "timeout") {
+      // Each updated record is rewritten whole; with unwound arrays its
+      // child rows are rebuilt too, so a few hundred large records can
+      // take longer than the timeout.
+      const unwound = readRegistry(collection.storage).unwinds.map((u) => `'${u.path}'`);
+      const why = unwound.length > 0
+        ? ` Every updated record also rebuilds its rows for the queryable array${unwound.length > 1 ? "s" : ""} ${unwound.join(", ")}, which is slow for many large records.`
+        : "";
+      return {
+        error: `Transform timed out after ${formatTimeout()} on collection '${slug}' and was rolled back: no records were changed.${why} Narrow set_field.filter so each call touches fewer records (for example by an id or date range) and run it in batches.`,
+        status: 504,
+      };
     }
-    const overlay = JSON.stringify({ [field]: value });
+    if (kind === "invalid_input") {
+      return { error: `${describeDbError(err, { tool: "Transform", collection: slug })} No records were changed.`, status: 400 };
+    }
+    return { error: "Transform failed while updating records and was rolled back: no records were changed. Try again; if it keeps failing, transform fewer records per call.", status: 500 };
+  };
+
+  // set_field.filter takes the full query filter language (operators,
+  // dotted paths, array elements), as in hutch_query_records.
+  let setFilter: SQL | undefined;
+  if (set_field?.filter && Object.keys(set_field.filter).length > 0) {
     try {
-      let result;
-      if (filter && Object.keys(filter).length > 0) {
-        result = await db.execute(
-          sql`UPDATE records
-              SET data = data || ${overlay}::jsonb,
-                  updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND data @> ${JSON.stringify(filter)}::jsonb
-              AND deleted_at IS NULL
-              RETURNING id`
-        );
-      } else {
-        result = await db.execute(
-          sql`UPDATE records
-              SET data = data || ${overlay}::jsonb,
-                  updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND deleted_at IS NULL
-              RETURNING id`
-        );
-      }
-      track(result);
+      setFilter = await tableFilterWhere(collection, set_field.filter);
     } catch (err) {
-      console.error(`transformRecords set_field failed for collection ${collection.id}`, err);
-      return transformFailed;
+      // A malformed filter (unknown operator, bad path) is the caller's to fix: say exactly what is wrong.
+      if (!isDatabaseError(err)) {
+        return { error: `Invalid set_field.filter: ${(err as Error)?.message ?? String(err)}`, status: 400 };
+      }
+      console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
+      return transformFailed(err);
+    }
+  }
+
+  // The statements run in one transaction, so a failure leaves none of
+  // them applied.
+  let touched: Set<number>;
+  try {
+    const result = await tableRows.transformRows(collection.id, {
+      remove_fields,
+      rename_fields,
+      set_field: set_field ? { field: set_field.field, value: set_field.value } : undefined,
+      setFilter,
+    });
+    touched = new Set(result.touched);
+  } catch (err) {
+    if (err instanceof tableRows.TransformStepError) {
+      console.error(`transformRecords ${err.step} failed for collection ${collection.id}`, err.cause);
+      return transformFailed(err.cause);
+    }
+    throw err;
+  }
+
+  if (touched.size > 0) {
+    try {
+      await recheckMixedProjections(collection.id);
+    } catch (err) {
+      console.error(`[storage] projection check failed for collection ${collection.id}`, err);
     }
   }
 
@@ -685,36 +844,26 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
     return { error: `Invalid status. Must be one of: ${RECORD_STATUSES.join(", ")}`, status: 400 };
   }
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
-  const collection = access.collection;
-
-  const [updated] = await db
-    .update(records)
-    .set({ status, updatedAt: new Date() })
-    .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
-    .returning();
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
+  const updated = await tableRows.setRecordStatus(access.collection.id, recordId, status);
 
   if (!updated) return { error: "Record not found", status: 404 };
 
   revalidateDashboard(slug);
-  return { updated: true, record: updated };
+  return { updated: true, record: updated, slug };
 }
 
 export async function deleteRecord(slug: string, userId: string, recordId: number) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
-  const collection = access.collection;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
+  const deleted = await tableRows.softDeleteRecord(access.collection.id, recordId);
 
-  const [existing] = await db
-    .select({ id: records.id })
-    .from(records)
-    .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
-    .limit(1);
-
-  if (!existing) return { error: "Record not found", status: 404 };
-
-  await db.update(records).set({ deletedAt: new Date() }).where(eq(records.id, recordId));
+  if (!deleted) return { error: "Record not found", status: 404 };
   revalidateDashboard(slug);
-  return { deleted: true, id: recordId };
+  return { deleted: true, id: recordId, slug };
 }

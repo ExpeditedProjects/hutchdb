@@ -12,17 +12,19 @@
     "db:migrate": "npx drizzle-kit migrate",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke": "npx tsx scripts/smoke.ts"
+    "smoke": "npx tsx scripts/smoke.ts",
+    "storage:cutover": "npx tsx scripts/storage-cutover.ts",
+    "storage:build-indexes": "npx tsx scripts/storage-build-indexes.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",
     "drizzle-orm": "^0.45.4",
     "nanoid": "^6.0.2",
-    "next": "16.4.0",
+    "next": "16.4.2",
     "pg": "^8.23.1",
-    "react": "19.3.0",
-    "react-dom": "19.3.0",
-    "zod": "^4.6.5"
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
@@ -34,15 +36,15 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "^6.1.2",
-    "dotenv": "^18.0.6",
+    "dotenv": "^18.0.8",
     "drizzle-kit": "^0.31.11",
     "eslint": "^9",
-    "eslint-config-next": "16.4.0",
+    "eslint-config-next": "16.4.2",
     "happy-dom": "^20.14.6",
     "tailwindcss": "^4",
     "tsx": "^4.23.15",
     "typescript": "^6.0.3",
-    "vitest": "^5.0.3"
+    "vitest": "^5.0.5"
   },
   "overrides": {
     "@esbuild-kit/core-utils": {

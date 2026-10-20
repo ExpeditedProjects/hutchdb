@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { sql, eq, asc } from "drizzle-orm";
+import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +99,11 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     // Cascades to records, views, collection_members, collection_invitations.
     // The seeded user/org rows survive across tests.
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
+    // Collection ids restart, so drop the per-collection tables too.
+    const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
+    for (const row of tables.rows as { tablename: string }[]) {
+      await testDb.execute(sql`DROP TABLE IF EXISTS ${sql.identifier(row.tablename)} CASCADE`);
+    }
   });
 
   afterAll(async () => {
@@ -112,20 +117,65 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     return (result as { collection: { slug: string } }).collection.slug;
   }
 
+  /** A collection's rows straight from its hc_<id> table, in id order. */
+  async function rawRows(slug: string): Promise<{ data: Record<string, unknown>; deleted_at: string | null; updated_at: string }[]> {
+    const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
+    const result = await testDb.execute(sql`SELECT data, deleted_at, updated_at FROM ${sql.identifier(`hc_${coll.id}`)} ORDER BY id`);
+    return result.rows as { data: Record<string, unknown>; deleted_at: string | null; updated_at: string }[];
+  }
+
   /** Read a collection's live records straight from the scratch DB. */
   async function rawData(slug: string): Promise<Record<string, unknown>[]> {
-    const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
-    const rows = await testDb
-      .select()
-      .from(schema.records)
-      .where(eq(schema.records.collectionId, coll.id))
-      .orderBy(asc(schema.records.id));
-    return rows.filter((r) => r.deletedAt === null).map((r) => r.data as Record<string, unknown>);
+    return (await rawRows(slug)).filter((r) => r.deleted_at === null).map((r) => r.data);
   }
 
   async function query(slug: string, params: Parameters<RecordsService["queryRecords"]>[2]) {
     return ok(await recordsSvc.queryRecords(slug, USER_ID, params));
   }
+
+  describe("values a query cut short are never written back", () => {
+    const long = "word ".repeat(1000); // 5000 chars, over the 2000 default
+    const reject = /^Nothing was written: field 'notes.*' .*contains a "\[truncated: N more chars …\]" marker.*Re-read the record with max_string_length: 0/;
+
+    async function readCut(slug: string) {
+      const page = ok(await recordsSvc.queryRecords(slug, USER_ID, {}, { maxStringLength: 2000 })) as { records: { id: number; data: Record<string, unknown> }[]; truncated_strings?: number };
+      expect(page.truncated_strings).toBe(1);
+      return page.records[0];
+    }
+
+    it("hutch_update_record with a truncated value read back is rejected and the record is unchanged", async () => {
+      const slug = await seed("cut_update", [{ title: "t", notes: { body: long } }]);
+      const record = await readCut(slug);
+      const edited = { ...record.data, title: "changed" };
+      const result = await recordsSvc.updateRecord(slug, USER_ID, record.id, edited);
+      expect(result).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect((result as { error: string }).error).toContain("field 'notes.body'");
+      expect(await rawData(slug)).toEqual([{ title: "t", notes: { body: long } }]);
+    });
+
+    it("hutch_store_records with on_conflict replace and a truncated value is rejected and the record is unchanged; so are import and transform", async () => {
+      const slug = await seed("cut_store", [{ key: "a", notes: long }]);
+      ok(await (await import("@/lib/services/collections")).updateCollection(slug, USER_ID, { unique_key: ["key"] }));
+      const record = await readCut(slug);
+      const stored = await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: slug, records: [{ key: "b", notes: "fine" }, record.data], on_conflict: "replace" });
+      expect(stored).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect((stored as { error: string }).error).toContain("(record 2 of 2)");
+      const imported = await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: slug, format: "json", content: JSON.stringify([record.data]), on_conflict: "replace" });
+      expect(imported).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      const transformed = await recordsSvc.transformRecords(slug, USER_ID, { set_field: { field: "notes", value: record.data.notes } });
+      expect(transformed).toMatchObject({ status: 400, error: expect.stringMatching(reject) });
+      expect(await rawData(slug)).toEqual([{ key: "a", notes: long }]);
+    });
+
+    it("a value that merely talks about truncation is stored", async () => {
+      const prose = { key: "p", notes: "The log was truncated: 40 more chars were lost [truncated] — see the full values elsewhere." };
+      const slug = await seed("cut_prose", [prose]);
+      expect(await rawData(slug)).toEqual([prose]);
+      const id = (ok(await recordsSvc.queryRecords(slug, USER_ID, {})) as { records: { id: number }[] }).records[0].id;
+      ok(await recordsSvc.updateRecord(slug, USER_ID, id, { ...prose, extra: true }));
+      expect(await rawData(slug)).toEqual([{ ...prose, extra: true }]);
+    });
+  });
 
   // ── a. transformRecords ───────────────────────────────────────────────────
 
@@ -164,7 +214,7 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("remove_fields leaves records without the field untouched", async () => {
       const slug = await seed("transform_remove_sparse", [{ a: 1, c: 1 }, { c: 2 }]);
       const updatedAt = async () =>
-        (await testDb.select().from(schema.records).orderBy(asc(schema.records.id))).map((r) => r.updatedAt?.getTime());
+        (await rawRows(slug)).map((r) => new Date(r.updated_at).getTime());
       const before = await updatedAt();
 
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["a"] }));
@@ -462,10 +512,10 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("time_bucket buckets by created_at", async () => {
       // Push two records into yesterday's bucket directly in the DB.
       const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
+      const table = sql.identifier(`hc_${coll.id}`);
       await testDb.execute(sql`
-        UPDATE records SET created_at = created_at - interval '1 day'
-        WHERE collection_id = ${coll.id}
-          AND id IN (SELECT id FROM records WHERE collection_id = ${coll.id} ORDER BY id ASC LIMIT 2)
+        UPDATE ${table} SET created_at = created_at - interval '1 day'
+        WHERE id IN (SELECT id FROM ${table} ORDER BY id ASC LIMIT 2)
       `);
 
       const rows = await aggregated({ timeBucket: "day", aggregate: { n: "count" } });
@@ -526,6 +576,198 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(page3.total).toBe(5);
       expect(page3.has_more).toBe(false);
       expect(page3.next_offset).toBeNull();
+    });
+  });
+
+  // ── d2. query API: dotted sort, sort validation, aggregate top-N ─────────
+
+  describe("query API fixes (sort, aggregate top-N, multi-key group_by)", () => {
+    // Ties on purpose: three at 29 and two at 5, inserted out of name order
+    // so a correct sort can't pass by accident of insertion order.
+    const legislators = [
+      { name: "WHITEHOUSE", party: "D", chamber: "Senate", totals: { veterans: { points: 5 } } },
+      { name: "BACON", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "WILD", party: "D", chamber: "House", totals: { veterans: { points: 13 } } },
+      { name: "AMODEI", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "NOVETS", party: "I", chamber: "Senate", totals: { other: { points: 99 } } },
+      { name: "ZINKE", party: "R", chamber: "House", totals: { veterans: { points: 5 } } },
+      { name: "WENSTRUP", party: "R", chamber: "House", totals: { veterans: { points: 28 } } },
+      { name: "BARR", party: "R", chamber: "House", totals: { veterans: { points: 29 } } },
+      { name: "HUNDRED", party: "D", chamber: "Senate", totals: { veterans: { points: 100 } } },
+    ];
+    let slug: string;
+
+    beforeEach(async () => {
+      slug = await seed("legislators", legislators);
+    });
+
+    async function names(params: Parameters<RecordsService["queryRecords"]>[2]) {
+      const result = await query(slug, params);
+      if (!("records" in result)) throw new Error("expected records shape");
+      return result.records.map((r) => (r.data as Record<string, unknown>).name);
+    }
+
+    async function groups(params: Parameters<RecordsService["queryRecords"]>[2]) {
+      const result = await query(slug, params);
+      if (!("results" in result)) throw new Error("expected aggregation shape");
+      return result as { results: Record<string, unknown>[]; total: number };
+    }
+
+    it("sorts descending on a dotted path numerically, missing values last, ties by insertion", async () => {
+      // As text, "5" > "29" > "100"; numeric jsonb order puts 100 first.
+      expect(await names({ sort: "-totals.veterans.points" })).toEqual([
+        "HUNDRED", "BACON", "AMODEI", "BARR", "WENSTRUP", "WILD", "WHITEHOUSE", "ZINKE", "NOVETS",
+      ]);
+    });
+
+    it("sorts ascending on a dotted path with missing values still last", async () => {
+      expect(await names({ sort: "totals.veterans.points", limit: 3 })).toEqual(["WHITEHOUSE", "ZINKE", "WILD"]);
+      const all = await names({ sort: "totals.veterans.points" });
+      expect(all[all.length - 1]).toBe("NOVETS");
+    });
+
+    it("top-N pages over ties are stable and partition the ordered set", async () => {
+      const first = await names({ sort: "-totals.veterans.points", limit: 3 });
+      for (let i = 0; i < 3; i++) expect(await names({ sort: "-totals.veterans.points", limit: 3 })).toEqual(first);
+      const page2 = await names({ sort: "-totals.veterans.points", limit: 3, offset: 3 });
+      expect([...first, ...page2]).toEqual(["HUNDRED", "BACON", "AMODEI", "BARR", "WENSTRUP", "WILD"]);
+    });
+
+    it("rejects an invalid sort field instead of falling back to created_at", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "-totals..points" }))
+        .rejects.toThrow(/Invalid sort field 'totals\.\.points'/);
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "name; DROP TABLE records" }))
+        .rejects.toThrow(/Invalid sort field/);
+    });
+
+    it("rejects a sort on a field or path no record has", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "-totals.veterans.pionts" }))
+        .rejects.toThrow(/no record in this collection has it/);
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { sort: "nonsense" }))
+        .rejects.toThrow(/no record in this collection has it/);
+    });
+
+    it("accepts a sort the filtered rows lack when other records have it", async () => {
+      expect(await names({ filter: { name: "NOVETS" }, sort: "-totals.veterans.points" })).toEqual(["NOVETS"]);
+    });
+
+    it("ignores soft-deleted records when checking the sort path exists", async () => {
+      const lone = await seed("lonely", [{ name: "kept" }, { name: "gone", score: 1 }]);
+      const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, lone));
+      await testDb.execute(sql`UPDATE ${sql.identifier(`hc_${coll.id}`)} SET deleted_at = now() WHERE data->>'name' = 'gone'`);
+      await expect(recordsSvc.queryRecords(lone, USER_ID, { sort: "score" })).rejects.toThrow(/no record in this collection has it/);
+    });
+
+    it("keeps default order (created_at DESC) and accepts id / created_at sorts", async () => {
+      expect((await names({}))[0]).toBe("HUNDRED");
+      expect(await names({ sort: "id", limit: 2 })).toEqual(["WHITEHOUSE", "BACON"]);
+      expect(await names({ sort: "-id", limit: 2 })).toEqual(["HUNDRED", "BARR"]);
+      expect(await names({ sort: "created_at", limit: 2 })).toEqual(["WHITEHOUSE", "BACON"]);
+    });
+
+    it("filters on dotted paths with plain values and operators", async () => {
+      expect(await names({ filter: { "totals.veterans.points": 29 }, sort: "name" })).toEqual(["AMODEI", "BACON", "BARR"]);
+      expect(await names({ filter: { "totals.veterans.points": { $gte: 28 } }, sort: "name" })).toEqual(["AMODEI", "BACON", "BARR", "HUNDRED", "WENSTRUP"]);
+      expect(await names({ filter: { "totals.veterans": { $exists: false } } })).toEqual(["NOVETS"]);
+    });
+
+    it("dotted filter keys address the nested path, not a literal top-level key of that name", async () => {
+      // A CSV import with a "first.name" column keeps the key, but a filter
+      // on "first.name" reads first -> name.
+      const csv = await seed("csvish", [
+        { "first.name": "Ada", "age.years": 36 },
+        { first: { name: "Ada" }, age: { years: 40 } },
+        { "first.name": "Grace", "age.years": 85 },
+      ]);
+      const count = async (filter: Record<string, unknown>) => {
+        const result = await query(csv, { filter });
+        if (!("records" in result)) throw new Error("expected records shape");
+        return result.records.length;
+      };
+      expect(await count({ "first.name": "Ada" })).toBe(1);
+      expect(await count({ "age.years": { $gte: 40 } })).toBe(1);
+      expect(await count({ "first.name": { $ne: "Ada" } })).toBe(2);
+      expect(await count({ "first.name": { $in: ["Grace"] } })).toBe(0);
+      expect(await count({ "first.name": { $exists: true } })).toBe(1);
+      expect(await count({ "first.name": { $contains: "da" } })).toBe(1);
+    });
+
+    it("aggregate sort by alias + limit returns the true top-N groups and the group total", async () => {
+      const result = await groups({
+        groupBy: "party",
+        aggregate: { points: { sum: "totals.veterans.points" }, n: "count" },
+        sort: "-points",
+        limit: 2,
+      });
+      expect(result.results).toEqual([
+        { party: "R", points: 120, n: 5 },
+        { party: "D", points: 118, n: 3 },
+      ]);
+      expect(result.total).toBe(3);
+    });
+
+    it("aggregate sort by group_by key ascending and descending", async () => {
+      const desc = await groups({ groupBy: "party", sort: "-party" });
+      expect(desc.results.map((r) => r.party)).toEqual(["R", "I", "D"]);
+      const asc = await groups({ groupBy: "party", sort: "count", limit: 1 });
+      expect(asc.results).toEqual([{ party: "I", count: 1 }]);
+      expect(asc.total).toBe(3);
+    });
+
+    it("aggregate without sort keeps group key ASC order", async () => {
+      expect((await groups({ groupBy: "party" })).results.map((r) => r.party)).toEqual(["D", "I", "R"]);
+    });
+
+    it("rejects an aggregate sort that is neither an alias nor a group key", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: "party", aggregate: { n: "count" }, sort: "-created_at" }))
+        .rejects.toThrow(/Invalid sort field 'created_at' for an aggregate query/);
+    });
+
+    it("multi-key group_by names columns by key, including a dotted path", async () => {
+      const result = await groups({ groupBy: ["chamber", "party"], aggregate: { n: "count" }, sort: "-n" });
+      expect(result.results[0]).toEqual({ chamber: "House", party: "R", n: 5 });
+      expect(result.total).toBe(4);
+      expect(result.results.slice(1)).toEqual([
+        { chamber: "House", party: "D", n: 1 },
+        { chamber: "Senate", party: "D", n: 2 },
+        { chamber: "Senate", party: "I", n: 1 },
+      ].sort((a, b) => b.n - a.n || a.chamber.localeCompare(b.chamber) || a.party.localeCompare(b.party)));
+
+      const byPoints = await groups({ groupBy: ["party", "totals.veterans.points"], sort: "-count", limit: 1 });
+      // Group keys keep their JSON type.
+      expect(byPoints.results).toEqual([{ party: "R", "totals.veterans.points": 29, count: 3 }]);
+    });
+
+    it("rejects more than 5 group_by keys", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: ["a", "b", "c", "d", "e", "f"] })).rejects.toThrow(/at most 5 keys/);
+    });
+
+    it("createRecords return: summary omits the stored records", async () => {
+      const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, {
+        collection: "legislators",
+        records: [{ name: "NEW1" }, { name: "NEW2" }],
+        return: "summary",
+      })) as Record<string, unknown>;
+      expect(result).not.toHaveProperty("results");
+      expect(result).toEqual(expect.objectContaining({ count: 2, created: 2, updated: 0, skipped: 0 }));
+      expect(result.summary).toMatch(/Saved 2 records/);
+
+      const single = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "legislators", data: { name: "NEW3" }, return: "summary" })) as Record<string, unknown>;
+      expect(single).not.toHaveProperty("record");
+      expect(single).toEqual(expect.objectContaining({ count: 1, created: 1, action: "created", id: expect.any(Number) }));
+
+      const echoed = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "legislators", records: [{ name: "NEW4" }] })) as Record<string, unknown>;
+      expect(echoed.results).toHaveLength(1);
+    });
+
+    it("importRecords defaults to summary and echoes records with return: records", async () => {
+      const summary = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "imported", content: "name\nA\nB\n" })) as Record<string, unknown>;
+      expect(summary).not.toHaveProperty("results");
+      expect(summary).toEqual(expect.objectContaining({ count: 2, created: 2 }));
+
+      const records = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "imported", content: "name\nC\n", return: "records" })) as Record<string, unknown>;
+      expect(records.results).toHaveLength(1);
+      expect(records).toEqual(expect.objectContaining({ count: 1, created: 1 }));
     });
   });
 
@@ -610,6 +852,17 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
 
       const data = await rawData(slug);
       expect(data).toEqual([{ sku: "a1", qty: 1 }]);
+    });
+
+    it("on_conflict error returns 409 for duplicates within one batch and writes nothing", async () => {
+      const slug = await upsertCollection("Upsert Error Batch");
+      const result = await recordsSvc.createRecords(USER_ID, ORG_ID, {
+        collection: "Upsert Error Batch",
+        records: [{ sku: "b1", qty: 1 }, { sku: "c1", qty: 1 }, { sku: "b1", qty: 2 }],
+        on_conflict: "error",
+      });
+      expect(result).toMatchObject({ status: 409 });
+      expect(await rawData(slug)).toEqual([]);
     });
 
     it("non-conflicting records still insert alongside upserts", async () => {
@@ -815,6 +1068,62 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
 
       const none = await recordsSvc.searchGlobal(USER_ID, "nonexistentterm");
       expect(none.results).toHaveLength(0);
+    });
+
+    it("searchGlobal caps the total at limit, most relevant first, then newest", async () => {
+      // "otter otter otter" ranks above a single mention.
+      const a = await seed("otters_a", [{ text: "otter" }, { text: "otter otter otter" }]);
+      const b = await seed("otters_b", [{ text: "one otter" }, { text: "another otter" }, { text: "otter again" }]);
+      await seed("otters_c", [{ text: "an otter" }, { text: "seal" }]);
+
+      const result = await recordsSvc.searchGlobal(USER_ID, "otter", 3);
+      const flat = result.results.flatMap((g) => g.records as { collectionSlug: string; data: { text: string } }[]);
+      expect(flat).toHaveLength(3);
+      expect(result.results.reduce((n, g) => n + g.matches, 0)).toBe(3);
+      // Best match first; its group leads.
+      expect(result.results[0].collection.slug).toBe(a);
+      expect(flat[0]).toMatchObject({ collectionSlug: a, data: { text: "otter otter otter" } });
+      for (const g of result.results) {
+        for (const r of g.records as { collectionSlug: string }[]) expect(r.collectionSlug).toBe(g.collection.slug);
+      }
+      // Among equal ranks the newest wins: otters_c's "an otter" was stored
+      // last, then otters_b's three; otters_a's single "otter" is oldest.
+      const picked = flat.map((r) => `${r.collectionSlug}:${r.data.text}`);
+      expect(picked).not.toContain(`${a}:otter`);
+      expect(picked.some((p) => p.startsWith(`${b}:`))).toBe(true);
+
+      const all = await recordsSvc.searchGlobal(USER_ID, "otter", 50);
+      expect(all.results.reduce((n, g) => n + g.matches, 0)).toBe(6);
+    });
+
+    it("searchGlobal over many collections returns exactly what a serial pass over them would, ties included", async () => {
+      // Six collections (more than the concurrency bound), each with an exact
+      // tie (same text, same id 1, same created_at) and one better match.
+      const slugs: string[] = [];
+      for (let c = 0; c < 6; c++) {
+        slugs.push(await seed(`kiwis_${c}`, [{ text: "kiwi" }, { text: c % 2 ? "kiwi kiwi kiwi" : "a kiwi and more" }]));
+      }
+      const colls = await testDb.select().from(schema.collections);
+      for (const coll of colls) {
+        await testDb.execute(sql`UPDATE ${sql.identifier(`hc_${coll.id}`)} SET created_at = '2026-03-01T00:00:00Z'`);
+      }
+      const { searchRecords } = await import("@/lib/storage/rows");
+      // The serial order: collections as the access query returns them, then a stable sort.
+      const accessible = (await testDb.execute(sql`
+        SELECT c.id, c.slug FROM collections c JOIN collection_members m ON m.collection_id = c.id AND m.user_id = ${USER_ID}`)).rows as { id: number; slug: string }[];
+      const serial: { slug: string; id: number; rank: number; created: number }[] = [];
+      for (const coll of accessible) {
+        for (const row of await searchRecords(coll.id, "kiwi", 50)) serial.push({ slug: coll.slug, id: row.id, rank: row.rank, created: row.createdAt?.getTime() ?? 0 });
+      }
+      serial.sort((a, b) => b.rank - a.rank || b.created - a.created || b.id - a.id);
+
+      const result = await recordsSvc.searchGlobal(USER_ID, "kiwi", 50);
+      const flat = result.results.flatMap((g) => (g.records as { collectionSlug: string; id: number }[]).map((r) => `${r.collectionSlug}#${r.id}`));
+      const grouped: string[] = [];
+      for (const slug of [...new Set(serial.map((r) => r.slug))]) grouped.push(...serial.filter((r) => r.slug === slug).map((r) => `${r.slug}#${r.id}`));
+      expect(flat).toEqual(grouped);
+      expect(flat).toHaveLength(12);
+      expect(new Set(flat.map((f) => f.split("#")[0]))).toEqual(new Set(slugs));
     });
   });
 });

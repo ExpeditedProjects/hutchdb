@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
-import { views, collections, collectionMembers } from "@/lib/db/schema";
+import { views } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
-import { findAccessibleCollectionBySlug } from "@/lib/db/queries";
+import { findAccessibleCollection } from "./resolve";
 import { uniqueSlug, titleCase } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { MAX_VIEW_NAME_LENGTH } from "@/lib/views/types";
@@ -28,8 +28,10 @@ export async function createView(collectionSlug: string, userId: string, params:
     resolvedName = validated.value;
   }
 
-  const access = await findAccessibleCollectionBySlug(collectionSlug, userId, "editor");
+  const access = await findAccessibleCollection(collectionSlug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  collectionSlug = access.collection.slug;
 
   const type = params.type || "table";
   const name = resolvedName ?? titleCase(type);
@@ -52,23 +54,27 @@ export async function createView(collectionSlug: string, userId: string, params:
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
-  return { view: created };
+  return { view: created, slug: collectionSlug };
 }
 
-export async function renameView(viewId: number, userId: string, name: string) {
+/** Same access rule as createView; the view must belong to collectionSlug. */
+async function findEditableView(collectionSlug: string, viewId: number, userId: string) {
+  const access = await findAccessibleCollection(collectionSlug, userId, "editor");
+  if (!access) return null;
+
+  const [view] = await db
+    .select({ config: views.config })
+    .from(views)
+    .where(and(eq(views.id, viewId), eq(views.collectionId, access.collection.id)))
+    .limit(1);
+  return view ?? null;
+}
+
+export async function renameView(collectionSlug: string, viewId: number, userId: string, name: string) {
   const validated = validateTrimmedLength(name, MAX_VIEW_NAME_LENGTH, "Name");
   if ("error" in validated) return validated;
 
-  const [existing] = await db
-    .select({ collectionId: views.collectionId, collectionSlug: collections.slug })
-    .from(views)
-    .innerJoin(collections, eq(views.collectionId, collections.id))
-    .innerJoin(
-      collectionMembers,
-      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(eq(views.id, viewId))
-    .limit(1);
+  const existing = await findEditableView(collectionSlug, viewId, userId);
   if (!existing) return { error: "View not found", status: 404 };
 
   const [updated] = await db
@@ -77,7 +83,7 @@ export async function renameView(viewId: number, userId: string, name: string) {
     .where(eq(views.id, viewId))
     .returning();
 
-  revalidateDashboard(existing.collectionSlug, "views");
+  revalidateDashboard(collectionSlug, "views");
   return { view: updated };
 }
 
@@ -100,17 +106,13 @@ function pickAllowedConfig(config: Record<string, unknown>): Record<string, unkn
   return picked;
 }
 
-export async function updateViewConfig(viewId: number, userId: string, config: Record<string, unknown>) {
-  const [existing] = await db
-    .select({ config: views.config, collectionId: views.collectionId })
-    .from(views)
-    .innerJoin(collections, eq(views.collectionId, collections.id))
-    .innerJoin(
-      collectionMembers,
-      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(eq(views.id, viewId))
-    .limit(1);
+export async function updateViewConfig(
+  collectionSlug: string,
+  viewId: number,
+  userId: string,
+  config: Record<string, unknown>
+) {
+  const existing = await findEditableView(collectionSlug, viewId, userId);
   if (!existing) return null;
 
   const sanitized = pickAllowedConfig(config);
@@ -121,6 +123,7 @@ export async function updateViewConfig(viewId: number, userId: string, config: R
     .where(eq(views.id, viewId))
     .returning();
 
+  revalidateDashboard(collectionSlug, "views");
   return { view: updated };
 }
 

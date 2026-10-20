@@ -20,7 +20,8 @@ export const config = {
     url: env.HUTCH_DATABASE_URL || env.DATABASE_URL,
   },
 
-  baseUrl: env.HUTCH_BASE_URL ?? 'http://localhost:3000',
+  /** The configured public URL, if any; requests fall back to their own origin (src/lib/base-url.ts). */
+  baseUrl: env.HUTCH_BASE_URL || undefined,
 } as const
 
 export type Config = typeof config

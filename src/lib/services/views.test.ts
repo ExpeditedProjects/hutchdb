@@ -16,12 +16,7 @@ vi.mock('@/lib/db', () => ({
     })),
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        innerJoin: vi.fn(() => ({
-          innerJoin: vi.fn(() => ({
-            where: vi.fn(() => ({ limit: selectLimit })),
-          })),
-          where: vi.fn(() => ({ limit: selectLimit })),
-        })),
+        where: vi.fn(() => ({ limit: selectLimit })),
       })),
     })),
   },
@@ -31,13 +26,24 @@ vi.mock('@/lib/db/queries', () => ({
   findAccessibleCollectionBySlug: vi.fn(),
 }))
 
+// Name resolution has its own tests (resolve.test.ts and the integration
+// suite); here a slug argument resolves exactly as the mocked slug lookup says.
+vi.mock('./resolve', async () => {
+  const queries = await import('@/lib/db/queries')
+  return {
+    findAccessibleCollection: (ref: string, userId: string, role?: string) =>
+      (queries.findAccessibleCollectionBySlug as (...a: unknown[]) => unknown)(ref, userId, role),
+  }
+})
+
 vi.mock('@/lib/revalidation', () => ({
   revalidateDashboard: vi.fn(),
 }))
 
-import { createView, renameView, seedAutoViews } from './views'
+import { createView, renameView, updateViewConfig, seedAutoViews } from './views'
 import { findAccessibleCollectionBySlug } from '@/lib/db/queries'
 import { db } from '@/lib/db'
+import { revalidateDashboard } from '@/lib/revalidation'
 
 const collectionRow = {
   id: 42,
@@ -52,6 +58,11 @@ const collectionRow = {
   publishedAt: null,
   visibility: 'private',
   orgDefaultRole: 'viewer',
+  storage: {},
+  migrationState: null,
+  migrationSwappedAt: null,
+  migrationReport: null,
+  migrationError: null,
   createdAt: new Date(),
   updatedAt: new Date(),
 }
@@ -182,34 +193,79 @@ describe('createView with explicit name and groupBy', () => {
 
 describe('renameView', () => {
   it('rejects empty names with status 400', async () => {
-    const result = await renameView(1, 'user-test', '   ')
+    const result = await renameView('bookmarks', 1, 'user-test', '   ')
     expect(result).toEqual(expect.objectContaining({ error: expect.any(String), status: 400 }))
+    expect(findAccessibleCollectionBySlug).not.toHaveBeenCalled()
     expect(db.select).not.toHaveBeenCalled()
   })
 
   it('rejects names longer than 100 characters with status 400', async () => {
-    const result = await renameView(1, 'user-test', 'x'.repeat(101))
+    const result = await renameView('bookmarks', 1, 'user-test', 'x'.repeat(101))
     expect(result).toEqual(expect.objectContaining({ status: 400 }))
     expect(db.select).not.toHaveBeenCalled()
   })
 
-  it('returns 404 when the view is not owned by any of the supplied api keys', async () => {
+  it('returns 404 without looking up the view when the caller lacks editor access', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
+    const result = await renameView('bookmarks', 7, 'user-test', 'New Name')
+    expect(result).toEqual(expect.objectContaining({ status: 404 }))
+    expect(findAccessibleCollectionBySlug).toHaveBeenCalledWith('bookmarks', 'user-test', 'editor')
+    expect(db.select).not.toHaveBeenCalled()
+    expect(db.update).not.toHaveBeenCalled()
+  })
+
+  it('returns 404 when the view is not in the collection', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: collectionRow, role: 'editor' })
     selectLimit.mockResolvedValue([])
-    const result = await renameView(99, 'user-test', 'New Name')
+    const result = await renameView('bookmarks', 99, 'user-test', 'New Name')
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
     expect(db.update).not.toHaveBeenCalled()
   })
 
-  it('trims whitespace and updates the name when the caller owns the view', async () => {
-    selectLimit.mockResolvedValue([{ collectionId: 42, collectionSlug: 'bookmarks' }])
+  it('trims whitespace, updates the name, and revalidates the collection', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: collectionRow, role: 'editor' })
+    selectLimit.mockResolvedValue([{ config: {} }])
     updateReturning.mockResolvedValue([{ id: 7, name: 'Pretty Name', slug: 'table-aaaaaaaa', type: 'table' }])
 
-    const result = await renameView(7, 'user-test', '  Pretty Name  ')
+    const result = await renameView('bookmarks', 7, 'user-test', '  Pretty Name  ')
 
     const setCall = vi.mocked(db.update).mock.results[0].value.set
     const patch = setCall.mock.calls[0][0]
     expect(patch.name).toBe('Pretty Name')
     expect(result).toEqual({ view: expect.objectContaining({ id: 7, name: 'Pretty Name' }) })
+    expect(revalidateDashboard).toHaveBeenCalledWith('bookmarks', 'views')
+  })
+})
+
+describe('updateViewConfig', () => {
+  it('returns null without looking up the view when the caller lacks editor access', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
+    const result = await updateViewConfig('bookmarks', 7, 'user-test', { cardTitle: 'title' })
+    expect(result).toBeNull()
+    expect(findAccessibleCollectionBySlug).toHaveBeenCalledWith('bookmarks', 'user-test', 'editor')
+    expect(db.select).not.toHaveBeenCalled()
+    expect(db.update).not.toHaveBeenCalled()
+  })
+
+  it('returns null when the view is not in the collection', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: collectionRow, role: 'editor' })
+    selectLimit.mockResolvedValue([])
+    const result = await updateViewConfig('bookmarks', 99, 'user-test', { cardTitle: 'title' })
+    expect(result).toBeNull()
+    expect(db.update).not.toHaveBeenCalled()
+  })
+
+  it('merges allowed keys into the existing config and revalidates the collection', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: collectionRow, role: 'editor' })
+    selectLimit.mockResolvedValue([{ config: { dateField: 'due' } }])
+    updateReturning.mockResolvedValue([{ id: 7 }])
+
+    const result = await updateViewConfig('bookmarks', 7, 'user-test', { cardTitle: 'title', evil: 'x' })
+
+    const setCall = vi.mocked(db.update).mock.results[0].value.set
+    expect(setCall.mock.calls[0][0].config).toEqual({ dateField: 'due', cardTitle: 'title' })
+    expect(result).toEqual({ view: { id: 7 } })
+    expect(revalidateDashboard).toHaveBeenCalledWith('bookmarks', 'views')
   })
 })
 
