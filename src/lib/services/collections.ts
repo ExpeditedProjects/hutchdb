@@ -10,6 +10,9 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
+import { isTableLayout, readRegistry } from "@/lib/storage/registry";
+import { createCollectionTable, dropCollectionTable } from "@/lib/storage/ddl";
+import * as tableRows from "@/lib/storage/rows";
 
 export type RecentCollection = { name: string; slug: string; role: CollectionRole };
 
@@ -170,6 +173,7 @@ export async function listCollections(userId: string, organizationId?: string) {
       published: collections.published,
       createdAt: collections.createdAt,
       updatedAt: collections.updatedAt,
+      layout: collections.layout,
       role: collectionMembers.role,
       recordCount: sql<number>`(SELECT count(*)::int FROM records WHERE records.collection_id = ${collections.id} AND deleted_at IS NULL)`,
       lastRecordAt: sql<string>`(SELECT max(created_at) FROM records WHERE records.collection_id = ${collections.id} AND deleted_at IS NULL)`,
@@ -183,6 +187,15 @@ export async function listCollections(userId: string, organizationId?: string) {
     .orderBy(desc(collections.updatedAt));
 
   if (colls.length === 0) return [];
+
+  // The subqueries above only see the shared records table; table-layout
+  // collections keep their rows in hc_<id>.
+  for (const coll of colls) {
+    if (!isTableLayout(coll)) continue;
+    const [count, lastAt] = await Promise.all([tableRows.countRecords(coll.id), tableRows.lastRecordAt(coll.id)]);
+    coll.recordCount = count;
+    coll.lastRecordAt = lastAt ? lastAt.toISOString() : (null as unknown as string);
+  }
 
   const collIds = colls.map((c) => c.id);
   const fieldRows = await db.execute(
@@ -202,6 +215,9 @@ export async function listCollections(userId: string, organizationId?: string) {
       fieldsByCollection.set(row.collection_id, new Set());
     }
     fieldsByCollection.get(row.collection_id)!.add(row.field_name);
+  }
+  for (const coll of colls) {
+    if (isTableLayout(coll)) fieldsByCollection.set(coll.id, new Set(await tableRows.sampleFieldNames(coll.id, 10)));
   }
 
   return colls.map((coll) => ({
@@ -232,6 +248,10 @@ export async function createCollection(userId: string, organizationId: string, p
     published: published ?? false,
   });
 
+  if (isTableLayout(created)) {
+    await createCollectionTable(db, created.id);
+  }
+
   if (schemaVal && (schemaVal as CollectionSchema)?.fields?.length) {
     await seedAutoViews(slug, userId, schemaVal as CollectionSchema);
   }
@@ -244,6 +264,14 @@ export async function getCollection(slug: string, userId: string) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
+
+  if (isTableLayout(collection)) {
+    const [recordCount, lastAt] = await Promise.all([
+      tableRows.countRecords(collection.id),
+      tableRows.lastRecordAt(collection.id),
+    ]);
+    return { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
+  }
 
   const [recordCount, [lastRecord]] = await Promise.all([
     getCollectionRecordCount(collection.id),
@@ -292,7 +320,14 @@ export async function deleteCollection(slug: string, userId: string) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
 
-  await db.delete(collections).where(eq(collections.id, access.collection.id));
+  if (isTableLayout(access.collection)) {
+    await db.transaction(async (tx) => {
+      await dropCollectionTable(tx, access.collection.id);
+      await tx.delete(collections).where(eq(collections.id, access.collection.id));
+    });
+  } else {
+    await db.delete(collections).where(eq(collections.id, access.collection.id));
+  }
   revalidateDashboard(slug);
   return { deleted: true, slug };
 }
@@ -302,7 +337,7 @@ export async function inferCollectionSchema(slug: string, userId: string) {
   if (!access) return null;
   const collection = access.collection;
 
-  const inferred = await inferSchema(collection.id);
+  const inferred = await inferSchema(collection.id, collection.layout);
   const existingSchema = collection.schema as CollectionSchema | null;
   const merged = mergeSchema(existingSchema, inferred);
 
@@ -484,7 +519,7 @@ export async function getCollectionStats(slug: string, userId: string) {
   if (!access) return null;
   const collection = access.collection;
 
-  const [summaryResult, statusResult, fieldResult] = await Promise.all([
+  const [summaryResult, statusResult, fieldResult] = isTableLayout(collection) ? await tableRows.collectionStats(collection.id, STATS_MAX_FIELDS) : await Promise.all([
     db.execute(sql`
       SELECT count(*)::int AS record_count,
              min(created_at)::text AS first_created_at,
@@ -549,8 +584,9 @@ export async function describeCollection(slug: string, userId: string) {
   if (!access) return null;
   const collection = access.collection;
 
-  const recordCount = await getCollectionRecordCount(collection.id);
-  const fields = await describeCollectionFields(collection.id, recordCount);
+  const table = isTableLayout(collection);
+  const recordCount = table ? await tableRows.countRecords(collection.id) : await getCollectionRecordCount(collection.id);
+  const fields = await describeCollectionFields(collection.id, recordCount, collection.layout);
 
   return {
     name: collection.name,
@@ -559,5 +595,26 @@ export async function describeCollection(slug: string, userId: string) {
     recordCount,
     uniqueKey: collection.uniqueKey,
     fields,
+    ...(table ? { storage: await describeStorage(collection) } : {}),
+  };
+}
+
+/**
+ * What inference has created for a table-layout collection: projected
+ * fields and unwound arrays with their reasons and child row counts.
+ */
+async function describeStorage(collection: { id: number; storage: unknown }) {
+  const registry = readRegistry(collection.storage);
+  const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
+  return {
+    layout: "table",
+    evaluated_rows: registry.evaluated_rows,
+    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
+    unwinds: registry.unwinds.map((u) => ({
+      path: u.path,
+      fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
+      rows: counts[u.table] ?? 0,
+      reason: u.reason,
+    })),
   };
 }

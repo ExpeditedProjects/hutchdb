@@ -21,16 +21,22 @@ type FieldInfo = {
   latest?: string;
 };
 
-export async function describeCollection(collectionId: number, totalRecords: number): Promise<FieldInfo[]> {
+export async function describeCollection(collectionId: number, totalRecords: number, layout: string | null = "shared"): Promise<FieldInfo[]> {
   if (totalRecords === 0) return [];
 
   const sampleSize = Math.min(totalRecords, 500);
-  const sampleRecords = await db
-    .select({ data: records.data })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted))
-    .orderBy(sql`random()`)
-    .limit(sampleSize);
+  let sampleRecords: { data: unknown }[];
+  if (layout === "table") {
+    const { sampleDocuments } = await import("./storage/rows");
+    sampleRecords = (await sampleDocuments(collectionId, sampleSize, true)).map((data) => ({ data }));
+  } else {
+    sampleRecords = await db
+      .select({ data: records.data })
+      .from(records)
+      .where(and(eq(records.collectionId, collectionId), notDeleted))
+      .orderBy(sql`random()`)
+      .limit(sampleSize);
+  }
 
   const fieldStats: Record<string, {
     count: number;

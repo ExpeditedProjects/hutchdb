@@ -4,6 +4,7 @@ import { collections, records, collectionMembers, organizations, organizationMem
 import { eq, and, sql, asc, isNull, inArray, SQL } from "drizzle-orm";
 import { FIELD_NAME_RE } from "@/lib/constants";
 import { isPlainObject } from "@/lib/validation";
+import { defaultStorageLayout } from "@/lib/storage/registry";
 
 export const notDeleted = isNull(records.deletedAt);
 
@@ -182,8 +183,13 @@ export async function createCollectionWithOwner(
   }
 ): Promise<typeof collections.$inferSelect> {
   const { ownerUserId, ...collectionValues } = values;
+  // HUTCH_STORAGE_LAYOUT=table gives new collections their own table; unset
+  // (or "shared") leaves the insert exactly as it was, so the column default
+  // ('shared') applies. An explicit layout from the caller always wins.
+  const layout = defaultStorageLayout();
+  const insertValues = layout === "shared" || collectionValues.layout ? collectionValues : { ...collectionValues, layout };
   return db.transaction(async (tx) => {
-    const [created] = await tx.insert(collections).values(collectionValues).returning();
+    const [created] = await tx.insert(collections).values(insertValues).returning();
     await tx
       .insert(collectionMembers)
       .values({ collectionId: created.id, userId: ownerUserId, role: "owner" })
@@ -243,6 +249,8 @@ export type QueryParams = {
   groupBy?: string | string[];
   aggregate?: Record<string, string | Record<string, string>>;
   timeBucket?: string;
+  /** Table layout, aggregates over a nested array only: false omits the embedded parent `record`. */
+  record?: boolean;
   createdAfter?: string;
   createdBefore?: string;
   limit?: number;
@@ -292,7 +300,7 @@ const IN_ARRAY_LIMIT = 1000;
  * nested objects, mixed keys — falls back to JSONB containment, which
  * keeps existing filter call shapes byte-for-byte compatible.
  */
-function isOperatorSpec(value: unknown): value is Record<string, unknown> {
+export function isOperatorSpec(value: unknown): value is Record<string, unknown> {
   if (!isPlainObject(value)) return false;
   const keys = Object.keys(value);
   return keys.length > 0 && keys.every((k) => k.startsWith("$"));
@@ -306,8 +314,11 @@ function isOperatorSpec(value: unknown): value is Record<string, unknown> {
  * jsonb_typeof(data->field) = 'number' so mixed-type fields can't raise
  * cast errors; string operands compare lexicographically as text (which
  * also works for ISO-8601 date strings).
+ *
+ * `data` is the document column: the shared `records.data` by default, or
+ * an aliased column (`t.data`, `e.val`) for the table-layout compiler.
  */
-export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
+export function buildFilterConditions(filter: Record<string, unknown>, data: DataRef = records.data): SQL[] {
   const conditions: SQL[] = [];
   const containment: Record<string, unknown> = {};
 
@@ -319,31 +330,51 @@ export function buildFilterConditions(filter: Record<string, unknown>): SQL[] {
     const path = dottedPathSegments(field);
     if (isOperatorSpec(value)) {
       for (const [op, operand] of Object.entries(value)) {
-        conditions.push(buildOperatorCondition(field, op, operand, path));
+        conditions.push(buildOperatorCondition(field, op, operand, path, data));
       }
     } else if (path) {
-      conditions.push(sql`(${records.data} @> ${JSON.stringify(nestValue(path, value))}::jsonb OR ${records.data} @> ${JSON.stringify({ [field]: value })}::jsonb)`);
+      conditions.push(sql`(${data} @> ${JSON.stringify(nestValue(path, value))}::jsonb OR ${data} @> ${JSON.stringify({ [field]: value })}::jsonb)`);
     } else {
       containment[field] = value;
     }
   }
 
   if (Object.keys(containment).length > 0) {
-    conditions.unshift(sql`${records.data} @> ${JSON.stringify(containment)}::jsonb`);
+    conditions.unshift(sql`${data} @> ${JSON.stringify(containment)}::jsonb`);
   }
 
   return conditions;
 }
 
-function buildOperatorCondition(field: string, op: string, operand: unknown, path: string[] | null = null): SQL {
+/** A reference to the jsonb document column a filter compiles against. */
+export type DataRef = SQL | typeof records.data;
+
+/**
+ * One operator condition. `data` is the document column (see
+ * buildFilterConditions). `literalKey: false` drops the literal top-level
+ * key fallback for dotted paths: the table-layout compiler addresses only
+ * the nested path, so its document route matches its projection columns.
+ */
+export function buildOperatorCondition(
+  field: string,
+  op: string,
+  operand: unknown,
+  path: string[] | null = null,
+  data: DataRef = records.data,
+  literalKey = true,
+): SQL {
   // Top-level fields keep their original `->` / `->>` / `?` SQL; dotted
   // object paths use `#>` / `#>>` with the path bound as a text[] parameter,
   // falling back to a literal top-level key of the same name.
-  const json = path ? sql`coalesce(${records.data} #> ${pathLiteral(path)}::text[], ${records.data}->${field})` : sql`${records.data}->${field}`;
-  const text = path ? sql`coalesce(${records.data} #>> ${pathLiteral(path)}::text[], ${records.data}->>${field})` : sql`${records.data}->>${field}`;
-  const contains = (v: unknown) => path
-    ? sql`(${records.data} @> ${JSON.stringify(nestValue(path, v))}::jsonb OR ${records.data} @> ${JSON.stringify({ [field]: v })}::jsonb)`
-    : sql`${records.data} @> ${JSON.stringify({ [field]: v })}::jsonb`;
+  const json = !path ? sql`${data}->${field}`
+    : literalKey ? sql`coalesce(${data} #> ${pathLiteral(path)}::text[], ${data}->${field})`
+    : sql`${data} #> ${pathLiteral(path)}::text[]`;
+  const text = !path ? sql`${data}->>${field}`
+    : literalKey ? sql`coalesce(${data} #>> ${pathLiteral(path)}::text[], ${data}->>${field})`
+    : sql`${data} #>> ${pathLiteral(path)}::text[]`;
+  const contains = (v: unknown) => !path ? sql`${data} @> ${JSON.stringify({ [field]: v })}::jsonb`
+    : literalKey ? sql`(${data} @> ${JSON.stringify(nestValue(path, v))}::jsonb OR ${data} @> ${JSON.stringify({ [field]: v })}::jsonb)`
+    : sql`${data} @> ${JSON.stringify(nestValue(path, v))}::jsonb`;
 
   if (Object.hasOwn(COMPARISON_OPS, op)) {
     const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
@@ -382,7 +413,7 @@ function buildOperatorCondition(field: string, op: string, operand: unknown, pat
         // `#>` yields SQL NULL only when the key is absent (a stored JSON null is present).
         return operand ? sql`${json} IS NOT NULL` : sql`${json} IS NULL`;
       }
-      return operand ? sql`${records.data} ? ${field}` : sql`NOT (${records.data} ? ${field})`;
+      return operand ? sql`${data} ? ${field}` : sql`NOT (${data} ? ${field})`;
     case "$contains": {
       if (typeof operand !== "string") throw new Error("$contains requires a string operand");
       const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
@@ -394,7 +425,7 @@ function buildOperatorCondition(field: string, op: string, operand: unknown, pat
 }
 
 /** Keep only the requested top-level keys of a record's data (projection). */
-function projectData(data: unknown, fields: string[]): unknown {
+export function projectData(data: unknown, fields: string[]): unknown {
   if (!isPlainObject(data)) return data;
   const projected: Record<string, unknown> = {};
   for (const field of fields) {
@@ -576,7 +607,7 @@ async function runCount(whereClause: SQL): Promise<number> {
   return count;
 }
 
-const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
+export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
 
 /** Internal column carrying the group count; stripped from every result row. */
 const TOTAL_COLUMN = "__hutch_total";
@@ -745,7 +776,7 @@ function escapeFieldPath(field: string): string {
   return field;
 }
 
-function escapeBucket(bucket: string): string {
+export function escapeBucket(bucket: string): string {
   const allowed = ["second", "minute", "hour", "day", "week", "month", "quarter", "year"];
   return allowed.includes(bucket) ? bucket : "day";
 }

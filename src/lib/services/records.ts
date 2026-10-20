@@ -10,10 +10,15 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
+import { collectionTableName, ident, isTableLayout, readRegistry } from "@/lib/storage/registry";
+import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
+import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
+import * as tableRows from "@/lib/storage/rows";
+import { queryTable } from "@/lib/storage/compiler";
 
-async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
+async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null, layout: string | null = "shared") {
   try {
-    const inferred = await inferSchema(collectionId);
+    const inferred = await inferSchema(collectionId, layout);
     const merged = mergeSchema(existingSchema, inferred);
     await db.update(collections).set({ schema: merged, updatedAt: new Date() }).where(eq(collections.id, collectionId));
   } catch {
@@ -121,7 +126,11 @@ export async function createRecords(userId: string, organizationId: string, para
   const uniqueKey = (collection.uniqueKey as string[]) || [];
   const results: { action: string; record: Record<string, unknown> }[] = [];
 
-  if (uniqueKey.length === 0) {
+  if (isTableLayout(collection)) {
+    const stored = await storeInTable(collection, recordsToInsert, onConflict, collectionWasCreated);
+    if ("error" in stored) return stored;
+    results.push(...stored.results);
+  } else if (uniqueKey.length === 0) {
     // Fast path: batch insert all records in a single query
     const created = await db
       .insert(records)
@@ -197,9 +206,20 @@ export async function createRecords(userId: string, organizationId: string, para
   const hasNewFields = recordsToInsert.some((data) => detectNewFields(existingSchema, data));
 
   if (hasNewFields && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema);
+    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
+  }
+
+  // Storage inference (projections, unwinds) runs after every successful
+  // write to a table-layout collection. It must never fail the write.
+  if (isTableLayout(collection)) {
+    try {
+      await markMixedProjections(collection.id, recordsToInsert);
+      await applyInference(collection, recordsToInsert);
+    } catch (err) {
+      console.error(`[storage] inference failed for collection ${collection.id}`, err);
+    }
   }
 
   revalidateDashboard(collection.slug);
@@ -237,6 +257,61 @@ export async function createRecords(userId: string, organizationId: string, para
     ...results[0],
     summary,
   };
+}
+
+type CollectionRow = typeof collections.$inferSelect;
+
+/**
+ * Write path for layout='table' collections: the rows go to hc_<id>.
+ * Upserts use a unique index over the key (see hc_set_unique_key) and
+ * honour every on_conflict mode the shared layout does.
+ */
+async function storeInTable(
+  collection: CollectionRow,
+  docs: Record<string, unknown>[],
+  onConflict: string,
+  collectionWasCreated: boolean,
+): Promise<{ results: { action: string; record: Record<string, unknown> }[] } | { error: string; status: number }> {
+  if (collectionWasCreated || !(await collectionTableExists(db, collection.id))) {
+    await createCollectionTable(db, collection.id);
+  }
+
+  const uniqueKey = (collection.uniqueKey as string[]) || [];
+  if (uniqueKey.length === 0) {
+    const inserted = await tableRows.insertRecords(collection.id, docs);
+    return { results: inserted.map((record) => ({ action: "created", record: record as unknown as Record<string, unknown> })) };
+  }
+
+  const mode = onConflict === "skip" || onConflict === "error" || onConflict === "merge" ? onConflict : "replace";
+
+  const keyError = await ensureUniqueKeyIndex(collection, uniqueKey);
+  if (keyError) return keyError;
+
+  const result = await tableRows.upsertRecords(collection.id, docs, uniqueKey, mode);
+  if ("conflict" in result) {
+    return { error: "Record with matching unique key already exists", status: 409 };
+  }
+  return { results: result.results.map((r) => ({ action: r.action, record: r.record as unknown as Record<string, unknown> })) };
+}
+
+/** Make the table's unique index match the collection's unique_key, if it changed. */
+async function ensureUniqueKeyIndex(collection: CollectionRow, uniqueKey: string[]): Promise<{ error: string; status: number } | null> {
+  const registry = readRegistry(collection.storage);
+  if (JSON.stringify(registry.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+  try {
+    await updateRegistry(collection.id, async (current, tx) => {
+      if (JSON.stringify(current.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+      await setUniqueKey(tx, collection.id, uniqueKey);
+      return { ...current, unique_key: uniqueKey };
+    });
+    return null;
+  } catch (err) {
+    const pg = (err as { cause?: { code?: string } }).cause ?? (err as { code?: string });
+    if (pg && (pg as { code?: string }).code === "23505") {
+      return { error: `Existing records already contain duplicates of unique key [${uniqueKey.join(", ")}] — remove them before storing with on_conflict`, status: 409 };
+    }
+    throw err;
+  }
 }
 
 function tallyActions(results: { action: string }[]): { created: number; updated: number; skipped: number } {
@@ -297,6 +372,14 @@ export async function listRecords(slug: string, userId: string, limit: number = 
 
   const clampedLimit = Math.min(limit, 200);
 
+  if (isTableLayout(collection)) {
+    const [recs, total] = await Promise.all([
+      tableRows.listRecords(collection.id, clampedLimit, offset),
+      tableRows.countRecords(collection.id),
+    ]);
+    return { records: recs, total, limit: clampedLimit, offset };
+  }
+
   const recs = await db
     .select()
     .from(records)
@@ -310,11 +393,17 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
+/** Route a query to the engine that owns the collection's rows. */
+function runQuery(collection: CollectionRow, params: Omit<QueryParams, "collectionId">) {
+  if (isTableLayout(collection)) return queryTable(collection, params);
+  return queryRecordsEngine({ ...params, collectionId: collection.id });
+}
+
 export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
   if (!access) return null;
 
-  return queryRecordsEngine({ ...params, collectionId: access.collection.id });
+  return runQuery(access.collection, params);
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -345,8 +434,7 @@ export async function exportRecords(slug: string, userId: string, params: {
   const format = params.format ?? "json";
   const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
 
-  const result = await queryRecordsEngine({
-    collectionId: access.collection.id,
+  const result = await runQuery(access.collection, {
     filter: params.filter,
     search: params.search,
     sort: params.sort,
@@ -511,6 +599,35 @@ export async function searchGlobal(userId: string, search: string, limit: number
     }
   }
 
+  // Table-layout collections keep their rows in hc_<id>, which the join
+  // above cannot see; search each one the user can access.
+  const tableCollections = await db
+    .select({ id: collections.id, name: collections.name, slug: collections.slug })
+    .from(collections)
+    .innerJoin(
+      collectionMembers,
+      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
+    )
+    .where(eq(collections.layout, "table"));
+  for (const coll of tableCollections) {
+    const rows = await tableRows.searchRecords(coll.id, search, clampedLimit);
+    if (rows.length === 0) continue;
+    grouped.set(coll.id, {
+      collection: { name: coll.name, slug: coll.slug },
+      records: rows.map((r) => ({
+        collectionName: coll.name,
+        collectionSlug: coll.slug,
+        id: r.id,
+        collectionId: coll.id,
+        data: r.data,
+        source: r.source,
+        deletedAt: r.deletedAt,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      })),
+    });
+  }
+
   const results = Array.from(grouped.values()).map((g) => ({
     collection: g.collection,
     matches: g.records.length,
@@ -525,7 +642,11 @@ export async function truncateRecords(slug: string, userId: string) {
   if (!access) return null;
   const collection = access.collection;
 
-  await db.update(records).set({ deletedAt: new Date() }).where(and(eq(records.collectionId, collection.id), notDeleted));
+  if (isTableLayout(collection)) {
+    await tableRows.softDeleteAll(collection.id);
+  } else {
+    await db.update(records).set({ deletedAt: new Date() }).where(and(eq(records.collectionId, collection.id), notDeleted));
+  }
   revalidateDashboard(slug);
   return { truncated: true, slug };
 }
@@ -535,18 +656,28 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   if (!access) return null;
   const collection = access.collection;
 
-  const [updated] = await db
-    .update(records)
-    .set({ data, updatedAt: new Date() })
-    .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
-    .returning();
+  const updated = isTableLayout(collection)
+    ? await tableRows.updateRecordData(collection.id, recordId, data)
+    : (await db
+        .update(records)
+        .set({ data, updatedAt: new Date() })
+        .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
+        .returning())[0];
 
   if (!updated) return { error: "Record not found", status: 404 };
+
+  if (isTableLayout(collection)) {
+    try {
+      await markMixedProjections(collection.id, [data]);
+    } catch (err) {
+      console.error(`[storage] projection check failed for collection ${collection.id}`, err);
+    }
+  }
 
   // Re-infer schema if the updated record has new fields
   const existingSchema = collection.schema as CollectionSchema | null;
   if (detectNewFields(existingSchema, data) && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema);
+    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
@@ -565,6 +696,12 @@ export async function transformRecords(slug: string, userId: string, params: {
   const collection = access.collection;
 
   const { remove_fields, rename_fields, set_field } = params;
+
+  // Table-layout collections run the same statements against hc_<id>;
+  // projection columns are generated from data and the unwind triggers
+  // fire on data changes, so both stay in sync without extra work.
+  const target = isTableLayout(collection) ? ident(collectionTableName(collection.id)) : sql`records`;
+  const scope = isTableLayout(collection) ? sql`` : sql`collection_id = ${collection.id} AND`;
 
   const hasOperation =
     (remove_fields && remove_fields.length > 0) ||
@@ -603,8 +740,8 @@ export async function transformRecords(slug: string, userId: string, params: {
     const fieldsLiteral = `{${remove_fields.join(",")}}`;
     try {
       const result = await db.execute(
-        sql`UPDATE records SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-            WHERE collection_id = ${collection.id} AND data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
+        sql`UPDATE ${target} SET data = data - ${fieldsLiteral}::text[], updated_at = now()
+            WHERE ${scope} data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
             RETURNING id`
       );
       track(result);
@@ -626,11 +763,10 @@ export async function transformRecords(slug: string, userId: string, params: {
       // Verified against node-postgres, which sends params untyped.
       try {
         const result = await db.execute(
-          sql`UPDATE records
+          sql`UPDATE ${target}
               SET data = (data || jsonb_build_object(${newName}::text, data->${oldName}::text)) - ${oldName}::text,
                   updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND data ? ${oldName}
+              WHERE ${scope} data ? ${oldName}
               AND deleted_at IS NULL
               RETURNING id`
         );
@@ -652,21 +788,19 @@ export async function transformRecords(slug: string, userId: string, params: {
       let result;
       if (filter && Object.keys(filter).length > 0) {
         result = await db.execute(
-          sql`UPDATE records
+          sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
                   updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND data @> ${JSON.stringify(filter)}::jsonb
+              WHERE ${scope} data @> ${JSON.stringify(filter)}::jsonb
               AND deleted_at IS NULL
               RETURNING id`
         );
       } else {
         result = await db.execute(
-          sql`UPDATE records
+          sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
                   updated_at = now()
-              WHERE collection_id = ${collection.id}
-              AND deleted_at IS NULL
+              WHERE ${scope} deleted_at IS NULL
               RETURNING id`
         );
       }
@@ -677,11 +811,19 @@ export async function transformRecords(slug: string, userId: string, params: {
     }
   }
 
+  if (isTableLayout(collection) && touched.size > 0) {
+    try {
+      await recheckMixedProjections(collection.id);
+    } catch (err) {
+      console.error(`[storage] projection check failed for collection ${collection.id}`, err);
+    }
+  }
+
   // Re-infer schema if fields were added or renamed (skip for remove-only)
   const existingSchema = collection.schema as CollectionSchema | null;
   const needsReinference = !!(set_field || rename_fields) && touched.size > 0;
   if (needsReinference && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema);
+    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
@@ -708,11 +850,13 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
   if (!access) return null;
   const collection = access.collection;
 
-  const [updated] = await db
-    .update(records)
-    .set({ status, updatedAt: new Date() })
-    .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
-    .returning();
+  const updated = isTableLayout(collection)
+    ? await tableRows.setRecordStatus(collection.id, recordId, status)
+    : (await db
+        .update(records)
+        .set({ status, updatedAt: new Date() })
+        .where(and(eq(records.id, recordId), eq(records.collectionId, collection.id), notDeleted))
+        .returning())[0];
 
   if (!updated) return { error: "Record not found", status: 404 };
 
@@ -724,6 +868,13 @@ export async function deleteRecord(slug: string, userId: string, recordId: numbe
   const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
   if (!access) return null;
   const collection = access.collection;
+
+  if (isTableLayout(collection)) {
+    const deleted = await tableRows.softDeleteRecord(collection.id, recordId);
+    if (!deleted) return { error: "Record not found", status: 404 };
+    revalidateDashboard(slug);
+    return { deleted: true, id: recordId };
+  }
 
   const [existing] = await db
     .select({ id: records.id })

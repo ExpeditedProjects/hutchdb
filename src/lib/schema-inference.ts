@@ -130,7 +130,11 @@ export function inferSchemaFromData(dataRows: Record<string, unknown>[]): Collec
   };
 }
 
-export async function inferSchema(collectionId: number): Promise<CollectionSchema> {
+export async function inferSchema(collectionId: number, layout: string | null = "shared"): Promise<CollectionSchema> {
+  if (layout === "table") {
+    const { sampleDocuments } = await import("./storage/rows");
+    return inferSchemaFromData(await sampleDocuments(collectionId, 500));
+  }
   const sampleRecords = await db
     .select({ data: records.data })
     .from(records)
