@@ -46,6 +46,11 @@ describe('describeDbError', () => {
     for (const leak of LEAKS) expect(text).not.toMatch(leak)
   })
 
+  it('gives batching advice for writes', () => {
+    const text = describeDbError(wrapped('57014', 'x'), { tool: 'hutch_store_records', collection: 'orders', write: true })
+    expect(text).toMatch(/^hutch_store_records timed out after 5s on collection 'orders'\. Send smaller batches/)
+  })
+
   it('reports the configured statement timeout', () => {
     process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = '2500'
     expect(statementTimeoutMs()).toBe(2500)

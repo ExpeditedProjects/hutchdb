@@ -287,6 +287,16 @@ describe('database error classification', () => {
     consoleError.mockRestore()
   })
 
+  it('gives write tools batching advice on a timeout instead of query advice', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.importRecords).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    const result = await registeredTools.get('hutch_import_records')!({ collection: 'orders', content: 'a\n1' }) as { content: { text: string }[] }
+    expect(result.content[0].text).toMatch(/^hutch_import_records timed out after 5s on collection 'orders'\. Send smaller batches/)
+    expect(result.content[0].text).not.toMatch(/Narrow the filter/)
+    consoleError.mockRestore()
+  })
+
   it('says a value did not match a type for invalid-input errors, without echoing SQL', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     createMcpServer('user-1', 'org-test', 'https://example.test')

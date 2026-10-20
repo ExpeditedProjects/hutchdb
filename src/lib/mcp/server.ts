@@ -152,7 +152,8 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
               // The hint is best effort; the timeout message stands without it.
             }
           }
-          return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint }));
+          const write = (config as { annotations?: ToolAnnotations }).annotations?.readOnlyHint !== true;
+          return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint, write }));
         }
         throw err;
       }

@@ -108,6 +108,8 @@ export type DbErrorContext = {
   collection?: string;
   /** Extra sentence(s) appended to a timeout message (e.g. index state). */
   timeoutHint?: string;
+  /** The operation writes: a timeout gets batching advice instead of query advice. */
+  write?: boolean;
 };
 
 /**
@@ -121,7 +123,10 @@ export function describeDbError(err: unknown, ctx: DbErrorContext): string {
   const on = ctx.collection ? ` on collection '${ctx.collection}'` : "";
   if (kind === "timeout") {
     const hint = ctx.timeoutHint ? ` ${ctx.timeoutHint}` : "";
-    return `${ctx.tool} timed out after ${formatTimeout()}${on}. Narrow the filter, use limit: 0 to count instead of fetching, or request fewer fields; full-text search and $contains over large text read every document. Retrying the same request will time out again.${hint}`;
+    const advice = ctx.write
+      ? "Send smaller batches or touch fewer records per call, and check what was saved (hutch_query_records with limit: 0 counts) before retrying."
+      : "Narrow the filter, use limit: 0 to count instead of fetching, or request fewer fields; full-text search and $contains over large text read every document. Retrying the same request will time out again.";
+    return `${ctx.tool} timed out after ${formatTimeout()}${on}. ${advice}${hint}`;
   }
   if (kind === "invalid_input") {
     const type = expectedType(findPgError(err)?.message ?? "");
