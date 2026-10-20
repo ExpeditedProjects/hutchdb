@@ -715,3 +715,25 @@ describe('compileQuery: count of a path, first, group_by keys', () => {
     expect(() => compile({ groupBy: ['a', 'b', 'c', 'd', 'e', 'f'] })).toThrow(/at most 5 keys/)
   })
 })
+
+describe('compileQuery: limit 0 counts', () => {
+  it('a records query with limit 0 compiles to the count only, with the filter clauses but not the sort', () => {
+    const compiled = compileQuery(collection, { filter: { price: 10 }, sort: '-status', limit: 0 })
+    expect(compiled.kind).toBe('records')
+    if (compiled.kind !== 'records') return
+    expect(compiled.countOnly).toBe(true)
+    expect(compiled.limit).toBe(0)
+    expect(dialect.sqlToQuery(compiled.query).sql).toMatch(/^SELECT count\(\*\)::int AS count FROM "hc_12" t WHERE .*"p_price" = \$1::float8$/)
+    expect(compiled.clauses.map((c) => c.label)).toEqual(['filter on price'])
+  })
+
+  it('an aggregate with limit 0 still reads one row for the group total and reports limit 0', () => {
+    const compiled = compileQuery(collection, { groupBy: 'status', limit: 0 })
+    expect(compiled.limit).toBe(0)
+    expect(dialect.sqlToQuery(compiled.query).params.at(-1)).toBe(1)
+  })
+
+  it('a negative limit is an error', () => {
+    expect(() => compileQuery(collection, { limit: -1 })).toThrow(/0 or more/)
+  })
+})

@@ -355,6 +355,11 @@ describe('query, store and import descriptions', () => {
     expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
   })
 
+  it('documents limit: 0 as count-only', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(shapeOf('hutch_query_records').limit.description).toMatch(/limit: 0 only counts: the response has total and no records/)
+  })
+
   it('accepts group_by as a string or up to 5 keys', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const groupBy = shapeOf('hutch_query_records').group_by

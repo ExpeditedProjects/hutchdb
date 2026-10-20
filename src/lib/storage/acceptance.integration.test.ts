@@ -495,4 +495,33 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       await expect(query(projected, { groupBy: [...KEYS, "votes.vote"] })).rejects.toThrow(/at most 5 keys/);
     });
   });
+
+  // ── 5. limit: 0 counts ────────────────────────────────────────────────────
+
+  describe("limit: 0", () => {
+    const docs = makeQuestions(300);
+
+    it("returns total and no records, for records and aggregates, projected or not", async () => {
+      const { projected, plain } = await twin(docs);
+      const matching = docs.filter((d) => d.owner_user_id === 4);
+      const groups = new Set(docs.flatMap((d) => d.answers.map((a) => a.is_accepted))).size;
+      for (const slug of [projected, plain]) {
+        const r = await query(slug, { filter: { owner_user_id: 4 }, fields: ["question_id"], limit: 0 });
+        expect(r).toMatchObject({ records: [], total: matching.length, count: 0, limit: 0, has_more: true, next_offset: 0 });
+        const a = await query(slug, { groupBy: "owner_user_id", aggregate: { n: "count" }, limit: 0 });
+        expect(a).toMatchObject({ results: [], total: 17, count: 0, limit: 0 });
+        const nested = await query(slug, { groupBy: "answers.is_accepted", perRecord: true, limit: 0 });
+        expect(nested).toMatchObject({ results: [], count: 0, limit: 0 });
+        expect(nested.total).toBe(docs.reduce((s, d) => s + new Set(d.answers.map((x) => x.is_accepted)).size, 0));
+        expect(groups).toBe(2);
+        const none = await query(slug, { filter: { owner_user_id: 999 }, limit: 0 });
+        expect(none).toMatchObject({ records: [], total: 0, has_more: false, next_offset: null });
+      }
+    });
+
+    it("a negative limit is an error", async () => {
+      const { projected } = await twin(docs.slice(0, 10));
+      await expect(query(projected, { limit: -5 })).rejects.toThrow(/0 or more/);
+    });
+  });
 });

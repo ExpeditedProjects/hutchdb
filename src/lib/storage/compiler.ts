@@ -119,6 +119,8 @@ export type Clause = { label: string; indexes: string[]; note?: string };
 export type CompiledQuery =
   | {
       kind: "records";
+      /** limit: 0 — run countQuery only. */
+      countOnly: boolean;
       query: SQL;
       countQuery: SQL;
       limit: number;
@@ -136,6 +138,7 @@ export type CompiledQuery =
   | {
       kind: "aggregate";
       query: SQL;
+      /** 0 for a count-only query (limit: 0): the statement still runs with LIMIT 1 to read the group total. */
       limit: number;
       /** Set when rows are per parent record (perRecord), so the parent can be attached. */
       nested: { path: string; route: "child" | "lateral" } | null;
@@ -929,7 +932,10 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
     clauses.push({ label: "created_before", indexes: [indexName(parentTable, "created_at")] });
   }
 
-  const clampedLimit = Math.min(Math.max(limit, 1), Math.min(limitCap, TABLE_LIMIT_CAP));
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) throw new Error("limit must be a number, 0 or more (0 returns only total)");
+  // limit: 0 counts: the response has total and no records (or groups).
+  const countOnly = limit === 0;
+  const clampedLimit = Math.min(Math.max(Math.floor(limit), 1), Math.min(limitCap, TABLE_LIMIT_CAP));
   const groupKeys = normalizeGroupBy(groupBy);
 
   if (groupKeys.length > 0 || aggregate) {
@@ -939,6 +945,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
       timeBucket,
       sortKeys: keys,
       limit: clampedLimit,
+      countOnly,
       perRecord: params.perRecord === true,
       scalarArrayKeys: new Set(options.scalarArrayKeys ?? []),
     });
@@ -946,12 +953,19 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
 
   const where = sql.join([...parent, ...existsConditions(parsed)], sql` AND `);
   const sorted = compileRecordSort(ctx, keys);
+  // A count-only query has no order, so only the filter's clauses can be served.
+  const countClauses = [...clauses];
   clauses.push(...sorted.clauses);
+  if (countOnly) {
+    const countQuery = sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where}`;
+    return { kind: "records", countOnly, query: countQuery, countQuery, limit: 0, offset, fields, clauses: countClauses };
+  }
   const countQuery = sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where}`;
   const column = sorted.descendingColumn;
   if (column) {
     return {
       kind: "records",
+      countOnly,
       query: sql`SELECT ${RECORD_COLUMNS} FROM ${table} t WHERE ${where} AND ${column} IS NOT NULL ORDER BY ${column} DESC, t.id ASC LIMIT ${clampedLimit} OFFSET ${offset}`,
       countQuery,
       limit: clampedLimit,
@@ -966,6 +980,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
   }
   return {
     kind: "records",
+    countOnly,
     query: sql`SELECT ${RECORD_COLUMNS} FROM ${table} t WHERE ${where} ORDER BY ${sorted.orderBy} LIMIT ${clampedLimit} OFFSET ${offset}`,
     countQuery,
     limit: clampedLimit,
@@ -1004,10 +1019,10 @@ function compileAggregate(
   parsed: ParsedFilter,
   parent: SQL[],
   clauses: Clause[],
-  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; perRecord: boolean; scalarArrayKeys: Set<string> },
+  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; countOnly: boolean; perRecord: boolean; scalarArrayKeys: Set<string> },
 ): CompiledQuery {
   const { registry } = ctx;
-  const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, perRecord, scalarArrayKeys } = params;
+  const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, countOnly, perRecord, scalarArrayKeys } = params;
   const aggs = parseAggregate(aggregate);
 
   // Which nested array (if any) this aggregation runs over.
@@ -1143,7 +1158,7 @@ function compileAggregate(
   return {
     kind: "aggregate",
     query,
-    limit,
+    limit: countOnly ? 0 : limit,
     nested: path && route && perRecord ? { path, route } : null,
     stripPaths: [...new Set([...registry.unwinds.map((u) => u.path), ...(path ? [path] : [])])],
     clauses,
@@ -1461,8 +1476,8 @@ export async function queryTable(collection: Collection, params: TableQueryParam
     const total = raw.length > 0 ? Number(raw[0].__total) : 0;
     const hidden = new Set(["__total", ...compiled.typeChecks.map((c) => c.column)]);
     const warnings = typeCheckWarnings(compiled.typeChecks, raw);
-    let results = raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
-    if (compiled.nested && params.record !== false) {
+    let results = compiled.limit === 0 ? [] : raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
+    if (compiled.nested && params.record !== false && results.length > 0) {
       const ids = [...new Set(results.map((r) => Number(r.parent_id)))];
       // Without fields the record carries its top-level scalars, plus any array array_sort/array_limit names.
       const extra = [...new Set(arrayOps.map((op) => op.path.split(".")[0]))];
@@ -1474,6 +1489,11 @@ export async function queryTable(collection: Collection, params: TableQueryParam
   }
 
   const { query, countQuery, limit, offset, fields, nullsLast } = compiled;
+  if (compiled.countOnly) {
+    const [countRows, report] = await Promise.all([db.execute(countQuery), explain(collection.id, countQuery, compiled.clauses)]);
+    const total = (countRows.rows[0] as { count: number }).count;
+    return { records: [], total, count: 0, limit: 0, offset, has_more: offset < total, next_offset: offset < total ? offset : null, ...report };
+  }
   const [rowsResult, report] = await Promise.all([db.execute(query), explain(collection.id, query, compiled.clauses)]);
   const rows = (rowsResult.rows as Parameters<typeof toRecord>[1][]).map((r) => toRecord(collection.id, r));
 

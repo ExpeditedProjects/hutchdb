@@ -262,7 +262,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         time_bucket: z.string().optional().describe("Time bucket (hour, day, week, month, year)"),
         created_after: z.string().optional().describe("Filter records created after this ISO date (e.g. \"2026-07-01\" or \"2026-07-01T12:00:00Z\")"),
         created_before: z.string().optional().describe("Filter records created before this ISO date (e.g. \"2026-07-18\")"),
-        limit: z.number().optional().describe("Max records to return (default 50, max 1000)"),
+        limit: z.number().optional().describe("Max records (or groups, with group_by/aggregate) to return (default 50, max 1000). limit: 0 only counts: the response has total and no records — the number of matching records, or of groups for an aggregate."),
         offset: z.number().optional().describe("Offset for pagination"),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
