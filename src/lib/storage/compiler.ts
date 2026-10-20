@@ -1476,10 +1476,15 @@ async function assertShapingPaths(collection: Collection, registry: StorageRegis
   }
 }
 
-/** array_sort/array_limit, then fields, on one returned document. */
-function shapeData(data: unknown, fields: string[] | undefined, arrayOps: ArrayOps): unknown {
-  const ordered = applyArrayOps(data, arrayOps);
-  return fields && fields.length > 0 ? projectData(ordered, fields) : ordered;
+/**
+ * array_sort/array_limit, then fields, on one returned record. When
+ * array_limit cut an array, the record carries `array_totals` with the
+ * array's full length ({"votes": 330}).
+ */
+function shapeRecord<R extends { data: unknown }>(record: R, fields: string[] | undefined, arrayOps: ArrayOps): R & { array_totals?: Record<string, number> } {
+  const { data, totals } = applyArrayOps(record.data, arrayOps);
+  const shaped = fields && fields.length > 0 ? projectData(data, fields) : data;
+  return { ...record, data: shaped, ...(Object.keys(totals).length > 0 ? { array_totals: totals } : {}) };
 }
 
 export async function queryTable(collection: Collection, params: TableQueryParams): Promise<TableRecordsResult | TableAggregateResult> {
@@ -1509,7 +1514,7 @@ export async function queryTable(collection: Collection, params: TableQueryParam
       // Without fields the record carries its top-level scalars, plus any array array_sort/array_limit names.
       const extra = [...new Set(arrayOps.map((op) => op.path.split(".")[0]))];
       const fetched = await fetchEmbeddedRecords(collection.id, ids, fieldsGiven ? fieldHeads(params.fields!) : undefined, extra);
-      const parents = new Map(fetched.map((r) => [r.id, fieldsGiven || arrayOps.length > 0 ? { ...r, data: shapeData(r.data, params.fields, arrayOps) } : r]));
+      const parents = new Map(fetched.map((r) => [r.id, fieldsGiven || arrayOps.length > 0 ? shapeRecord(r, params.fields, arrayOps) : r]));
       results = results.map((r) => ({ ...r, record: parents.get(Number(r.parent_id)) ?? null }));
     }
     // Count-only (limit 0) never pages; otherwise has_more/next_offset page through the groups like records.
@@ -1556,7 +1561,7 @@ export async function queryTable(collection: Collection, params: TableQueryParam
     total = (countRows.rows[0] as { count: number }).count;
   }
 
-  const projected = fieldsGiven || arrayOps.length > 0 ? rows.map((r) => ({ ...r, data: shapeData(r.data, fields, arrayOps) })) : rows;
+  const projected = fieldsGiven || arrayOps.length > 0 ? rows.map((r) => shapeRecord(r, fields, arrayOps)) : rows;
   const hasMore = offset + rows.length < total;
   return {
     records: projected,

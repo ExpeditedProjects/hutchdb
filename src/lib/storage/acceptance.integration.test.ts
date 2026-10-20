@@ -294,6 +294,11 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       for (const slug of [projected, plain]) {
         const r = await query(slug, { filter, fields: ["question_id", "answers.answer_id", "answers.score"], arraySort: { answers: "-score,answer_id" }, arrayLimit: { answers: 2 } });
         expect(dataById(r)).toEqual(expected);
+        // array_totals reports the full length of each array array_limit cut, and nothing for arrays it left whole.
+        for (const rec of r.records! as { data: Question; array_totals?: Record<string, number> }[]) {
+          const full = docs.find((d) => d.question_id === rec.data.question_id)!.answers.length;
+          expect(rec.array_totals).toEqual(full > 2 ? { answers: full } : undefined);
+        }
       }
     });
 

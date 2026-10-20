@@ -85,23 +85,27 @@ describe("array_sort / array_limit", () => {
   });
 
   it("sorts ascending in code-point order with missing names last, keeping original order on ties", () => {
-    const out = applyArrayOps(voters, parseArrayOps({ votes: "name" }, undefined)) as typeof voters;
+    const out = applyArrayOps(voters, parseArrayOps({ votes: "name" }, undefined)).data as typeof voters;
     expect(out.votes.map((v) => v.name ?? null)).toEqual(["Ab", "al", "bo", "cy", null]);
   });
 
   it("sorts descending numerically with nulls still last, then breaks ties on the next key", () => {
-    const out = applyArrayOps(voters, parseArrayOps({ votes: "-pts,name" }, { votes: 4 })) as typeof voters;
+    const { data, totals } = applyArrayOps(voters, parseArrayOps({ votes: "-pts,name" }, { votes: 4 }));
+    const out = data as typeof voters;
+    expect(totals).toEqual({ votes: 5 });
     expect(out.votes).toEqual([{ name: "bo", pts: 5 }, { pts: 5 }, { name: "cy", pts: 2 }, { name: "Ab", pts: 1 }]);
   });
 
   it("limits without sorting, and leaves a document without the array alone", () => {
-    expect(applyArrayOps(voters, parseArrayOps(undefined, { votes: 1 }))).toEqual({ votes: [{ name: "cy", pts: 2 }] });
-    expect(applyArrayOps({ votes: "n/a" }, parseArrayOps(undefined, { votes: 1 }))).toEqual({ votes: "n/a" });
+    expect(applyArrayOps(voters, parseArrayOps(undefined, { votes: 1 }))).toEqual({ data: { votes: [{ name: "cy", pts: 2 }] }, totals: { votes: 5 } });
+    // A limit that cuts nothing reports no total.
+    expect(applyArrayOps(voters, parseArrayOps(undefined, { votes: 9 })).totals).toEqual({});
+    expect(applyArrayOps({ votes: "n/a" }, parseArrayOps(undefined, { votes: 1 }))).toEqual({ data: { votes: "n/a" }, totals: {} });
   });
 
   it("reaches an array below an object and never mutates the input", () => {
     const doc = { page: { items: [{ n: 2 }, { n: 1 }] } };
-    expect(applyArrayOps(doc, parseArrayOps({ "page.items": "n" }, undefined))).toEqual({ page: { items: [{ n: 1 }, { n: 2 }] } });
+    expect(applyArrayOps(doc, parseArrayOps({ "page.items": "n" }, undefined)).data).toEqual({ page: { items: [{ n: 1 }, { n: 2 }] } });
     expect(doc.page.items[0].n).toBe(2);
   });
 });

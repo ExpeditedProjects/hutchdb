@@ -187,21 +187,27 @@ function sortArray(arr: unknown[], keys: ArraySortKey[]): unknown[] {
 }
 
 /**
- * Apply array_sort/array_limit to one document, returning a new document.
- * A path that does not hold an array in this document is left as it is.
+ * Apply array_sort/array_limit to one document, returning a new document
+ * and, for each array that array_limit cut, its full length (`totals`), so
+ * a response can say how many elements there were. A path that does not
+ * hold an array in this document is left as it is.
  */
-export function applyArrayOps(data: unknown, ops: ArrayOps): unknown {
-  if (ops.length === 0 || !isPlainObject(data)) return data;
+export function applyArrayOps(data: unknown, ops: ArrayOps): { data: unknown; totals: Record<string, number> } {
+  const totals: Record<string, number> = {};
+  if (ops.length === 0 || !isPlainObject(data)) return { data, totals };
   let out: Record<string, unknown> = data;
   for (const op of ops) {
     const segments = op.path.split(".");
     const arr = readPath(out, segments);
     if (!Array.isArray(arr)) continue;
     let next = op.sort.length > 0 ? sortArray(arr, op.sort) : arr;
-    if (op.limit !== undefined) next = next.slice(0, op.limit);
+    if (op.limit !== undefined && next.length > op.limit) {
+      totals[op.path] = next.length;
+      next = next.slice(0, op.limit);
+    }
     out = setPath(out, segments, next);
   }
-  return out;
+  return { data: out, totals };
 }
 
 function setPath(obj: Record<string, unknown>, segments: string[], value: unknown): Record<string, unknown> {
