@@ -265,14 +265,49 @@ describe('database error classification', () => {
     consoleError.mockRestore()
   })
 
-  it('adds the failed-index hint to a timeout when the collection has one', async () => {
+  it('adds the failed-index hint to a query timeout when the collection has one', async () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     createMcpServer('user-1', 'org-test', 'https://example.test')
-    vi.mocked(collectionService.describeCollection).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    vi.mocked(recordService.queryRecords).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
     vi.mocked(collectionService.storageTimeoutHint).mockResolvedValue("Building indexes for 'author' on this collection failed.")
 
-    const result = await registeredTools.get('hutch_describe_collection')!({ slug: 'articles' }) as { content: { text: string }[] }
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'articles', filter: { author: 'x' } }) as { content: { text: string }[] }
     expect(result.content[0].text).toMatch(/timed out after 5s on collection 'articles'.*Building indexes for 'author'/)
+    consoleError.mockRestore()
+  })
+
+  it('gives describe, stats and search timeouts advice for their own inputs, without the index-build hint', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const timeout = pgWrapped('57014', 'canceling statement due to statement timeout')
+    vi.mocked(collectionService.describeCollection).mockRejectedValue(timeout)
+    vi.mocked(collectionService.getCollectionStats).mockRejectedValue(timeout)
+    vi.mocked(recordService.searchGlobal).mockRejectedValue(timeout)
+    vi.mocked(collectionService.storageTimeoutHint).mockResolvedValue("Building indexes for 'author' on this collection failed.")
+
+    const describe = (await registeredTools.get('hutch_describe_collection')!({ slug: 'articles' }) as { content: { text: string }[] }).content[0].text
+    expect(describe).toMatch(/^hutch_describe_collection timed out after 5s on collection 'articles'\. To see the fields another way, fetch a few records with hutch_query_records/)
+    const stats = (await registeredTools.get('hutch_collection_stats')!({ slug: 'articles' }) as { content: { text: string }[] }).content[0].text
+    expect(stats).toMatch(/^hutch_collection_stats timed out after 5s on collection 'articles'\. For the record count alone use hutch_query_records with limit: 0/)
+    const search = (await registeredTools.get('hutch_search')!({ search: 'quantum' }) as { content: { text: string }[] }).content[0].text
+    expect(search).toMatch(/^hutch_search timed out after 5s\. hutch_search looks in every collection; to search one collection, use hutch_query_records with search/)
+    for (const text of [describe, stats, search]) {
+      expect(text).not.toMatch(/Narrow the filter|limit: 0 to count|fewer fields|Building indexes|time out again/)
+    }
+    expect(collectionService.storageTimeoutHint).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
+
+  it('gives grouped queries aggregate advice instead of paging advice', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    vi.mocked(collectionService.storageTimeoutHint).mockResolvedValue(undefined)
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'orders', group_by: 'status', aggregate: { n: 'count' } }) as { content: { text: string }[] }
+    const text = result.content[0].text
+    expect(text).toMatch(/^hutch_query_records timed out after 5s on collection 'orders'\. Grouped and aggregate queries read every record the filter matches/)
+    expect(text).toMatch(/fewer aggregates/)
+    expect(text).not.toMatch(/limit: 0|fewer fields|time out again/)
     consoleError.mockRestore()
   })
 

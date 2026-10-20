@@ -110,7 +110,41 @@ export type DbErrorContext = {
   timeoutHint?: string;
   /** The operation writes: a timeout gets batching advice instead of query advice. */
   write?: boolean;
+  /** The tool's arguments, for advice that fits what was asked (a grouped query vs a page of records). */
+  args?: Record<string, unknown>;
 };
+
+/** Points at the index list, for advice to filter on an indexed field. */
+const INDEXED_FIELDS = "ideally on an indexed field (hutch_describe_collection lists them under storage.indexes)";
+
+/** Read-only tools: heavy requests run side by side slow each other down. */
+const ONE_AT_A_TIME = "Several heavy requests at once slow each other down, so run them one at a time.";
+
+/**
+ * What to change after a read timed out, in terms of the inputs the tool
+ * actually takes. Never claims a retry is bound to fail: the same request
+ * can succeed once concurrent load is gone.
+ */
+export function timeoutAdvice(tool: string, args: Record<string, unknown> = {}): string {
+  const has = (key: string) => args[key] !== undefined && args[key] !== null;
+  switch (tool) {
+    case "hutch_query_records":
+      if (has("group_by") || has("aggregate") || has("time_bucket")) {
+        return `Grouped and aggregate queries read every record the filter matches: add or narrow a filter, ${INDEXED_FIELDS}, or ask for fewer aggregates per call. ${ONE_AT_A_TIME}`;
+      }
+      return `Narrow the filter, ${INDEXED_FIELDS}, use limit: 0 to count instead of fetching, or request fewer fields; $contains, and search on a collection whose full-text index is not ready, read every document. ${ONE_AT_A_TIME}`;
+    case "hutch_export_records":
+      return `Narrow the filter, ${INDEXED_FIELDS}, or export fewer records (limit) or fields per call; $contains, and search on a collection whose full-text index is not ready, read every document. ${ONE_AT_A_TIME}`;
+    case "hutch_search":
+      return `hutch_search looks in every collection; to search one collection, use hutch_query_records with search (plus a filter to narrow it). ${ONE_AT_A_TIME}`;
+    case "hutch_describe_collection":
+      return `To see the fields another way, fetch a few records with hutch_query_records (limit: 2, max_string_length: 200), or call hutch_collection_stats for field fill rates. ${ONE_AT_A_TIME}`;
+    case "hutch_collection_stats":
+      return `For the record count alone use hutch_query_records with limit: 0; hutch_describe_collection lists the fields from a sample. ${ONE_AT_A_TIME}`;
+    default:
+      return "This reads little data, so the database was busy or a table was locked (for example by an index build); the same request may succeed when the server is less busy.";
+  }
+}
 
 /**
  * Client-safe text for a database failure: what happened, and what to
@@ -125,7 +159,7 @@ export function describeDbError(err: unknown, ctx: DbErrorContext): string {
     const hint = ctx.timeoutHint ? ` ${ctx.timeoutHint}` : "";
     const advice = ctx.write
       ? "Send smaller batches or touch fewer records per call, and check what was saved (hutch_query_records with limit: 0 counts) before retrying."
-      : "Narrow the filter, use limit: 0 to count instead of fetching, or request fewer fields; full-text search and $contains over large text read every document. Retrying the same request will time out again.";
+      : timeoutAdvice(ctx.tool, ctx.args);
     return `${ctx.tool} timed out after ${formatTimeout()}${on}. ${advice}${hint}`;
   }
   if (kind === "invalid_input") {

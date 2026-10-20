@@ -145,8 +145,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
           const params = (args[0] ?? {}) as { slug?: unknown; collection?: unknown };
           const collection = typeof params.slug === "string" ? params.slug
             : typeof params.collection === "string" ? params.collection : undefined;
+          // Index build states explain slow filters, sorts and search, so
+          // only the tools that run them get the hint.
           let timeoutHint: string | undefined;
-          if (collection && classifyDbError(err) === "timeout") {
+          if (collection && classifyDbError(err) === "timeout" && (name === "hutch_query_records" || name === "hutch_export_records")) {
             try {
               timeoutHint = await collectionService.storageTimeoutHint(collection, userId);
             } catch {
@@ -154,7 +156,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
             }
           }
           const write = (config as { annotations?: ToolAnnotations }).annotations?.readOnlyHint !== true;
-          return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint, write }));
+          return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint, write, args: params as Record<string, unknown> }));
         }
         throw err;
       }

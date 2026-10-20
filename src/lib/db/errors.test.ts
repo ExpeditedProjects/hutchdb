@@ -1,6 +1,6 @@
 import { describe, it, expect, afterEach } from 'vitest'
 import { DrizzleQueryError } from 'drizzle-orm'
-import { classifyDbError, describeDbError, findPgError, formatTimeout, statementTimeoutMs } from './errors'
+import { classifyDbError, describeDbError, findPgError, formatTimeout, statementTimeoutMs, timeoutAdvice } from './errors'
 
 /** A node-postgres DatabaseError as drizzle wraps it. */
 function pgError(code: string, message: string): Error {
@@ -44,6 +44,28 @@ describe('describeDbError', () => {
     expect(text).toMatch(/limit: 0/)
     expect(text).toMatch(/fewer fields/)
     for (const leak of LEAKS) expect(text).not.toMatch(leak)
+  })
+
+  it('never claims a retry is bound to fail, for any tool', () => {
+    for (const tool of ['hutch_query_records', 'hutch_export_records', 'hutch_search', 'hutch_describe_collection', 'hutch_collection_stats', 'hutch_get_collection', 'hutch_list_collections']) {
+      for (const args of [{}, { group_by: 'status' }]) {
+        expect(describeDbError(wrapped('57014', 'x'), { tool, args })).not.toMatch(/will time out again|always time out/)
+      }
+    }
+  })
+
+  it('fits the advice to the tool and the query shape', () => {
+    const grouped = timeoutAdvice('hutch_query_records', { group_by: 'status', aggregate: { n: 'count' } })
+    expect(grouped).toMatch(/^Grouped and aggregate queries read every record the filter matches/)
+    expect(grouped).toMatch(/indexed field/)
+    expect(timeoutAdvice('hutch_query_records', { time_bucket: { field: 'ts', interval: 'day' } })).toMatch(/^Grouped and aggregate/)
+    expect(timeoutAdvice('hutch_query_records', { filter: { a: 1 } })).toMatch(/^Narrow the filter.*limit: 0/)
+    expect(timeoutAdvice('hutch_export_records')).toMatch(/export fewer records \(limit\)/)
+    expect(timeoutAdvice('hutch_export_records')).not.toMatch(/limit: 0/)
+    expect(timeoutAdvice('hutch_search')).toMatch(/hutch_query_records with search/)
+    expect(timeoutAdvice('hutch_describe_collection')).not.toMatch(/filter|limit: 0/)
+    expect(timeoutAdvice('hutch_collection_stats')).not.toMatch(/filter|fields;/)
+    expect(timeoutAdvice('hutch_get_collection')).toMatch(/may succeed when the server is less busy/)
   })
 
   it('gives batching advice for writes', () => {
