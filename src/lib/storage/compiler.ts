@@ -10,6 +10,7 @@ import {
   type QueryParams,
 } from "@/lib/db/queries";
 import { isPlainObject } from "@/lib/validation";
+import { formatTimeout, isStatementTimeout } from "@/lib/db/errors";
 import {
   collectionTableName,
   findPathProjection,
@@ -76,7 +77,8 @@ export const SORT_HELP =
   "and with group_by/aggregate, an aggregate alias or a group_by key — optionally prefixed with - for descending; " +
   `up to ${MAX_SORT_KEYS} keys as a comma-separated list or an array, the first deciding first`;
 
-type Collection = { id: number; storage: unknown };
+/** `schema` (the saved field list, inferred from a sample) is optional: only error messages read it. */
+type Collection = { id: number; storage: unknown; schema?: unknown };
 
 /**
  * QueryParams for a collection table: `sort` may also be an array
@@ -1391,11 +1393,13 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
   let exists = sortPathCache.get(key);
   if (exists === undefined) {
     const table = ident(collectionTableName(collection.id));
-    const r = await db.execute(sql`
-      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
-             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-    const row = r.rows[0] as { found: boolean; empty: boolean };
-    exists = row.found || row.empty;
+    exists = await probeExists(collection, field, "sort field", async () => {
+      const r = await db.execute(sql`
+        SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
+               (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+      const row = r.rows[0] as { found: boolean; empty: boolean };
+      return row.found || row.empty;
+    });
     sortPathCache.set(key, exists);
   }
   if (!exists) {
@@ -1426,13 +1430,47 @@ async function pathExists(collection: Collection, registry: StorageRegistry, fie
   const test = asArray
     ? sql`jsonb_typeof(data #> ${pathArray(segments)}) = 'array'`
     : sql`(data @? ${`lax $${segments.map(jsonpathKey).join("")}`}::jsonpath OR data ? ${field}::text)`;
-  const r = await db.execute(sql`
-    SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
-           (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-  const row = r.rows[0] as { found: boolean; empty: boolean };
-  const exists = row.found || row.empty;
+  const exists = await probeExists(collection, field, asArray ? "array path" : "field", async () => {
+    const r = await db.execute(sql`
+      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
+             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+    const row = r.rows[0] as { found: boolean; empty: boolean };
+    return row.found || row.empty;
+  });
   fieldPathCache.set(key, exists);
   return exists;
+}
+
+/** Top-level field names in the collection's saved schema (inferred from a sample of records). */
+function schemaFieldNames(collection: Collection): string[] {
+  const fields = (collection.schema as { fields?: { name?: unknown }[] } | null | undefined)?.fields;
+  return Array.isArray(fields) ? fields.map((f) => f?.name).filter((n): n is string => typeof n === "string") : [];
+}
+
+/**
+ * Run an existence probe for a field the request names. The probe scans
+ * until it finds a record with the field, so for a name no record has (a
+ * typo) it reads the whole table and can hit the statement timeout; that
+ * is reported as the validation problem it most likely is, not as a
+ * database failure. A top-level field in the saved schema is known to
+ * exist, so its probe timing out is not held against it.
+ */
+async function probeExists(collection: Collection, field: string, what: string, probe: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await probe();
+  } catch (err) {
+    if (!isStatementTimeout(err)) throw err;
+    const known = schemaFieldNames(collection);
+    if (!field.includes(".") && known.includes(field)) return true;
+    const head = field.split(".")[0];
+    const listed = known.length > 0
+      ? ` Known top-level fields: ${known.slice(0, 25).join(", ")}${known.length > 25 ? `, … (${known.length - 25} more)` : ""}.`
+      : "";
+    const why = field.includes(".") && known.includes(head)
+      ? `no record with the path '${field}' was found before checking every record timed out (${formatTimeout()})`
+      : `'${field}' is not in this collection's saved schema, and checking every record for it timed out (${formatTimeout()})`;
+    throw new Error(`Unknown ${what} '${field}': ${why}.${listed} Check the name with hutch_describe_collection or hutch_get_collection.`);
+  }
 }
 
 /**

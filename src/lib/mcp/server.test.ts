@@ -29,6 +29,7 @@ vi.mock('@/lib/services/collections', () => ({
   inferCollectionSchema: vi.fn(),
   updateFieldDefinition: vi.fn(),
   getCollectionStats: vi.fn(),
+  storageTimeoutHint: vi.fn(),
 }))
 
 vi.mock('@/lib/services/records', () => ({
@@ -239,6 +240,75 @@ describe('error hygiene chokepoint', () => {
     // what the client ends up seeing.
     await expect(registeredTools.get('hutch_query_records')!({ slug: 'users', filter: { name: { $regex: 'x' } } }))
       .rejects.toThrow("Unsupported filter operator '$regex'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains")
+  })
+})
+
+describe('database error classification', () => {
+  function pgWrapped(code: string, message: string): Error {
+    const cause = Object.assign(new Error(message), { code, severity: 'ERROR' })
+    return Object.assign(new Error('Failed query: SELECT t.id FROM hc_7 t WHERE t.data @> $1\nparams: {"k":"secret"}'), { cause })
+  }
+
+  it('reports a statement timeout with the collection, the timeout and what to change', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    vi.mocked(collectionService.storageTimeoutHint).mockResolvedValue(undefined)
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'articles', search: 'quantum' }) as { isError?: boolean; content: { text: string }[] }
+
+    expect(result.isError).toBe(true)
+    const text = result.content[0].text
+    expect(text).toMatch(/^hutch_query_records timed out after 5s on collection 'articles'\. Narrow the filter/)
+    expect(text).not.toMatch(/hc_7|SELECT|secret|Failed query/)
+    expect(collectionService.storageTimeoutHint).toHaveBeenCalledWith('articles', 'user-1')
+    consoleError.mockRestore()
+  })
+
+  it('adds the failed-index hint to a timeout when the collection has one', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.describeCollection).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    vi.mocked(collectionService.storageTimeoutHint).mockResolvedValue("Building indexes for 'author' on this collection failed.")
+
+    const result = await registeredTools.get('hutch_describe_collection')!({ slug: 'articles' }) as { content: { text: string }[] }
+    expect(result.content[0].text).toMatch(/timed out after 5s on collection 'articles'.*Building indexes for 'author'/)
+    consoleError.mockRestore()
+  })
+
+  it('still reports the timeout when the hint lookup itself fails', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.exportRecords).mockRejectedValue(pgWrapped('57014', 'canceling statement due to statement timeout'))
+    vi.mocked(collectionService.storageTimeoutHint).mockRejectedValue(pgWrapped('57014', 'again'))
+
+    const result = await registeredTools.get('hutch_export_records')!({ collection: 'orders' }) as { content: { text: string }[] }
+    expect(result.content[0].text).toMatch(/^hutch_export_records timed out after 5s on collection 'orders'\./)
+    consoleError.mockRestore()
+  })
+
+  it('says a value did not match a type for invalid-input errors, without echoing SQL', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockRejectedValue(pgWrapped('22007', 'invalid input syntax for type timestamp with time zone: "soon"'))
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'events', created_after: 'soon' }) as { content: { text: string }[] }
+    const text = result.content[0].text
+    expect(text).toMatch(/^hutch_query_records failed on collection 'events': a value in the request does not match the type/)
+    expect(text).not.toMatch(/hc_7|SELECT|secret|Failed query/)
+    expect(collectionService.storageTimeoutHint).not.toHaveBeenCalled()
+    consoleError.mockRestore()
+  })
+
+  it('masks a bare node-postgres error (SQLSTATE, no drizzle wrapper) instead of rethrowing it', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollectionStats).mockRejectedValue(Object.assign(new Error('relation "hc_7" does not exist'), { code: '42P01' }))
+
+    const result = await registeredTools.get('hutch_collection_stats')!({ slug: 'x' }) as { isError?: boolean; content: { text: string }[] }
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe('hutch_collection_stats failed while accessing the database. Try again or adjust the inputs.')
+    consoleError.mockRestore()
   })
 })
 

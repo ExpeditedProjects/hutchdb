@@ -559,3 +559,26 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
     indexes: queryIndexes(collection.id, registry),
   };
 }
+
+/**
+ * One sentence for a timeout message when the collection's registry shows
+ * index builds (projections or unwinds) that failed, so queries on those
+ * fields read every document; undefined when there are none. One indexed
+ * lookup of the collection row, run only after a timeout.
+ */
+export async function storageTimeoutHint(slug: string, userId: string): Promise<string | undefined> {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
+  if (!access) return undefined;
+  const failed = readRegistry(access.collection.storage).failed_ddl ?? [];
+  if (failed.length === 0) return undefined;
+  const names = failed.map((f) => {
+    if (f.kind === "unwind") return f.key;
+    try {
+      const segments = JSON.parse(f.key);
+      return Array.isArray(segments) ? segments.join(".") : f.key;
+    } catch {
+      return f.key;
+    }
+  });
+  return `Building indexes for ${names.map((n) => `'${n}'`).join(", ")} on this collection failed (see hutch_get_collection storage.failed_ddl), so queries on those fields read every document until a later write retries them.`;
+}

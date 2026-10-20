@@ -1,5 +1,4 @@
 import { McpServer, type ToolAnnotations } from "@modelcontextprotocol/server";
-import { DrizzleQueryError } from "drizzle-orm";
 import { z } from "zod";
 import * as collectionService from "@/lib/services/collections";
 import * as recordService from "@/lib/services/records";
@@ -7,6 +6,7 @@ import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
 import { MCP_MAX_REQUEST_BODY_BYTES, MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
+import { classifyDbError, describeDbError, isDatabaseError } from "@/lib/db/errors";
 
 /**
  * hutch_query_records description: nested arrays, automatic indexing and the
@@ -78,22 +78,6 @@ function summarizedWriteResponse(result: object, collectionUrl: (slug: string) =
   return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
 
-/**
- * Database-layer failures whose messages leak driver internals (SQL text,
- * bound params) and must never reach the MCP client verbatim.
- *
- * drizzle-orm 0.45 throws DrizzleQueryError with message
- * "Failed query: <sql>\nparams: <params>". Note the class never assigns
- * `this.name`, so at runtime `err.name` is plain "Error" — the instanceof
- * and message checks are the ones that actually fire; the name check is
- * kept for errors crossing realm/bundle boundaries where instanceof fails.
- */
-function isDatabaseError(err: unknown): boolean {
-  if (err instanceof DrizzleQueryError) return true;
-  if (!(err instanceof Error)) return false;
-  return err.name === "DrizzleQueryError" || /^Failed query/i.test(err.message);
-}
-
 function collectionNotFound(slug: string): McpToolResponse {
   return errorResponse(
     `Collection '${slug}' not found (tools accept a collection's slug or its exact name). Call hutch_list_collections to see available names and slugs, or use hutch_store_records to create a new one by writing to it.`
@@ -117,8 +101,9 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
    * Error-hygiene chokepoint for every tool registration. If a handler
    * throws a database-layer error, the MCP SDK would otherwise stringify
    * it into the tool output — leaking raw SQL and bound params to the
-   * client. Catch those here: log the real error server-side, return a
-   * generic isError response. Every OTHER throw is rethrown unchanged so
+   * client. Catch those here: log the real error server-side, return an
+   * isError response that says what happened (a timeout, a value of the
+   * wrong type, or a generic failure) without any driver text. Every OTHER throw is rethrown unchanged so
    * intentional validation errors (e.g. "Unsupported filter operator …"
    * from the query engine) still reach the client verbatim via the SDK.
    */
@@ -133,9 +118,19 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       } catch (err) {
         if (isDatabaseError(err)) {
           console.error(`[mcp] ${name} database error:`, err);
-          return errorResponse(
-            `${name} failed while accessing the database. Try again or adjust the inputs.`
-          );
+          // The collection as the caller named it (slug or exact name) — their own input, safe to echo.
+          const params = (args[0] ?? {}) as { slug?: unknown; collection?: unknown };
+          const collection = typeof params.slug === "string" ? params.slug
+            : typeof params.collection === "string" ? params.collection : undefined;
+          let timeoutHint: string | undefined;
+          if (collection && classifyDbError(err) === "timeout") {
+            try {
+              timeoutHint = await collectionService.storageTimeoutHint(collection, userId);
+            } catch {
+              // The hint is best effort; the timeout message stands without it.
+            }
+          }
+          return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint }));
         }
         throw err;
       }
