@@ -7,6 +7,10 @@ const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
 
 vi.mock('@modelcontextprotocol/server', () => {
   class McpServer {
+    static lastOptions: { instructions?: string } | undefined
+    constructor(_info: unknown, options?: { instructions?: string }) {
+      McpServer.lastOptions = options
+    }
     registerTool(name: string, config: Record<string, unknown>, handler: (params: unknown) => Promise<unknown>) {
       registeredTools.set(name, handler)
       registeredConfigs.set(name, config)
@@ -353,6 +357,14 @@ describe('query, store and import descriptions', () => {
     expect(description).toMatch(/array of up to 5 keys/)
     expect(description).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
     expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
+  })
+
+  it('says every collection argument takes a slug or exact name, and that store reports index building', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
+    expect(McpServer.lastOptions?.instructions).toMatch(/Every tool that takes a collection accepts its slug or its exact name/)
+    expect(shapeOf('hutch_query_records').slug.description).toMatch(/exact name/)
+    expect(descriptionOf('hutch_store_records')).toMatch(/says so in storage_note/)
   })
 
   it('documents limit: 0 as count-only', () => {

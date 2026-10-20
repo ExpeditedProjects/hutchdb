@@ -11,7 +11,7 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
-import { collectionTableName, ident, readRegistry } from "@/lib/storage/registry";
+import { collectionTableName, ident, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
@@ -143,9 +143,13 @@ export async function createRecords(userId: string, organizationId: string, para
 
   // Storage inference (projections, unwinds) runs after every successful
   // write. It must never fail the write.
+  let storageNote: string | undefined;
   try {
+    const before = readRegistry(collection.storage);
     await markMixedProjections(collection.id, storedDocs);
-    await applyInference(collection, storedDocs);
+    const started = Date.now();
+    const after = await applyInference(collection, storedDocs);
+    storageNote = storageChangeNote(before, after, Date.now() - started);
   } catch (err) {
     console.error(`[storage] inference failed for collection ${collection.id}`, err);
   }
@@ -159,7 +163,9 @@ export async function createRecords(userId: string, organizationId: string, para
     await seedAutoViews(collection.slug, userId, inferredFromData);
   }
 
-  const summary = buildSaveSummary(collection.name, results, collectionWasCreated);
+  const saved = buildSaveSummary(collection.name, results, collectionWasCreated);
+  const summary = storageNote ? `${saved}${/[.)]$/.test(saved) ? "" : "."} ${storageNote}` : saved;
+  const note = storageNote ? { storage_note: storageNote } : {};
 
   if (returnMode === "summary") {
     return {
@@ -168,6 +174,7 @@ export async function createRecords(userId: string, organizationId: string, para
       ...tallyActions(results),
       ...(bulkRecords ? {} : { action: results[0]?.action, id: (results[0]?.record as { id?: number } | undefined)?.id }),
       summary,
+      ...note,
     };
   }
 
@@ -177,6 +184,7 @@ export async function createRecords(userId: string, organizationId: string, para
       results,
       count: results.length,
       summary,
+      ...note,
     };
   }
 
@@ -184,7 +192,23 @@ export async function createRecords(userId: string, organizationId: string, para
     collection: { name: collection.name, slug: collection.slug },
     ...results[0],
     summary,
+    ...note,
   };
+}
+
+/**
+ * What this write's inference added — fields made queryable as indexed
+ * columns, arrays unwound into child tables — and that building them is
+ * why the write took longer. Undefined when it added nothing.
+ */
+export function storageChangeNote(before: StorageRegistry, after: StorageRegistry, ms: number): string | undefined {
+  const projected = after.projections.filter((p) => !before.projections.some((b) => b.column === p.column)).map((p) => p.field);
+  const unwound = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path)).map((u) => u.path);
+  if (projected.length === 0 && unwound.length === 0) return undefined;
+  const parts: string[] = [];
+  if (projected.length > 0) parts.push(`made ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")} queryable as indexed ${projected.length === 1 ? "column" : "columns"}`);
+  if (unwound.length > 0) parts.push(`unwound ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can now use indexes)`);
+  return `This batch ${parts.join(" and ")}; building them over the existing records took ${ms} ms of this write, which is why it was slower than usual. This is one-time work.`;
 }
 
 type CollectionRow = typeof collections.$inferSelect;
@@ -460,6 +484,7 @@ export async function importRecords(userId: string, organizationId: string, para
     updated?: number;
     skipped?: number;
     summary?: string;
+    storage_note?: string;
   };
 
   const counts = bulk.results ? tallyActions(bulk.results) : { created: bulk.created ?? 0, updated: bulk.updated ?? 0, skipped: bulk.skipped ?? 0 };
@@ -470,6 +495,7 @@ export async function importRecords(userId: string, organizationId: string, para
     ...counts,
     ...(returnMode === "records" && bulk.results ? { results: bulk.results } : {}),
     summary: bulk.summary,
+    ...(bulk.storage_note ? { storage_note: bulk.storage_note } : {}),
   };
 }
 

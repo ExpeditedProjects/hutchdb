@@ -24,7 +24,7 @@ Workflow for answering questions about stored data:
 2. hutch_describe_collection — learn its fields and types
 3. hutch_query_records — fetch with filters/search
 
-Collections auto-create on the first hutch_store_records. No setup step.
+Collections auto-create on the first hutch_store_records. No setup step. Every tool that takes a collection accepts its slug or its exact name (as hutch_list_collections shows them).
 
 Use filter for exact/numeric/enum matches, search for free-text across string fields, or combine both. Run hutch_describe_collection first when you don't know a field's type. Filters also accept Mongo-style operator objects per field: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains (e.g. {"price": {"$gte": 10}}), and $or / $and at the top level (e.g. {"$or": [{"status": "open"}, {"price": {"$lt": 5}}]}).
 
@@ -96,7 +96,7 @@ function isDatabaseError(err: unknown): boolean {
 
 function collectionNotFound(slug: string): McpToolResponse {
   return errorResponse(
-    `Collection '${slug}' not found. Call hutch_list_collections to see available slugs, or use hutch_store_records to create a new one by writing to it.`
+    `Collection '${slug}' not found (tools accept a collection's slug or its exact name). Call hutch_list_collections to see available names and slugs, or use hutch_store_records to create a new one by writing to it.`
   );
 }
 
@@ -217,7 +217,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_store_records",
     {
       title: "Store Records",
-      description: `Save one or many records to a collection (auto-creates the collection if new). ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. Example: use when the user says 'save this' or has just produced structured output worth keeping for later.`,
+      description: `Save one or many records to a collection (auto-creates the collection if new). ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. When a batch makes fields queryable or unwinds an array (building indexes over the existing records, which makes that write slower), the response says so in storage_note. Example: use when the user says 'save this' or has just produced structured output worth keeping for later.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
         data: z.record(z.string(), z.unknown()).optional().describe("Single record as a JSON object (e.g. {\"title\": \"My note\", \"tags\": [\"work\"]}). Use this OR records, not both."),

@@ -112,6 +112,7 @@ import {
   deleteRecord,
   exportRecords,
   importRecords,
+  storageChangeNote,
 } from './records'
 import {
   findCollectionByNameInOrg,
@@ -965,5 +966,23 @@ describe('importRecords', () => {
     expect(insertRecords).toHaveBeenCalledWith(1, [
       { title: 'Widget, "deluxe"', price: 19.99, in_stock: true, meta: { color: 'red' }, notes: 'a\nb' },
     ])
+  })
+})
+
+describe('storageChangeNote', () => {
+  const base = { projections: [{ field: 'a', column: 'p_a', type: 'number' as const, reason: 'r' }], unwinds: [], evaluated_rows: 0 }
+
+  it('is undefined when the batch added nothing', () => {
+    expect(storageChangeNote(base, base, 12)).toBeUndefined()
+  })
+
+  it('names new indexed fields and unwound arrays, and why the write was slower', () => {
+    const after = {
+      ...base,
+      projections: [...base.projections, { field: 'score', column: 'p_score', type: 'number' as const, reason: 'r' }, { field: 'owner.id', column: 'p_owner_id', type: 'number' as const, reason: 'r', path: ['owner', 'id'] }],
+      unwinds: [{ path: 'answers', table: 'hc_1__answers', fields: [], reason: 'r' }],
+    }
+    const note = storageChangeNote(base, after, 840)!
+    expect(note).toBe("This batch made fields 'score', 'owner.id' queryable as indexed columns and unwound 'answers' into a queryable table (filters and aggregates on its elements can now use indexes); building them over the existing records took 840 ms of this write, which is why it was slower than usual. This is one-time work.")
   })
 })

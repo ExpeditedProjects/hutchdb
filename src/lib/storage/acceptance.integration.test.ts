@@ -582,4 +582,24 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       expect(estimates.answers).toBeUndefined();
     });
   });
+
+  // ── 8. the store response says when a batch built indexes ─────────────────
+
+  describe("store response storage note", () => {
+    it("says which fields became queryable and which arrays were unwound, only on the batch that did it", async () => {
+      thresholds(200);
+      const docs = makeQuestions(150);
+      const first = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(0, 50), return: "summary" })) as Record<string, unknown>;
+      expect(first.storage_note).toBeUndefined();
+      const second = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(50), return: "summary" })) as Record<string, unknown>;
+      expect(second.storage_note).toMatch(/^This batch made fields .*'owner_user_id'.* queryable as indexed columns and unwound 'answers' into a queryable table .* took \d+ ms of this write/);
+      expect(second.summary).toContain(second.storage_note as string);
+      const third = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: makeQuestions(3), return: "summary" })) as Record<string, unknown>;
+      expect(third.storage_note).toBeUndefined();
+      // Import passes it through too.
+      thresholds(100);
+      const imported = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "fresh", format: "json", content: JSON.stringify(makeQuestions(120)) })) as Record<string, unknown>;
+      expect(imported.storage_note).toMatch(/This batch made fields/);
+    });
+  });
 });
