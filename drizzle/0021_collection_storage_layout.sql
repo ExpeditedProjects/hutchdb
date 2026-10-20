@@ -1,9 +1,7 @@
--- Per-collection storage layout (src/lib/storage). `layout` picks where a
--- collection's rows live ('shared' = the records table, 'table' = its own
--- hc_<id> table); `storage` is the registry of projections/unwinds that
--- inference created for a layout='table' collection.
-ALTER TABLE "collections" ADD COLUMN "layout" text NOT NULL DEFAULT 'shared';
---> statement-breakpoint
+-- Per-collection storage (src/lib/storage). Every collection keeps its rows
+-- in its own hc_<id> table; `storage` is the registry of projections and
+-- unwinds that inference created on it. Moving rows out of the old
+-- `records` table is `npm run storage:cutover`, never a migration.
 ALTER TABLE "collections" ADD COLUMN "storage" jsonb NOT NULL DEFAULT '{}';
 --> statement-breakpoint
 -- Guarded casts used by projection columns. Generated columns must never
@@ -84,7 +82,7 @@ BEGIN
                  tbl, col, hc_pg_type(kind), hc_cast_path_expr('data', path, kind));
 END $$;
 --> statement-breakpoint
--- Unique-key support for layout='table': one stored generated jsonb column
+-- Unique-key support: one stored generated jsonb column
 -- uk_<n> per key field plus a partial unique index over them, so inserts can
 -- use ON CONFLICT (uk_0, ...) WHERE deleted_at IS NULL without any user
 -- string in the INSERT statement. Passing an empty array removes the key.
