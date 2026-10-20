@@ -63,7 +63,8 @@ vi.mock('@/lib/db/queries', () => ({
 }))
 
 vi.mock('@/lib/describe', () => ({
-  describeCollection: vi.fn().mockResolvedValue([]),
+  DESCRIBE_FIELDS_PAGE: 60,
+  describeFields: vi.fn().mockResolvedValue({ fields: [], total: 0, matched: 0, offset: 0 }),
 }))
 
 // Name resolution has its own tests (resolve.test.ts and the integration

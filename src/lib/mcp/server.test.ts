@@ -160,9 +160,9 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'slug', 'sort', 'type'] },
       { name: 'hutch_delete_collection', title: 'Delete Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_delete_record', title: 'Delete Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
-      { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
       { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
-      { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
+      { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
       { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
@@ -399,6 +399,29 @@ describe('compact JSON responses', () => {
     expect(human).toBe('Saved 1 record to Notes')
     expect(json).not.toMatch(/\n/)
     expect(JSON.parse(json)).toEqual(expect.objectContaining({ count: 1, url: 'https://example.test/c/notes' }))
+  })
+})
+
+describe('field paging on describe and get_collection', () => {
+  it('forwards fields_offset and field_prefix, and always pages get_collection', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.describeCollection).mockResolvedValue({ fields: [] } as never)
+    vi.mocked(collectionService.getCollection).mockResolvedValue({ slug: 'c' } as never)
+    await registeredTools.get('hutch_describe_collection')!({ slug: 'c', fields_offset: 60, field_prefix: 'volt' })
+    expect(collectionService.describeCollection).toHaveBeenCalledWith('c', 'user-1', { fields_offset: 60, field_prefix: 'volt' })
+    await registeredTools.get('hutch_get_collection')!({ slug: 'c' })
+    expect(collectionService.getCollection).toHaveBeenCalledWith('c', 'user-1', { fields_offset: undefined, field_prefix: undefined })
+  })
+
+  it('says get_collection returns the schema and storage diagnostics, and describe pages its fields', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const get = registeredConfigs.get('hutch_get_collection')!.description as string
+    expect(get).toMatch(/saved schema/)
+    expect(get).toMatch(/failed_ddl/)
+    expect(get).toMatch(/storage\.unwinds/)
+    const describe = registeredConfigs.get('hutch_describe_collection')!.description as string
+    expect(describe).toMatch(/at most 60 fields per call/)
+    expect(describe).toMatch(/field_prefix/)
   })
 })
 

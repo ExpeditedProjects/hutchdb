@@ -6,6 +6,7 @@ import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
 import { MCP_MAX_REQUEST_BODY_BYTES, MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
+import { DESCRIBE_FIELDS_PAGE } from "@/lib/describe";
 import { classifyDbError, describeDbError, isDatabaseError } from "@/lib/db/errors";
 
 /**
@@ -53,6 +54,10 @@ const FILTER_DESCRIPTION =
   "{\"$or\": [{\"status\": \"open\"}, {\"score\": {\"$gt\": 10}}]}. A $or/$and branch selects records; with group_by over an array of objects it does not restrict which elements are aggregated (a plain array-path condition does). " +
   "Any other top-level key starting with $ is an error. " +
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
+
+// Field paging shared by hutch_describe_collection and hutch_get_collection.
+const FIELDS_OFFSET_DESCRIPTION = `Skip this many fields (default 0): each call lists at most ${DESCRIBE_FIELDS_PAGE}; pass the response's fields_next_offset for the next page.`;
+const FIELD_PREFIX_DESCRIPTION = "Only list fields whose name starts with this (case-sensitive), e.g. \"voltage\" for voltage_0, voltage_1, ...";
 
 function textResponse(text: string): McpToolResponse {
   return { content: [{ type: "text", text }] };
@@ -187,12 +192,16 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_get_collection",
     {
       title: "Get Collection",
-      description: "Get one collection's metadata, settings, and record count by slug. Example: use when the user asks 'how big is my bookmarks collection?'.",
-      inputSchema: z.object({ slug: z.string().describe(slugDescription) }),
+      description: `Get one collection's metadata, settings and record count, its saved schema (schema.fields: name, type, options; at most ${DESCRIBE_FIELDS_PAGE} per call, paged like hutch_describe_collection), and storage diagnostics: storage.projections (fields with indexed columns), storage.unwinds (arrays of objects made queryable), storage.pending_unwinds, and storage.failed_ddl (index builds that failed, so queries on those fields read every document). Example: use when the user asks 'how big is my bookmarks collection?', or when queries on a collection are slow or failing.`,
+      inputSchema: z.object({
+        slug: z.string().describe(slugDescription),
+        fields_offset: z.number().int().min(0).optional().describe(FIELDS_OFFSET_DESCRIPTION),
+        field_prefix: z.string().optional().describe(FIELD_PREFIX_DESCRIPTION),
+      }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug }) => {
-      const result = await collectionService.getCollection(slug, userId);
+    async ({ slug, fields_offset, field_prefix }) => {
+      const result = await collectionService.getCollection(slug, userId, { fields_offset, field_prefix });
       if (!result) return collectionNotFound(slug);
       return jsonResponse(result);
     }
@@ -202,12 +211,16 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_describe_collection",
     {
       title: "Describe Collection",
-      description: "Describe a collection's field names, types, and sample values, plus its storage: which fields (top-level or nested object paths) are projected into indexed columns, which nested arrays of objects have been made queryable (unwound), each with the reason, and storage.indexes — every index that can serve a query and what it serves, including the GIN index on the documents that serves equality on any field, array element or key inside an array of objects. Field types, frequency and sample values come from a sample of up to 500 records; distinctCount is an exact count of distinct values over all records (collections up to 20,000 records; scalar fields), and larger collections give distinctCountEstimate instead — Postgres's statistics estimate, for indexed fields only. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.",
-      inputSchema: z.object({ slug: z.string().describe(slugDescription) }),
+      description: `Describe a collection's field names, types, and sample values, plus its storage: which fields (top-level or nested object paths) are projected into indexed columns, which nested arrays of objects have been made queryable (unwound), each with the reason, and storage.indexes — every index that can serve a query and what it serves, including the GIN index on the documents that serves equality on any field, array element or key inside an array of objects. Field types, frequency and sample values come from a sample of up to 500 records; distinctCount is an exact count of distinct values over all records (collections up to 20,000 records; scalar fields), and larger collections give distinctCountEstimate instead — Postgres's statistics estimate, for indexed fields only. Lists at most ${DESCRIBE_FIELDS_PAGE} fields per call, most common first, with fields_total, fields_omitted and fields_next_offset; page with fields_offset or find fields by name with field_prefix. A field whose records disagree on the type has conflict: true and typeCounts, and type follows the most common one; a projection with mixed: true serves equality but not ranges or sort. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.`,
+      inputSchema: z.object({
+        slug: z.string().describe(slugDescription),
+        fields_offset: z.number().int().min(0).optional().describe(FIELDS_OFFSET_DESCRIPTION),
+        field_prefix: z.string().optional().describe(FIELD_PREFIX_DESCRIPTION),
+      }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ slug }) => {
-      const result = await collectionService.describeCollection(slug, userId);
+    async ({ slug, fields_offset, field_prefix }) => {
+      const result = await collectionService.describeCollection(slug, userId, { fields_offset, field_prefix });
       if (!result) return collectionNotFound(slug);
       return jsonResponse(result);
     }
