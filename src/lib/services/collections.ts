@@ -4,7 +4,7 @@ import { alias } from "drizzle-orm/pg-core";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { createCollectionWithOwner } from "@/lib/db/queries";
 import { findAccessibleCollection } from "./resolve";
-import { describeCollection as describeCollectionFields } from "@/lib/describe";
+import { DESCRIBE_FIELDS_PAGE, describeFields, type DescribePage } from "@/lib/describe";
 import { uniqueSlug } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectableField, MAX_OPTION_VALUE_LENGTH, MAX_OPTIONS_PER_FIELD } from "@/lib/schema-inference";
@@ -227,7 +227,13 @@ export async function createCollection(userId: string, organizationId: string, p
   return { collection: created };
 }
 
-export async function getCollection(slug: string, userId: string) {
+/**
+ * One collection with its record count. With `page` (the MCP tool always
+ * passes one), schema.fields is cut to one page in schema order — a wide
+ * collection's saved schema can list thousands of fields — with the same
+ * paging metadata as describe; without it, the whole schema.
+ */
+export async function getCollection(slug: string, userId: string, page?: FieldPage) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
@@ -236,7 +242,17 @@ export async function getCollection(slug: string, userId: string) {
     tableRows.countRecords(collection.id),
     tableRows.lastRecordAt(collection.id),
   ]);
-  return { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
+  const result = { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
+  const schema = collection.schema as CollectionSchema | null;
+  if (!page || !schema || !Array.isArray(schema.fields)) return result;
+  const offset = Math.max(0, Math.floor(page.fields_offset ?? 0));
+  const matching = page.field_prefix ? schema.fields.filter((f) => f.name.startsWith(page.field_prefix!)) : schema.fields;
+  const fields = matching.slice(offset, offset + DESCRIBE_FIELDS_PAGE);
+  return {
+    ...result,
+    schema: { ...schema, fields },
+    ...fieldPageInfo(page, matching.length, schema.fields.length, fields.length, offset, "schema.fields, in schema order"),
+  };
 }
 
 export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
@@ -516,7 +532,31 @@ export async function getCollectionStats(slug: string, userId: string) {
   };
 }
 
-export async function describeCollection(slug: string, userId: string) {
+export type FieldPage = { fields_offset?: number; field_prefix?: string };
+
+/**
+ * Paging metadata for a bounded field list: how many fields exist, how
+ * many this call returned, and how to get the rest.
+ */
+function fieldPageInfo(page: FieldPage, matched: number, total: number, returned: number, offset: number, source: string) {
+  const omitted = Math.max(0, matched - offset - returned);
+  const nextOffset = omitted > 0 ? offset + returned : null;
+  const info: Record<string, unknown> = {
+    fields_total: total,
+    ...(page.field_prefix ? { fields_matching_prefix: matched } : {}),
+    fields_offset: offset,
+    fields_returned: returned,
+    fields_omitted: Math.max(0, matched - returned),
+    fields_next_offset: nextOffset,
+  };
+  if (nextOffset !== null) {
+    const which = page.field_prefix ? ` starting with '${page.field_prefix}'` : "";
+    info.fields_hint = `Fields ${offset + 1}–${offset + returned} of ${matched}${which} (${source}). Pass fields_offset: ${nextOffset} for the next ${DESCRIBE_FIELDS_PAGE}, or field_prefix (the start of a field name) to find specific fields.`;
+  }
+  return info;
+}
+
+export async function describeCollection(slug: string, userId: string, page: FieldPage = {}) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   // The argument may be the collection's name; continue with its slug.
@@ -524,7 +564,8 @@ export async function describeCollection(slug: string, userId: string) {
   const collection = access.collection;
 
   const recordCount = await tableRows.countRecords(collection.id);
-  const fields = await describeCollectionFields(collection.id, recordCount, collection.storage);
+  const describePage: DescribePage = { offset: page.fields_offset, prefix: page.field_prefix };
+  const described = await describeFields(collection.id, recordCount, collection.storage, describePage);
 
   return {
     name: collection.name,
@@ -532,7 +573,8 @@ export async function describeCollection(slug: string, userId: string) {
     description: collection.description,
     recordCount,
     uniqueKey: collection.uniqueKey,
-    fields,
+    fields: described.fields,
+    ...fieldPageInfo(page, described.matched, described.total, described.fields.length, described.offset, "most common first, from a sample of up to 500 records; hutch_collection_stats has exact fill rates"),
     storage: await describeStorage(collection),
   };
 }
@@ -546,7 +588,11 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
   const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
   return {
     evaluated_rows: registry.evaluated_rows,
-    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
+    projections: registry.projections.map((p) => p.mixed
+      // The stored reason describes the data when the column was made;
+      // since then some record held another type there.
+      ? { field: p.field, type: p.type, mixed: true, reason: `Projected as ${p.type} when '${p.field}' held only ${p.type} values; some records now hold other types there (mixed), so this column serves equality, $in and $ne, while ranges and sort read the documents.` }
+      : { field: p.field, type: p.type, reason: p.reason }),
     unwinds: registry.unwinds.map((u) => ({
       path: u.path,
       fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
@@ -558,4 +604,27 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
     // Every index that can serve a query, including the GIN on the documents.
     indexes: queryIndexes(collection.id, registry),
   };
+}
+
+/**
+ * One sentence for a timeout message when the collection's registry shows
+ * index builds (projections or unwinds) that failed, so queries on those
+ * fields read every document; undefined when there are none. One indexed
+ * lookup of the collection row, run only after a timeout.
+ */
+export async function storageTimeoutHint(slug: string, userId: string): Promise<string | undefined> {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
+  if (!access) return undefined;
+  const failed = readRegistry(access.collection.storage).failed_ddl ?? [];
+  if (failed.length === 0) return undefined;
+  const names = failed.map((f) => {
+    if (f.kind === "unwind") return f.key;
+    try {
+      const segments = JSON.parse(f.key);
+      return Array.isArray(segments) ? segments.join(".") : f.key;
+    } catch {
+      return f.key;
+    }
+  });
+  return `Building indexes for ${names.map((n) => `'${n}'`).join(", ")} on this collection failed (see hutch_get_collection storage.failed_ddl), so queries on those fields read every document until a later write retries them.`;
 }

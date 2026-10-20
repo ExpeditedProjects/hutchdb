@@ -17,6 +17,8 @@ import { applyInference, markMixedProjections, recheckMixedProjections, updateRe
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
+import { limitQueryOutput, truncateStrings, type OutputLimits } from "./output-limits";
+import { classifyDbError, describeDbError, formatTimeout, isDatabaseError } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -341,11 +343,17 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
+/**
+ * With `limits` (the MCP tool passes them), long strings are cut and an
+ * oversized page is cut short with has_more/next_offset continuing it;
+ * without, the result is returned whole.
+ */
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>, limits?: OutputLimits) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
-  return queryTable(access.collection, params);
+  const result = await queryTable(access.collection, params);
+  return limits ? limitQueryOutput(result, limits) : result;
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -511,7 +519,7 @@ export async function importRecords(userId: string, organizationId: string, para
  * collection, groups in the order of their best match, and every record
  * keeps its collection's name and slug.
  */
-export async function searchGlobal(userId: string, search: string, limit: number = 10) {
+export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
 
@@ -551,13 +559,18 @@ export async function searchGlobal(userId: string, search: string, limit: number
     });
   }
 
-  const results = Array.from(grouped.values()).map((g) => ({
-    collection: g.collection,
-    matches: g.records.length,
-    records: g.records,
-  }));
+  let truncatedStrings = 0;
+  const results = Array.from(grouped.values()).map((g) => {
+    // Long strings in each match's data are cut when the caller set a cap.
+    const records = g.records.map((r) => {
+      const { value, truncated } = truncateStrings(r.data, limits.maxStringLength ?? 0);
+      truncatedStrings += truncated;
+      return truncated > 0 ? { ...r, data: value } : r;
+    });
+    return { collection: g.collection, matches: records.length, records };
+  });
 
-  return { search, results };
+  return { search, results, ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}) };
 }
 
 export async function truncateRecords(slug: string, userId: string) {
@@ -633,23 +646,43 @@ export async function transformRecords(slug: string, userId: string, params: {
     return { error: "Invalid field name", status: 400 };
   }
 
-  // Database failures return this clean message instead of surfacing raw
-  // driver/SQL text through the MCP tool output.
-  const transformFailed = {
-    error: "Transform failed while updating records — check the field names and values and try again",
-    status: 500,
+  // Database failures return a clean message that says what happened (a
+  // timeout, a value of the wrong type) instead of raw driver/SQL text.
+  const collection = access.collection;
+  const transformFailed = (err: unknown) => {
+    const kind = classifyDbError(err);
+    if (kind === "timeout") {
+      // Each updated record is rewritten whole; with unwound arrays its
+      // child rows are rebuilt too, so a few hundred large records can
+      // take longer than the timeout.
+      const unwound = readRegistry(collection.storage).unwinds.map((u) => `'${u.path}'`);
+      const why = unwound.length > 0
+        ? ` Every updated record also rebuilds its rows for the queryable array${unwound.length > 1 ? "s" : ""} ${unwound.join(", ")}, which is slow for many large records.`
+        : "";
+      return {
+        error: `Transform timed out after ${formatTimeout()} on collection '${slug}' and was rolled back: no records were changed.${why} Narrow set_field.filter so each call touches fewer records (for example by an id or date range) and run it in batches.`,
+        status: 504,
+      };
+    }
+    if (kind === "invalid_input") {
+      return { error: `${describeDbError(err, { tool: "Transform", collection: slug })} No records were changed.`, status: 400 };
+    }
+    return { error: "Transform failed while updating records and was rolled back: no records were changed. Try again; if it keeps failing, transform fewer records per call.", status: 500 };
   };
 
   // set_field.filter takes the full query filter language (operators,
   // dotted paths, array elements), as in hutch_query_records.
-  const collection = access.collection;
   let setFilter: SQL | undefined;
   if (set_field?.filter && Object.keys(set_field.filter).length > 0) {
     try {
       setFilter = await tableFilterWhere(collection, set_field.filter);
     } catch (err) {
+      // A malformed filter (unknown operator, bad path) is the caller's to fix: say exactly what is wrong.
+      if (!isDatabaseError(err)) {
+        return { error: `Invalid set_field.filter: ${(err as Error)?.message ?? String(err)}`, status: 400 };
+      }
       console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
-      return transformFailed;
+      return transformFailed(err);
     }
   }
 
@@ -667,7 +700,7 @@ export async function transformRecords(slug: string, userId: string, params: {
   } catch (err) {
     if (err instanceof tableRows.TransformStepError) {
       console.error(`transformRecords ${err.step} failed for collection ${collection.id}`, err.cause);
-      return transformFailed;
+      return transformFailed(err.cause);
     }
     throw err;
   }

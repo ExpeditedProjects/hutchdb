@@ -14,6 +14,7 @@ import {
   type QueryParams,
 } from "@/lib/db/queries";
 import { isPlainObject } from "@/lib/validation";
+import { formatTimeout, isStatementTimeout } from "@/lib/db/errors";
 import {
   collectionTableName,
   findPathProjection,
@@ -80,7 +81,8 @@ export const SORT_HELP =
   "and with group_by/aggregate, an aggregate alias or a group_by key — optionally prefixed with - for descending; " +
   `up to ${MAX_SORT_KEYS} keys as a comma-separated list or an array, the first deciding first`;
 
-type Collection = { id: number; storage: unknown };
+/** `schema` (the saved field list, inferred from a sample) is optional: only error messages read it. */
+type Collection = { id: number; storage: unknown; schema?: unknown };
 
 /**
  * QueryParams for a collection table: `sort` may also be an array
@@ -930,6 +932,33 @@ function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
   }
 }
 
+/**
+ * Each results row is one object keyed by the group_by keys and aggregate
+ * aliases, plus time_bucket (with time_bucket) and parent_id/record (with
+ * per_record). Two of those sharing a name would silently drop one value,
+ * so the names must be distinct. Top-level response fields (plan, total,
+ * indexed) are outside the rows and never collide.
+ */
+function assertDistinctColumns(groupKeys: string[], aliases: string[], opts: { timeBucket: boolean; perRecord: boolean }): void {
+  const reserved = new Set([...(opts.timeBucket ? ["time_bucket"] : []), ...(opts.perRecord ? ["parent_id", "record"] : [])]);
+  for (const name of [...groupKeys, ...aliases]) {
+    if (reserved.has(name) || name.startsWith("__")) {
+      const why = name.startsWith("__") ? "names starting with __ are used internally"
+        : name === "time_bucket" ? "with time_bucket, each row carries its bucket as time_bucket"
+        : "with per_record, each row carries parent_id and record";
+      throw new Error(`'${name}' is reserved in this aggregate's rows (${why}); ${groupKeys.includes(name) ? "a field with this name can't be a group_by key in this query" : "use another alias"}.`);
+    }
+  }
+  for (const alias of aliases) {
+    if (groupKeys.includes(alias)) {
+      throw new Error(`'${alias}' is both a group_by key and an aggregate alias; each results row would hold only one of them. Use a different alias, e.g. {"n": "count"}.`);
+    }
+  }
+  if (aliases.length === 0 && groupKeys.includes("count")) {
+    throw new Error(`group_by key 'count' collides with the default count column; pass an aggregate with another alias, e.g. {"n": "count"}.`);
+  }
+}
+
 export const AGGREGATE_SPEC_EXAMPLE = '{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}';
 
 // ── Aggregate expressions ────────────────────────────────────────────────────
@@ -1214,6 +1243,7 @@ function compileAggregate(
   const aggs = parseAggregate(aggregate);
   const bucket = parseTimeBucket(timeBucket);
   const exprRefs = aggs.flatMap((a) => (a.expr ? exprFields(a.expr) : []));
+  assertDistinctColumns(groupKeys, aggs.map((a) => a.alias), { timeBucket: !!timeBucket, perRecord });
 
   // Which nested array (if any) this aggregation runs over.
   const refs = [...groupKeys, ...aggs.flatMap((a) => (a.field ? [a.field] : [])), ...exprRefs.map((r) => r.field), ...(bucket?.field ? [bucket.field] : [])].map((f) => ({ field: f, parsed: parsePath(registry, ctx.arrayPaths, f) }));
@@ -1587,11 +1617,13 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
   let exists = sortPathCache.get(key);
   if (exists === undefined) {
     const table = ident(collectionTableName(collection.id));
-    const r = await db.execute(sql`
-      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
-             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-    const row = r.rows[0] as { found: boolean; empty: boolean };
-    exists = row.found || row.empty;
+    exists = await probeExists(collection, field, "sort field", async () => {
+      const r = await db.execute(sql`
+        SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
+               (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+      const row = r.rows[0] as { found: boolean; empty: boolean };
+      return row.found || row.empty;
+    });
     sortPathCache.set(key, exists);
   }
   if (!exists) {
@@ -1622,13 +1654,47 @@ async function pathExists(collection: Collection, registry: StorageRegistry, fie
   const test = asArray
     ? sql`jsonb_typeof(data #> ${pathArray(segments)}) = 'array'`
     : sql`(data @? ${`lax $${segments.map(jsonpathKey).join("")}`}::jsonpath OR data ? ${field}::text)`;
-  const r = await db.execute(sql`
-    SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
-           (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
-  const row = r.rows[0] as { found: boolean; empty: boolean };
-  const exists = row.found || row.empty;
+  const exists = await probeExists(collection, field, asArray ? "array path" : "field", async () => {
+    const r = await db.execute(sql`
+      SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
+             (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+    const row = r.rows[0] as { found: boolean; empty: boolean };
+    return row.found || row.empty;
+  });
   fieldPathCache.set(key, exists);
   return exists;
+}
+
+/** Top-level field names in the collection's saved schema (inferred from a sample of records). */
+function schemaFieldNames(collection: Collection): string[] {
+  const fields = (collection.schema as { fields?: { name?: unknown }[] } | null | undefined)?.fields;
+  return Array.isArray(fields) ? fields.map((f) => f?.name).filter((n): n is string => typeof n === "string") : [];
+}
+
+/**
+ * Run an existence probe for a field the request names. The probe scans
+ * until it finds a record with the field, so for a name no record has (a
+ * typo) it reads the whole table and can hit the statement timeout; that
+ * is reported as the validation problem it most likely is, not as a
+ * database failure. A top-level field in the saved schema is known to
+ * exist, so its probe timing out is not held against it.
+ */
+async function probeExists(collection: Collection, field: string, what: string, probe: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await probe();
+  } catch (err) {
+    if (!isStatementTimeout(err)) throw err;
+    const known = schemaFieldNames(collection);
+    if (!field.includes(".") && known.includes(field)) return true;
+    const head = field.split(".")[0];
+    const listed = known.length > 0
+      ? ` Known top-level fields: ${known.slice(0, 25).join(", ")}${known.length > 25 ? `, … (${known.length - 25} more)` : ""}.`
+      : "";
+    const why = field.includes(".") && known.includes(head)
+      ? `no record with the path '${field}' was found before checking every record timed out (${formatTimeout()})`
+      : `'${field}' is not in this collection's saved schema, and checking every record for it timed out (${formatTimeout()})`;
+    throw new Error(`Unknown ${what} '${field}': ${why}.${listed} Check the name with hutch_describe_collection or hutch_get_collection.`);
+  }
 }
 
 /**
