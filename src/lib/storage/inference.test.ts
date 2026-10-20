@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import {
   arrayCandidates,
   declareFields,
+  declareNestedFields,
   inferDecisions,
   thresholdsFromEnv,
   MAX_PROJECTIONS,
@@ -9,7 +10,11 @@ import {
 } from './inference'
 import {
   EMPTY_REGISTRY,
+  PG_MAX_IDENTIFIER,
   childTableName,
+  defaultStorageLayout,
+  findPathProjection,
+  findProjection,
   indexName,
   sanitizeIdentifier,
   uniqueColumnName,
@@ -219,5 +224,129 @@ describe('inferDecisions', () => {
     const d = inferDecisions(input({ docs: batch2, rowCount: 1000 }))
     const columns = d.projections.map((p) => p.column)
     expect(new Set(columns).size).toBe(2)
+  })
+})
+
+describe('defaultStorageLayout', () => {
+  it('is shared unless HUTCH_STORAGE_LAYOUT is exactly "table"', () => {
+    const saved = process.env.HUTCH_STORAGE_LAYOUT
+    try {
+      delete process.env.HUTCH_STORAGE_LAYOUT
+      expect(defaultStorageLayout()).toBe('shared')
+      for (const v of ['', 'shared', 'TABLE', 'tables', ' table']) {
+        process.env.HUTCH_STORAGE_LAYOUT = v
+        expect(defaultStorageLayout()).toBe('shared')
+      }
+      process.env.HUTCH_STORAGE_LAYOUT = 'table'
+      expect(defaultStorageLayout()).toBe('table')
+    } finally {
+      if (saved === undefined) delete process.env.HUTCH_STORAGE_LAYOUT
+      else process.env.HUTCH_STORAGE_LAYOUT = saved
+    }
+  })
+})
+
+describe('nested object paths', () => {
+  const CATEGORIES = Array.from({ length: 24 }, (_, k) => `cat_${String(k).padStart(2, '0')}`)
+
+  it('declares scalars two and three keys deep under the same presence and type rule', () => {
+    const batch = docs(100, (i) => ({
+      name: `n${i}`,
+      owner: { id: i, display_name: `u${i}`, ...(i < 85 ? { location: 'x' } : {}) },
+      stats: { score: { up: i, down: i % 3 }, flags: [1, 2], when: '2026-01-02' },
+      deep: { a: { b: { c: 1 } } },
+      ...(i % 2 ? { 'bad key': { x: 1 } } : {}),
+    }))
+    expect(declareNestedFields(batch).map((f) => [f.field, f.type, f.path])).toEqual([
+      ['owner.display_name', 'text', ['owner', 'display_name']],
+      ['owner.id', 'number', ['owner', 'id']],
+      ['stats.when', 'date', ['stats', 'when']],
+      ['stats.score.down', 'number', ['stats', 'score', 'down']],
+      ['stats.score.up', 'number', ['stats', 'score', 'up']],
+    ])
+    // owner.location is in 85% (< 90%); arrays, a fourth key level and keys
+    // the dotted-path syntax cannot address are never candidates.
+  })
+
+  it('tolerates type outliers and treats JSON null as absent, like top-level fields', () => {
+    const batch = docs(100, (i) => ({ t: { v: i === 3 ? 'three' : i === 4 ? null : i } }))
+    expect(declareNestedFields(batch)).toEqual([{ field: 't.v', path: ['t', 'v'], type: 'number', presence: 0.99 }])
+  })
+
+  it('skips every path under an object with more keys than the projection cap (a map)', () => {
+    const batch = docs(50, (i) => ({
+      totals: Object.fromEntries(CATEGORIES.map((c) => [c, { points: i, possible: i, votes: i }])),
+      stats: Object.fromEntries(Array.from({ length: MAX_PROJECTIONS }, (_, k) => [`s${k}`, i])),
+    }))
+    const declared = declareNestedFields(batch)
+    expect(declared.some((f) => f.field.startsWith('totals.'))).toBe(false)
+    expect(declared.filter((f) => f.field.startsWith('stats.'))).toHaveLength(MAX_PROJECTIONS)
+  })
+
+  it('projects top-level fields first, then nested paths, within one cap', () => {
+    const batch = docs(10, (i) => ({
+      ...Object.fromEntries(Array.from({ length: 12 }, (_, k) => [`f${String(k).padStart(2, '0')}`, i])),
+      a: { x: i, y: i, z: { w: i } },
+      b: { q: `s${i}`, r: i, s: i },
+    }))
+    const d = inferDecisions(input({ docs: batch, rowCount: 1000 }))
+    expect(d.projections).toHaveLength(MAX_PROJECTIONS)
+    expect(d.projections.slice(0, 12).every((p) => p.path === undefined)).toBe(true)
+    // 4 slots left; equal presence, so shallower paths first, then by name.
+    expect(d.projections.slice(12).map((p) => [p.field, p.column, p.path])).toEqual([
+      ['a.x', 'p_a_x', ['a', 'x']],
+      ['a.y', 'p_a_y', ['a', 'y']],
+      ['b.q', 'p_b_q', ['b', 'q']],
+      ['b.r', 'p_b_r', ['b', 'r']],
+    ])
+    expect(d.projections[12].reason).toMatch(/'a.x' is a number in 100% of documents and the collection reached 1000 rows/)
+  })
+
+  it('projects nested paths with the parent fields when an unwind is created', () => {
+    const batch = docs(20, (i) => ({ name: `n${i}`, totals: { veterans: { points: i, votes: i } }, votes: [{ c: 1 }, { c: 2 }] }))
+    const d = inferDecisions(input({ docs: batch, rowCount: 20, elementCounts: { votes: 100 } }))
+    expect(d.unwinds).toHaveLength(1)
+    expect(d.projections.map((p) => p.field)).toEqual(['name', 'totals.veterans.points', 'totals.veterans.votes'])
+    expect(d.projections[1]).toMatchObject({ path: ['totals', 'veterans', 'points'], column: 'p_totals_veterans_points', type: 'number' })
+    expect(d.projections[1].reason).toMatch(/when a nested array was made queryable/)
+  })
+
+  it('keeps a top-level key and a same-looking nested path apart', () => {
+    const batch = docs(10, (i) => ({ a_b: i, a: { b: i }, 'a.b': i }))
+    const d = inferDecisions(input({ docs: batch, rowCount: 1000 }))
+    const byPath = (p: { path?: string[]; field: string }) => JSON.stringify(p.path ?? p.field)
+    expect(d.projections.map(byPath).sort()).toEqual(['"a.b"', '"a_b"', '["a","b"]'])
+    expect(new Set(d.projections.map((p) => p.column)).size).toBe(3)
+    const registry: StorageRegistry = { projections: d.projections, unwinds: [], evaluated_rows: 0 }
+    expect(findProjection(registry, 'a.b')?.path).toBeUndefined()
+    expect(findPathProjection(registry, ['a', 'b'])?.path).toEqual(['a', 'b'])
+    // Idempotent: a second batch adds nothing.
+    expect(inferDecisions(input({ docs: batch, registry, rowCount: 2000 })).projections).toEqual([])
+  })
+
+  it('names long paths safely within 63 characters with a deterministic hash', () => {
+    const long = 'segment_with_a_rather_long_name_'
+    const batch = docs(10, (i) => ({ [long + 'one']: { [long + 'two']: { [long + 'three']: i } } }))
+    const [p] = inferDecisions(input({ docs: batch, rowCount: 1000 })).projections
+    expect(p.path).toHaveLength(3)
+    expect(p.column.length).toBeLessThanOrEqual(PG_MAX_IDENTIFIER)
+    expect(p.column).toMatch(/^p_[a-z0-9_]+_[0-9a-f]{8}$/)
+    expect(() => ident(p.column)).not.toThrow()
+    expect(indexName('hc_123456', p.column).length).toBeLessThanOrEqual(PG_MAX_IDENTIFIER)
+    expect(inferDecisions(input({ docs: batch, rowCount: 1000 })).projections[0].column).toBe(p.column)
+  })
+
+  it('on dollarvote-shaped legislators, the per-category totals map is never projected', () => {
+    const legislators = docs(555, (i) => ({
+      bioguide_id: `B${i}`, icpsr: i, congress: 118, chamber: i % 5 ? 'House' : 'Senate', name: `N${i}`, party: i % 2 ? 'D' : 'R',
+      state: 'CA', ...(i % 5 ? { district: i % 50 } : { district: null }), opensecrets_id: `N${i}`, fec_ids: [`F${i}`], govtrack_id: i,
+      totals: Object.fromEntries(CATEGORIES.filter((_, k) => (i + k) % 40).map((c) => [c, { points: i % 30, possible: 29, votes: 24 }])),
+      votes: [{ bill_id: 'HR1', vote: 'yea', points: { cat_00: 1 } }],
+      scores: [{ category: 'cat_00', bill_id: 'HR1', points: 1, possible: 1 }],
+    }))
+    const d = inferDecisions(input({ docs: legislators, rowCount: 555, elementCounts: { votes: 177_677, scores: 297_309 } }))
+    expect(d.unwinds.map((u) => u.path)).toEqual(['scores', 'votes'])
+    expect(d.projections.map((p) => p.field).sort()).toEqual(['bioguide_id', 'chamber', 'congress', 'govtrack_id', 'icpsr', 'name', 'opensecrets_id', 'party', 'state'])
+    expect(d.projections.some((p) => p.field.startsWith('totals.'))).toBe(false)
   })
 })

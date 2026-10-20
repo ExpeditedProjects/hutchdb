@@ -386,13 +386,16 @@ describe.skipIf(!TEST_DB_URL)("table storage layout against real Postgres", () =
       expect(reg.unwinds[0].fields.map((f) => f.field)).toEqual(["category_id", "label"]); // points is an object: no column
     });
 
-    it("sorts records on a dotted object path numerically and reports the unserved sort", async () => {
+    it("sorts records on a dotted object path numerically and reports whether an index served it", async () => {
       const result = await query(slug, { sort: "-totals.veterans.points", fields: ["name", "totals"], limit: 10 });
       const expected = legs.slice().sort((a, b) => b.totals.veterans.points - a.totals.veterans.points || a.name.localeCompare(b.name)).slice(0, 10);
       const got = result.records!.map((r) => (r.data as Leg).totals.veterans.points);
       expect(got).toEqual(expected.map((d) => d.totals.veterans.points));
-      expect(result.indexed).toBe(false);
-      expect(result.reason).toMatch(/No index served sort on totals.veterans.points/);
+      // totals.veterans.points is now projected (nested scalar paths are), so
+      // whether its index serves the sort is the planner's call on 60 rows.
+      expect((await registry(slug)).projections.map((p) => p.field)).toContain("totals.veterans.points");
+      if (result.indexed) expect(result.plan).toMatch(/p_totals_veterans_points_idx/);
+      else expect(result.reason).toMatch(/No index served sort on totals.veterans.points/);
       expect(result.total).toBe(60);
     });
 
