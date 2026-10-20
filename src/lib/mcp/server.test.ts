@@ -408,6 +408,20 @@ describe('query, store and import descriptions', () => {
     expect(shapeOf('hutch_query_records').group_by.description).toContain('{"first": "name"}')
   })
 
+  it('states the configured request body limit (HUTCH_MCP_MAX_BODY_BYTES) on store and import', async () => {
+    vi.resetModules()
+    vi.stubEnv('HUTCH_MCP_MAX_BODY_BYTES', String(4 * 1024 * 1024))
+    try {
+      const fresh = await import('./server')
+      fresh.createMcpServer('user-1', 'org-test', 'https://example.test')
+      expect(descriptionOf('hutch_store_records')).toContain('limited to 4 MB')
+      expect(descriptionOf('hutch_import_records')).toContain('limited to 4 MB (content up to a little less than that)')
+    } finally {
+      vi.unstubAllEnvs()
+      vi.resetModules()
+    }
+  })
+
   it('states the 16 MB request body limit on store and import', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')

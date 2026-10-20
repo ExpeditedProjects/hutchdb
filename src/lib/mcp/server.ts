@@ -6,7 +6,7 @@ import * as recordService from "@/lib/services/records";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
-import { MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
+import { MCP_MAX_REQUEST_BODY_BYTES, MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
 
 /**
  * hutch_query_records description: nested arrays, automatic indexing and the
@@ -357,7 +357,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_import_records",
     {
       title: "Import Records",
-      description: `Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). ${NESTED_DOCUMENTS_NOTE.replace("Records can", "JSON records can")}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL} (content up to 10 MB). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.`,
+      description: `Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). ${NESTED_DOCUMENTS_NOTE.replace("Records can", "JSON records can")}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL} (content up to ${MCP_MAX_REQUEST_BODY_BYTES < 10 * 1024 * 1024 ? "a little less than that" : "10 MB"}). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
         format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
