@@ -35,6 +35,9 @@ yarn-error.log*
 .env*
 !.env.local.example
 
+# storage:cutover pg_dump backups
+/storage-cutover-backups/
+
 # vercel
 .vercel
 

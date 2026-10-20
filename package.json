@@ -12,7 +12,8 @@
     "db:migrate": "npx drizzle-kit migrate",
     "test": "vitest run",
     "test:watch": "vitest",
-    "smoke": "npx tsx scripts/smoke.ts"
+    "smoke": "npx tsx scripts/smoke.ts",
+    "storage:cutover": "npx tsx scripts/storage-cutover.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/server": "^2.3.1",

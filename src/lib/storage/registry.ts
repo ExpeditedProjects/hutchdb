@@ -53,6 +53,21 @@ export type StorageRegistry = {
   evaluated_rows: number;
   /** Unique key the uk_* columns and hc_<id>_uk index currently reflect. */
   unique_key?: string[];
+  /**
+   * Set by `npm run storage:cutover` once the collection's rows were copied
+   * from the old shared `records` table and verified; a re-run skips it.
+   */
+  cutover?: CutoverMark;
+};
+
+export type CutoverMark = {
+  at: string;
+  /** Rows copied (live and soft-deleted). */
+  rows: number;
+  /** Sorted md5 over the copied documents. */
+  data_md5: string;
+  /** When inference ran over the copied rows. */
+  inferred_at?: string;
 };
 
 export const EMPTY_REGISTRY: StorageRegistry = { projections: [], unwinds: [], evaluated_rows: 0 };
@@ -65,6 +80,7 @@ export function readRegistry(raw: unknown): StorageRegistry {
     unwinds: Array.isArray(r.unwinds) ? r.unwinds : [],
     evaluated_rows: typeof r.evaluated_rows === "number" ? r.evaluated_rows : 0,
     ...(Array.isArray(r.unique_key) ? { unique_key: r.unique_key } : {}),
+    ...(r.cutover && typeof r.cutover === "object" ? { cutover: r.cutover } : {}),
   };
 }
 

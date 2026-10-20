@@ -165,7 +165,7 @@ Core is intentionally small. If you want the product layer, run [HutchDB Cloud](
 ## Architecture
 
 - **Next.js App Router** — one static landing page, one MCP route (`/api/mcp`), one REST seed route (`/api/v1/collections`). Everything else is deleted.
-- **Drizzle + Postgres** — each collection is its own table of JSONB documents; hot fields become indexed columns automatically, everything else is queried via containment operators and full-text search.
+- **Drizzle + Postgres** — each collection is its own table of JSONB documents; hot fields become indexed columns automatically, everything else is queried via containment operators and full-text search. Upgrading a database from before per-collection storage: run `npm run storage:cutover` once after `db:migrate`.
 - **MCP server** — collection tools (including per-collection stats), record tools (store/query/search/update/delete/status/transform plus CSV/JSON export and import), schema tools (describe/infer/update), and view tools. Queries support filter operators (`$gt`/`$gte`/`$lt`/`$lte`/`$ne`/`$in`/`$nin`/`$exists`/`$contains`), field projection, and count/min/max/distinct/sum/avg aggregations.
 - **Auth seam** (`src/lib/auth/seam.ts`) — the only place auth lives: bearer-key check when `HUTCH_API_KEY` is set, singleton context otherwise.
 - **Singleton bootstrap** (`src/lib/auth/singleton.ts`) — one user, one personal org, created lazily on first request.

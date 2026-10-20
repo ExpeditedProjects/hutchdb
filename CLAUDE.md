@@ -13,6 +13,7 @@ npm run dev          # Start dev server on port 3111
 npm run db:generate  # Generate Drizzle migrations
 npm run db:migrate   # Run migrations
 npm run smoke        # Hit /api/mcp against SMOKE_BASE_URL
+npm run storage:cutover -- --dry-run   # Move a pre-0022 database out of `records` (see Cutover below)
 ```
 
 Core self-bootstraps its singleton user + personal org on the first authenticated request — no seed step.
@@ -26,6 +27,7 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - **DB schema** in `src/lib/db/schema.ts` — users, organizations, organization_members, collections, views (schema stays merge-compatible with Cloud; do not drop Cloud-only tables). There is no shared `records` table: each collection's rows live in its own table.
 - **Query engine** in `src/lib/storage/compiler.ts` — compiles filter/search/sort/aggregate to a collection's table (projection columns where they exist, JSONB containment and full-text search otherwise); shared filter helpers in `src/lib/db/queries.ts`.
 - **Per-collection storage** in `src/lib/storage/` — every collection lives in `hc_<id>` (created with the collection) with inferred projection columns (top-level and nested object scalars) and unwound child tables `hc_<id>__<path>`, recorded in `collections.storage`; `compiler.ts` routes queries to them and reports `indexed`/`plan`. SQL helpers are in migration `0021`.
+- **Cutover** `npm run storage:cutover -- [--dry-run] [--drop-records]` moves a database created before per-collection storage out of the old `records` table (pg_dump first, copy + verify in one transaction, then inference). `db:migrate` never touches `records`; only `--drop-records` drops it.
 
 ## Key Design Decisions
 
