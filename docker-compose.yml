@@ -27,7 +27,7 @@ services:
       HUTCH_ADMIN_EMAIL: "${HUTCH_ADMIN_EMAIL:-admin@hutch.local}"
       HUTCH_ADMIN_PASSWORD: "${HUTCH_ADMIN_PASSWORD:?HUTCH_ADMIN_PASSWORD is required}"
       HUTCH_SESSION_SECRET: "${HUTCH_SESSION_SECRET:?HUTCH_SESSION_SECRET is required (openssl rand -hex 32)}"
-      HUTCH_BASE_URL: "${HUTCH_BASE_URL:-http://localhost:3000}"
+      HUTCH_BASE_URL: "${HUTCH_BASE_URL:-}"
       HUTCH_AUTO_SEED: "${HUTCH_AUTO_SEED:-true}"
     ports:
       - "${HUTCH_PORT:-3000}:3000"

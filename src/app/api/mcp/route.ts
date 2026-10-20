@@ -1,7 +1,7 @@
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { createMcpServer } from "@/lib/mcp/server";
 import { authenticate } from "@/lib/auth/seam";
-import { config } from "@/lib/config";
+import { publicBaseUrl } from "@/lib/base-url";
 import { MCP_MAX_REQUEST_BODY_BYTES } from "@/lib/constants";
 
 function unauthorizedResponse(): Response {
@@ -23,12 +23,12 @@ function unauthorizedResponse(): Response {
  * never inspects or verifies tokens itself.
  */
 const handler = createMcpHandler((ctx) => {
-  const identity = ctx.authInfo?.extra as { userId: string; orgId: string } | undefined;
+  const identity = ctx.authInfo?.extra as { userId: string; orgId: string; baseUrl: string } | undefined;
   if (!identity) {
     // Unreachable: handleMcpRequest only dispatches authenticated requests.
     throw new Error("MCP request reached the server factory without an authenticated identity");
   }
-  return createMcpServer(identity.userId, identity.orgId, config.baseUrl);
+  return createMcpServer(identity.userId, identity.orgId, identity.baseUrl);
 }, {
   // The SDK default is 4 MiB and answers larger bodies with a JSON-RPC
   // "Payload Too Large" error; bulk stores and 10 MB imports need more.
@@ -44,7 +44,8 @@ async function handleMcpRequest(req: Request): Promise<Response> {
       token: "",
       clientId: ctx.userId,
       scopes: [],
-      extra: { userId: ctx.userId, orgId: ctx.orgId },
+      // Links in tool responses point at the configured public URL, else the origin this request reached.
+      extra: { userId: ctx.userId, orgId: ctx.orgId, baseUrl: publicBaseUrl(req) },
     },
   });
 }
