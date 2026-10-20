@@ -482,6 +482,7 @@ describe('storage-aware descriptions', () => {
     // Arrays of scalars, per-element groups, totals across records, multi-key sort, typed keys.
     expect(query).toMatch(/array of scalars \(tags\) matches when some element matches/)
     expect(query).toMatch(/groups per element/)
+    expect(query).toMatch(/array of objects \("items"\) likewise groups per element, keyed by the whole element; an empty array groups as null/)
     expect(query).toMatch(/totals across records/)
     expect(query).toMatch(/per_record: true/)
     expect(query).toMatch(/up to 3 keys, as "-points,name"/)

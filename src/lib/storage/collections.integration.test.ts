@@ -199,7 +199,7 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
       const unindexed = await query(plain, { sort: "-totals.veterans.points", limit: 10 });
       expect(unindexed.indexed).toBe(false);
       expect(unindexed.reason).toMatch(/'totals.veterans.points' is a nested object path with no projection/);
-    });
+    }, 30_000); // two 2,000-document stores plus 44 queries; 5 s is too tight on a loaded machine
   });
 
   it("a descending sort on a nested projection is served by its index, rows without a value last", async () => {

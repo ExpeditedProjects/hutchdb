@@ -14,7 +14,7 @@
 // Run it in a quiet minute: there is no write lock.
 
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { config } from "dotenv";
 
@@ -41,7 +41,8 @@ function parseArgs(argv: string[]) {
 
 /** pg_dump the whole database (custom format) and return the file path, or exit. */
 function dumpDatabase(url: string, dir: string): string {
-  mkdirSync(dir, { recursive: true });
+  // The dump holds every secret in the database: owner-only directory and file.
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const file = resolve(join(dir, `hutch-before-cutover-${stamp}.dump`));
   console.log(`pg_dump -> ${file}`);
@@ -50,6 +51,7 @@ function dumpDatabase(url: string, dir: string): string {
     console.error(`pg_dump failed (${result.error?.message ?? `exit ${result.status}`}); refusing to run the cutover.`);
     process.exit(1);
   }
+  chmodSync(file, 0o600);
   console.log(`pg_dump ok: ${file} (${statSync(file).size} bytes)`);
   return file;
 }
