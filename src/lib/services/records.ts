@@ -1,8 +1,8 @@
 import { db } from "@/lib/db";
-import { collections, records, collectionMembers } from "@/lib/db/schema";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, QueryParams, notDeleted } from "@/lib/db/queries";
+import { collections, collectionMembers } from "@/lib/db/schema";
+import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, QueryParams } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
-import { eq, and, sql, desc, type SQL } from "drizzle-orm";
+import { eq, and, sql, type SQL } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, CollectionSchema } from "@/lib/schema-inference";
 import { seedAutoViews } from "./views";
@@ -10,16 +10,15 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
-import { collectionTableName, ident, isTableLayout, readRegistry } from "@/lib/storage/registry";
+import { collectionTableName, ident, readRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
 import { queryTable } from "@/lib/storage/compiler";
-import { withCollectionWriteLock, type DbTx } from "@/lib/storage/lock";
 
-async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null, layout: string | null = "shared") {
+async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
-    const inferred = await inferSchema(collectionId, layout);
+    const inferred = await inferSchema(collectionId);
     const merged = mergeSchema(existingSchema, inferred);
     await db.update(collections).set({ schema: merged, updatedAt: new Date() }).where(eq(collections.id, collectionId));
   } catch {
@@ -124,18 +123,8 @@ export async function createRecords(userId: string, organizationId: string, para
     }
   }
 
-  // Writes hold the collection's write lock (shared) and route by the
-  // layout read once it is granted, so a write that waited out a storage
-  // migration lands in the collection's new table.
-  const stored = await withCollectionWriteLock(collection, async (tx, fresh) => {
-    if (!fresh) return { error: "Collection not found", status: 404 };
-    const written = isTableLayout(fresh)
-      ? await storeInTable(tx, fresh, recordsToInsert, onConflict, collectionWasCreated)
-      : await storeInShared(tx, fresh, recordsToInsert, onConflict);
-    return "error" in written ? written : { collection: fresh, results: written.results };
-  });
+  const stored = await storeInTable(collection, recordsToInsert, onConflict, collectionWasCreated);
   if ("error" in stored) return stored;
-  collection = stored.collection;
   const results = stored.results;
 
   // Auto-infer schema if records contain fields not yet in the schema
@@ -143,20 +132,18 @@ export async function createRecords(userId: string, organizationId: string, para
   const hasNewFields = recordsToInsert.some((data) => detectNewFields(existingSchema, data));
 
   if (hasNewFields && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
+    await reinferCollectionSchema(collection.id, existingSchema);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
 
   // Storage inference (projections, unwinds) runs after every successful
-  // write to a table-layout collection. It must never fail the write.
-  if (isTableLayout(collection)) {
-    try {
-      await markMixedProjections(collection.id, recordsToInsert);
-      await applyInference(collection, recordsToInsert);
-    } catch (err) {
-      console.error(`[storage] inference failed for collection ${collection.id}`, err);
-    }
+  // write. It must never fail the write.
+  try {
+    await markMixedProjections(collection.id, recordsToInsert);
+    await applyInference(collection, recordsToInsert);
+  } catch (err) {
+    console.error(`[storage] inference failed for collection ${collection.id}`, err);
   }
 
   revalidateDashboard(collection.slug);
@@ -200,118 +187,35 @@ type CollectionRow = typeof collections.$inferSelect;
 
 type StoreResult = { results: { action: string; record: Record<string, unknown> }[] } | { error: string; status: number };
 
-/** Write path for layout='shared' collections: the rows go to `records`. */
-async function storeInShared(
-  tx: DbTx,
-  collection: CollectionRow,
-  recordsToInsert: Record<string, unknown>[],
-  onConflict: string,
-): Promise<StoreResult> {
-  const uniqueKey = (collection.uniqueKey as string[]) || [];
-  const results: { action: string; record: Record<string, unknown> }[] = [];
-
-  if (uniqueKey.length === 0) {
-    // Fast path: batch insert all records in a single query
-    const created = await tx
-      .insert(records)
-      .values(recordsToInsert.map((data) => ({
-        collectionId: collection.id,
-        data,
-        source: "api" as const,
-      })))
-      .returning();
-    for (const rec of created) {
-      results.push({ action: "created", record: rec as unknown as Record<string, unknown> });
-    }
-    return { results };
-  }
-
-  // Upsert path: per-record conflict resolution
-  for (const data of recordsToInsert) {
-    const keyFilter: Record<string, unknown> = {};
-    for (const field of uniqueKey) {
-      if (data[field] !== undefined) {
-        keyFilter[field] = data[field];
-      }
-    }
-
-    if (Object.keys(keyFilter).length === uniqueKey.length) {
-      const [existing] = await tx
-        .select()
-        .from(records)
-        .where(
-          and(
-            eq(records.collectionId, collection.id),
-            sql`${records.data} @> ${JSON.stringify(keyFilter)}::jsonb`,
-            notDeleted
-          )
-        )
-        .limit(1);
-
-      if (existing) {
-        let newData: Record<string, unknown>;
-        if (onConflict === "merge") {
-          newData = { ...(existing.data as Record<string, unknown>), ...data };
-        } else if (onConflict === "skip") {
-          results.push({ action: "skipped", record: existing as unknown as Record<string, unknown> });
-          continue;
-        } else if (onConflict === "error") {
-          return { error: "Record with matching unique key already exists", status: 409 };
-        } else {
-          newData = data;
-        }
-
-        const [updated] = await tx
-          .update(records)
-          .set({ data: newData, updatedAt: new Date(), source: "api" })
-          .where(eq(records.id, existing.id))
-          .returning();
-        results.push({ action: "updated", record: updated as unknown as Record<string, unknown> });
-        continue;
-      }
-    }
-
-    const [created] = await tx
-      .insert(records)
-      .values({
-        collectionId: collection.id,
-        data,
-        source: "api",
-      })
-      .returning();
-    results.push({ action: "created", record: created as unknown as Record<string, unknown> });
-  }
-  return { results };
-}
-
 /**
- * Write path for layout='table' collections: the rows go to hc_<id>.
+ * Write path: the rows go to the collection's hc_<id> table.
  * Upserts use a unique index over the key (see hc_set_unique_key) and
- * honour every on_conflict mode the shared layout does.
+ * honour every on_conflict mode (replace, merge, skip, error).
  */
 async function storeInTable(
-  tx: DbTx,
   collection: CollectionRow,
   docs: Record<string, unknown>[],
   onConflict: string,
   collectionWasCreated: boolean,
 ): Promise<StoreResult> {
-  if (collectionWasCreated || !(await collectionTableExists(tx, collection.id))) {
-    await createCollectionTable(tx, collection.id);
+  // createCollectionWithOwner creates the table; this covers a collection
+  // inserted by other means.
+  if (!collectionWasCreated && !(await collectionTableExists(db, collection.id))) {
+    await createCollectionTable(db, collection.id);
   }
 
   const uniqueKey = (collection.uniqueKey as string[]) || [];
   if (uniqueKey.length === 0) {
-    const inserted = await tableRows.insertRecords(collection.id, docs, "api", tx);
+    const inserted = await tableRows.insertRecords(collection.id, docs);
     return { results: inserted.map((record) => ({ action: "created", record: record as unknown as Record<string, unknown> })) };
   }
 
   const mode = onConflict === "skip" || onConflict === "error" || onConflict === "merge" ? onConflict : "replace";
 
-  const keyError = await ensureUniqueKeyIndex(tx, collection, uniqueKey);
+  const keyError = await ensureUniqueKeyIndex(collection, uniqueKey);
   if (keyError) return keyError;
 
-  const result = await tableRows.upsertRecords(collection.id, docs, uniqueKey, mode, "api", tx);
+  const result = await tableRows.upsertRecords(collection.id, docs, uniqueKey, mode);
   if ("conflict" in result) {
     return { error: "Record with matching unique key already exists", status: 409 };
   }
@@ -319,17 +223,15 @@ async function storeInTable(
 }
 
 /** Make the table's unique index match the collection's unique_key, if it changed. */
-async function ensureUniqueKeyIndex(conn: DbTx, collection: CollectionRow, uniqueKey: string[]): Promise<{ error: string; status: number } | null> {
+async function ensureUniqueKeyIndex(collection: CollectionRow, uniqueKey: string[]): Promise<{ error: string; status: number } | null> {
   const registry = readRegistry(collection.storage);
   if (JSON.stringify(registry.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
   try {
-    // A savepoint inside the write's transaction: a duplicate-key failure
-    // rolls back the index change only, and the write reports 409.
     await updateRegistry(collection.id, async (current, tx) => {
       if (JSON.stringify(current.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
       await setUniqueKey(tx, collection.id, uniqueKey);
       return { ...current, unique_key: uniqueKey };
-    }, conn);
+    });
     return null;
   } catch (err) {
     const pg = (err as { cause?: { code?: string } }).cause ?? (err as { code?: string });
@@ -398,31 +300,15 @@ export async function listRecords(slug: string, userId: string, limit: number = 
 
   const clampedLimit = Math.min(limit, 200);
 
-  if (isTableLayout(collection)) {
-    const [recs, total] = await Promise.all([
-      tableRows.listRecords(collection.id, clampedLimit, offset),
-      tableRows.countRecords(collection.id),
-    ]);
-    return { records: recs, total, limit: clampedLimit, offset };
-  }
-
-  const recs = await db
-    .select()
-    .from(records)
-    .where(and(eq(records.collectionId, collection.id), notDeleted))
-    .orderBy(desc(records.createdAt))
-    .limit(clampedLimit)
-    .offset(offset);
-
-  const total = await getCollectionRecordCount(collection.id);
-
+  const [recs, total] = await Promise.all([
+    tableRows.listRecords(collection.id, clampedLimit, offset),
+    tableRows.countRecords(collection.id),
+  ]);
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-/** Route a query to the engine that owns the collection's rows. */
 function runQuery(collection: CollectionRow, params: Omit<QueryParams, "collectionId">) {
-  if (isTableLayout(collection)) return queryTable(collection, params);
-  return queryRecordsEngine({ ...params, collectionId: collection.id });
+  return queryTable(collection, params);
 }
 
 export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
@@ -585,57 +471,15 @@ export async function searchGlobal(userId: string, search: string, limit: number
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.min(limit, 50);
 
-  const matches = await db
-    .select({
-      collectionName: collections.name,
-      collectionSlug: collections.slug,
-      id: records.id,
-      collectionId: records.collectionId,
-      data: records.data,
-      source: records.source,
-      deletedAt: records.deletedAt,
-      createdAt: records.createdAt,
-      updatedAt: records.updatedAt,
-    })
-    .from(records)
-    .innerJoin(collections, eq(records.collectionId, collections.id))
-    .innerJoin(
-      collectionMembers,
-      and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(
-      and(
-        sql`to_tsvector('english', ${records.data}::text) @@ plainto_tsquery('english', ${search})`,
-        notDeleted
-      )
-    )
-    .limit(clampedLimit * 10);
-
-  const grouped = new Map<number, { collection: { name: string; slug: string }; records: typeof matches }>();
-  for (const row of matches) {
-    if (!grouped.has(row.collectionId)) {
-      grouped.set(row.collectionId, {
-        collection: { name: row.collectionName, slug: row.collectionSlug },
-        records: [],
-      });
-    }
-    const group = grouped.get(row.collectionId)!;
-    if (group.records.length < clampedLimit) {
-      group.records.push(row);
-    }
-  }
-
-  // Table-layout collections keep their rows in hc_<id>, which the join
-  // above cannot see; search each one the user can access.
-  const tableCollections = await db
+  const grouped = new Map<number, { collection: { name: string; slug: string }; records: Record<string, unknown>[] }>();
+  const accessible = await db
     .select({ id: collections.id, name: collections.name, slug: collections.slug })
     .from(collections)
     .innerJoin(
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
-    )
-    .where(eq(collections.layout, "table"));
-  for (const coll of tableCollections) {
+    );
+  for (const coll of accessible) {
     const rows = await tableRows.searchRecords(coll.id, search, clampedLimit);
     if (rows.length === 0) continue;
     grouped.set(coll.id, {
@@ -668,16 +512,7 @@ export async function truncateRecords(slug: string, userId: string) {
   if (!access) return null;
   const collection = access.collection;
 
-  const done = await withCollectionWriteLock(collection, async (tx, fresh) => {
-    if (!fresh) return false;
-    if (isTableLayout(fresh)) {
-      await tableRows.softDeleteAll(fresh.id, tx);
-    } else {
-      await tx.update(records).set({ deletedAt: new Date() }).where(and(eq(records.collectionId, fresh.id), notDeleted));
-    }
-    return true;
-  });
-  if (!done) return null;
+  await tableRows.softDeleteAll(collection.id);
   revalidateDashboard(slug);
   return { truncated: true, slug };
 }
@@ -685,34 +520,21 @@ export async function truncateRecords(slug: string, userId: string) {
 export async function updateRecord(slug: string, userId: string, recordId: number, data: Record<string, unknown>) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
   if (!access) return null;
-  const locked = await withCollectionWriteLock(access.collection, async (tx, fresh) => {
-    if (!fresh) return null;
-    const updated = isTableLayout(fresh)
-      ? await tableRows.updateRecordData(fresh.id, recordId, data, tx)
-      : (await tx
-          .update(records)
-          .set({ data, updatedAt: new Date() })
-          .where(and(eq(records.id, recordId), eq(records.collectionId, fresh.id), notDeleted))
-          .returning())[0];
-    return { collection: fresh, updated };
-  });
-  if (!locked) return null;
-  const { collection, updated } = locked;
+  const collection = access.collection;
+  const updated = await tableRows.updateRecordData(collection.id, recordId, data);
 
   if (!updated) return { error: "Record not found", status: 404 };
 
-  if (isTableLayout(collection)) {
-    try {
-      await markMixedProjections(collection.id, [data]);
-    } catch (err) {
-      console.error(`[storage] projection check failed for collection ${collection.id}`, err);
-    }
+  try {
+    await markMixedProjections(collection.id, [data]);
+  } catch (err) {
+    console.error(`[storage] projection check failed for collection ${collection.id}`, err);
   }
 
   // Re-infer schema if the updated record has new fields
   const existingSchema = collection.schema as CollectionSchema | null;
   if (detectNewFields(existingSchema, data) && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
+    await reinferCollectionSchema(collection.id, existingSchema);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
@@ -769,23 +591,18 @@ export async function transformRecords(slug: string, userId: string, params: {
     status: 500,
   };
 
-  // The statements run in one transaction holding the collection's write
-  // lock, so they all land in the table its current layout names (and a
-  // failure leaves none of them applied).
-  let collection: CollectionRow;
+  // The statements run in one transaction, so a failure leaves none of
+  // them applied. Projection columns are generated from data and the
+  // unwind triggers fire on data changes, so both stay in sync.
+  const collection = access.collection;
+  const target = ident(collectionTableName(collection.id));
   try {
-    const fresh = await withCollectionWriteLock(access.collection, async (tx, current) => {
-      if (!current) return undefined;
-      // Table-layout collections run the same statements against hc_<id>;
-      // projection columns are generated from data and the unwind triggers
-      // fire on data changes, so both stay in sync without extra work.
-      const target = isTableLayout(current) ? ident(collectionTableName(current.id)) : sql`records`;
-      const scope = isTableLayout(current) ? sql`` : sql`collection_id = ${current.id} AND`;
+    await db.transaction(async (tx) => {
       const run = async (step: string, query: SQL) => {
         try {
           track(await tx.execute(query));
         } catch (err) {
-          console.error(`transformRecords ${step} failed for collection ${current.id}`, err);
+          console.error(`transformRecords ${step} failed for collection ${collection.id}`, err);
           throw new TransformFailed();
         }
       };
@@ -794,7 +611,7 @@ export async function transformRecords(slug: string, userId: string, params: {
         // Remove all fields in a single query using array subtraction
         const fieldsLiteral = `{${remove_fields.join(",")}}`;
         await run("remove_fields", sql`UPDATE ${target} SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-            WHERE ${scope} data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
+            WHERE data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
             RETURNING id`);
       }
 
@@ -808,7 +625,7 @@ export async function transformRecords(slug: string, userId: string, params: {
           await run("rename_fields", sql`UPDATE ${target}
               SET data = (data || jsonb_build_object(${newName}::text, data->${oldName}::text)) - ${oldName}::text,
                   updated_at = now()
-              WHERE ${scope} data ? ${oldName}
+              WHERE data ? ${oldName}
               AND deleted_at IS NULL
               RETURNING id`);
         }
@@ -821,27 +638,24 @@ export async function transformRecords(slug: string, userId: string, params: {
           await run("set_field", sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
                   updated_at = now()
-              WHERE ${scope} data @> ${JSON.stringify(filter)}::jsonb
+              WHERE data @> ${JSON.stringify(filter)}::jsonb
               AND deleted_at IS NULL
               RETURNING id`);
         } else {
           await run("set_field", sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
                   updated_at = now()
-              WHERE ${scope} deleted_at IS NULL
+              WHERE deleted_at IS NULL
               RETURNING id`);
         }
       }
-      return current;
     });
-    if (!fresh) return null;
-    collection = fresh;
   } catch (err) {
     if (err instanceof TransformFailed) return transformFailed;
     throw err;
   }
 
-  if (isTableLayout(collection) && touched.size > 0) {
+  if (touched.size > 0) {
     try {
       await recheckMixedProjections(collection.id);
     } catch (err) {
@@ -853,7 +667,7 @@ export async function transformRecords(slug: string, userId: string, params: {
   const existingSchema = collection.schema as CollectionSchema | null;
   const needsReinference = !!(set_field || rename_fields) && touched.size > 0;
   if (needsReinference && shouldReinfer(existingSchema)) {
-    await reinferCollectionSchema(collection.id, existingSchema, collection.layout);
+    await reinferCollectionSchema(collection.id, existingSchema);
   } else {
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
@@ -878,16 +692,7 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
 
   const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
   if (!access) return null;
-  const updated = await withCollectionWriteLock(access.collection, async (tx, fresh) => {
-    if (!fresh) return undefined;
-    return isTableLayout(fresh)
-      ? await tableRows.setRecordStatus(fresh.id, recordId, status, tx)
-      : (await tx
-          .update(records)
-          .set({ status, updatedAt: new Date() })
-          .where(and(eq(records.id, recordId), eq(records.collectionId, fresh.id), notDeleted))
-          .returning())[0];
-  });
+  const updated = await tableRows.setRecordStatus(access.collection.id, recordId, status);
 
   if (!updated) return { error: "Record not found", status: 404 };
 
@@ -898,20 +703,7 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
 export async function deleteRecord(slug: string, userId: string, recordId: number) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
   if (!access) return null;
-  const deleted = await withCollectionWriteLock(access.collection, async (tx, fresh) => {
-    if (!fresh) return false;
-    if (isTableLayout(fresh)) return tableRows.softDeleteRecord(fresh.id, recordId, tx);
-
-    const [existing] = await tx
-      .select({ id: records.id })
-      .from(records)
-      .where(and(eq(records.id, recordId), eq(records.collectionId, fresh.id), notDeleted))
-      .limit(1);
-    if (!existing) return false;
-
-    await tx.update(records).set({ deletedAt: new Date() }).where(eq(records.id, recordId));
-    return true;
-  });
+  const deleted = await tableRows.softDeleteRecord(access.collection.id, recordId);
 
   if (!deleted) return { error: "Record not found", status: 404 };
   revalidateDashboard(slug);

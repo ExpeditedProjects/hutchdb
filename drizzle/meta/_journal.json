@@ -160,7 +160,7 @@
       "idx": 22,
       "version": "7",
       "when": 1792454400000,
-      "tag": "0022_collection_migration_state",
+      "tag": "0022_drop_collection_layout",
       "breakpoints": true
     }
   ]

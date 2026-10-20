@@ -1,7 +1,3 @@
-import { db } from "./db";
-import { records } from "./db/schema";
-import { eq, and } from "drizzle-orm";
-import { notDeleted } from "./db/queries";
 
 export {
   SELECTABLE_FIELD_TYPES,
@@ -130,18 +126,9 @@ export function inferSchemaFromData(dataRows: Record<string, unknown>[]): Collec
   };
 }
 
-export async function inferSchema(collectionId: number, layout: string | null = "shared"): Promise<CollectionSchema> {
-  if (layout === "table") {
-    const { sampleDocuments } = await import("./storage/rows");
-    return inferSchemaFromData(await sampleDocuments(collectionId, 500));
-  }
-  const sampleRecords = await db
-    .select({ data: records.data })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted))
-    .limit(500);
-
-  return inferSchemaFromData(sampleRecords.map((r) => r.data as Record<string, unknown>));
+export async function inferSchema(collectionId: number): Promise<CollectionSchema> {
+  const { sampleDocuments } = await import("./storage/rows");
+  return inferSchemaFromData(await sampleDocuments(collectionId, 500));
 }
 
 export function mergeSchema(

@@ -1,16 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { insertReturning, insertValues, updateReturning, selectLimit, dbExecute, mockBeforeCreateRecord } = vi.hoisted(() => {
-  const insertReturning = vi.fn()
-  return {
-    insertReturning,
-    insertValues: vi.fn(() => ({ returning: insertReturning })),
-    updateReturning: vi.fn(),
-    selectLimit: vi.fn(),
-    dbExecute: vi.fn(),
-    mockBeforeCreateRecord: vi.fn(),
-  }
-})
+const { dbExecute, mockBeforeCreateRecord } = vi.hoisted(() => ({
+  dbExecute: vi.fn(),
+  mockBeforeCreateRecord: vi.fn(),
+}))
 
 // Partial mock: replace the beforeCreateRecord hook so tests can make it
 // reject, but keep the module's other exports (notably the real
@@ -20,41 +13,54 @@ vi.mock('@/lib/quota', async (importOriginal) => ({
   beforeCreateRecord: mockBeforeCreateRecord,
 }))
 
+// transformRecords runs its UPDATEs inside db.transaction; the callback
+// gets a tx whose execute is the same dbExecute mock.
 vi.mock('@/lib/db', () => ({
   db: {
-    insert: vi.fn(() => ({
-      values: insertValues,
-    })),
     update: vi.fn(() => ({
       set: vi.fn(() => ({
-        where: vi.fn(() => Object.assign(Promise.resolve(undefined), { returning: updateReturning })),
+        where: vi.fn(() => Promise.resolve(undefined)),
       })),
     })),
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({
-          limit: selectLimit,
-          orderBy: vi.fn(() => ({ limit: vi.fn(() => ({ offset: vi.fn().mockResolvedValue([]) })) })),
-        })),
-        innerJoin: vi.fn(() => ({
-          innerJoin: vi.fn(() => ({
-            where: vi.fn(() => ({ limit: vi.fn().mockResolvedValue([]) })),
-          })),
-        })),
+        innerJoin: vi.fn().mockResolvedValue([]),
       })),
     })),
-    delete: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })),
     execute: dbExecute,
+    transaction: vi.fn((fn: (tx: unknown) => unknown) => fn({ execute: dbExecute })),
   },
 }))
 
-// Writes run inside withCollectionWriteLock (a transaction holding the
-// collection's advisory lock); here it hands the mocked db and the
-// caller's collection straight to the callback.
-vi.mock('@/lib/storage/lock', async () => {
-  const { db } = await import('@/lib/db')
-  return { withCollectionWriteLock: vi.fn((collection: unknown, fn: (tx: unknown, c: unknown) => unknown) => fn(db, collection)) }
-})
+// Row operations on the collection's hc_<id> table.
+vi.mock('@/lib/storage/rows', () => ({
+  insertRecords: vi.fn(),
+  upsertRecords: vi.fn(),
+  updateRecordData: vi.fn(),
+  setRecordStatus: vi.fn(),
+  softDeleteRecord: vi.fn(),
+  softDeleteAll: vi.fn().mockResolvedValue(undefined),
+  listRecords: vi.fn().mockResolvedValue([]),
+  countRecords: vi.fn().mockResolvedValue(0),
+  searchRecords: vi.fn().mockResolvedValue([]),
+}))
+
+vi.mock('@/lib/storage/compiler', () => ({
+  queryTable: vi.fn(),
+}))
+
+vi.mock('@/lib/storage/apply', () => ({
+  applyInference: vi.fn().mockResolvedValue({}),
+  markMixedProjections: vi.fn().mockResolvedValue(undefined),
+  recheckMixedProjections: vi.fn().mockResolvedValue(undefined),
+  updateRegistry: vi.fn().mockResolvedValue({}),
+}))
+
+vi.mock('@/lib/storage/ddl', () => ({
+  collectionTableExists: vi.fn().mockResolvedValue(true),
+  createCollectionTable: vi.fn().mockResolvedValue(undefined),
+  setUniqueKey: vi.fn().mockResolvedValue(undefined),
+}))
 
 vi.mock('@/lib/db/queries', () => ({
   findCollectionByNameInOrg: vi.fn(),
@@ -62,9 +68,6 @@ vi.mock('@/lib/db/queries', () => ({
   findCollectionBySlugInOrg: vi.fn(),
   findAccessibleCollectionBySlug: vi.fn(),
   createCollectionWithOwner: vi.fn(),
-  getCollectionRecordCount: vi.fn().mockResolvedValue(0),
-  queryRecords: vi.fn(),
-  notDeleted: { __notDeleted: true },
 }))
 
 vi.mock('@/lib/revalidation', () => ({
@@ -106,13 +109,20 @@ import {
   findCollectionBySlugInOrg,
   findAccessibleCollectionBySlug,
   createCollectionWithOwner,
-  queryRecords as queryRecordsEngine,
 } from '@/lib/db/queries'
+import {
+  insertRecords,
+  upsertRecords,
+  updateRecordData,
+  setRecordStatus,
+  softDeleteRecord,
+  softDeleteAll,
+} from '@/lib/storage/rows'
+import { queryTable } from '@/lib/storage/compiler'
 import { seedAutoViews } from './views'
 
 const baseCollection = {
   id: 1,
-  apiKeyId: 1,
   organizationId: 'org-test',
   name: 'Users',
   slug: 'users',
@@ -123,15 +133,16 @@ const baseCollection = {
   publishedAt: null,
   visibility: 'private',
   orgDefaultRole: 'viewer',
-  layout: 'shared',
   storage: {},
-  migrationState: null,
-  migrationSwappedAt: null,
-  migrationReport: null,
-  migrationError: null,
   createdAt: new Date(),
   updatedAt: new Date(),
 }
+
+/** Shorthand for the rows a mocked insert/upsert hands back. */
+type Rows = Awaited<ReturnType<typeof insertRecords>>
+const rows = (...items: Record<string, unknown>[]) => items as unknown as Rows
+const upserted = (...results: { action: 'created' | 'updated' | 'skipped'; record: Record<string, unknown> }[]) =>
+  ({ results } as unknown as Awaited<ReturnType<typeof upsertRecords>>)
 
 const mockOrg = {
   id: 'org-test',
@@ -169,7 +180,7 @@ describe('createRecords', () => {
     vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
     vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
     vi.mocked(createCollectionWithOwner).mockResolvedValue({ ...baseCollection, name: 'New', slug: 'new-aaaaaaaa' })
-    insertReturning.mockResolvedValue([{ id: 1, data: { hello: 'world' } }])
+    vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { hello: 'world' } }))
 
     const result = await createRecords('user-test', 'org-test', { collection: 'New', data: { hello: 'world' } })
 
@@ -183,7 +194,7 @@ describe('createRecords', () => {
 
   it('uses the fast batch path when no unique_key is set', async () => {
     vi.mocked(findCollectionByNameInOrg).mockResolvedValue(baseCollection)
-    insertReturning.mockResolvedValue([{ id: 1 }, { id: 2 }, { id: 3 }])
+    vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }, { id: 2 }, { id: 3 }))
 
     const result = await createRecords('user-test', 'org-test', {
       collection: 'Users',
@@ -203,7 +214,7 @@ describe('createRecords', () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
       vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
       vi.mocked(findCollectionByNameInsensitiveInOrg).mockResolvedValue(myTasks)
-      insertReturning.mockResolvedValue([{ id: 2, data: { n: 2 } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 2, data: { n: 2 } }))
 
       const result = await createRecords('user-test', 'org-test', { collection: 'my_tasks', data: { n: 2 } })
 
@@ -231,7 +242,7 @@ describe('createRecords', () => {
         constraint: 'idx_collections_org_name',
       })
       vi.mocked(createCollectionWithOwner).mockRejectedValue(Object.assign(new Error('Failed query: insert into "collections"'), { cause: pgErr }))
-      insertReturning.mockResolvedValue([{ id: 1, data: { n: 1 } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { n: 1 } }))
 
       const result = await createRecords('user-test', 'org-test', { collection: 'my_tasks', data: { n: 1 } })
 
@@ -263,7 +274,7 @@ describe('createRecords', () => {
         name: 'Tasks',
         slug: 'tasks-aaaaaaaa',
       })
-      insertReturning.mockResolvedValue([{ id: 1, data: { due_date: '2026-05-01', priority: 'high' } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { due_date: '2026-05-01', priority: 'high' } }))
 
       await createRecords('user-test', 'org-test', {
         collection: 'Tasks',
@@ -285,7 +296,7 @@ describe('createRecords', () => {
 
     it('does NOT call seedAutoViews when the collection already exists', async () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue(baseCollection)
-      insertReturning.mockResolvedValue([{ id: 1, data: { due_date: '2026-05-01' } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { due_date: '2026-05-01' } }))
 
       await createRecords('user-test', 'org-test', {
         collection: 'Users',
@@ -299,7 +310,7 @@ describe('createRecords', () => {
   describe('summary field (issue #447)', () => {
     it('returns a singular summary for a single created record', async () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue({ ...baseCollection, name: 'Bookmarks', slug: 'bookmarks' })
-      insertReturning.mockResolvedValue([{ id: 1, data: { url: 'x' } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { url: 'x' } }))
 
       const result = await createRecords('user-test', 'org-test', { collection: 'Bookmarks', data: { url: 'x' } })
 
@@ -310,7 +321,7 @@ describe('createRecords', () => {
 
     it('returns a plural summary for a bulk all-created insert', async () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue({ ...baseCollection, name: 'Bookmarks', slug: 'bookmarks' })
-      insertReturning.mockResolvedValue([{ id: 1 }, { id: 2 }, { id: 3 }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }, { id: 2 }, { id: 3 }))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -324,7 +335,7 @@ describe('createRecords', () => {
 
     it('uses singular grammar when bulk has exactly one record', async () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue({ ...baseCollection, name: 'Bookmarks', slug: 'bookmarks' })
-      insertReturning.mockResolvedValue([{ id: 1 }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -340,7 +351,7 @@ describe('createRecords', () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
       vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
       vi.mocked(createCollectionWithOwner).mockResolvedValue({ ...baseCollection, name: 'Bookmarks', slug: 'bookmarks-aaaaaaaa' })
-      insertReturning.mockResolvedValue([{ id: 1, data: { url: 'x' } }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1, data: { url: 'x' } }))
 
       const result = await createRecords('user-test', 'org-test', { collection: 'Bookmarks', data: { url: 'x' } })
 
@@ -353,7 +364,7 @@ describe('createRecords', () => {
       vi.mocked(findCollectionByNameInOrg).mockResolvedValue(undefined as never)
       vi.mocked(findCollectionBySlugInOrg).mockResolvedValue(undefined as never)
       vi.mocked(createCollectionWithOwner).mockResolvedValue({ ...baseCollection, name: 'Bookmarks', slug: 'bookmarks-aaaaaaaa' })
-      insertReturning.mockResolvedValue([{ id: 1 }, { id: 2 }, { id: 3 }])
+      vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }, { id: 2 }, { id: 3 }))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -373,8 +384,7 @@ describe('createRecords', () => {
         uniqueKey: ['url'],
       })
       // existing record found -> update path
-      selectLimit.mockResolvedValue([{ id: 7, data: { url: 'x', title: 'old' } }])
-      updateReturning.mockResolvedValue([{ id: 7, data: { url: 'x', title: 'new' } }])
+      vi.mocked(upsertRecords).mockResolvedValue(upserted({ action: 'updated', record: { id: 7, data: { url: 'x', title: 'new' } } }))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -382,6 +392,7 @@ describe('createRecords', () => {
         on_conflict: 'merge',
       })
 
+      expect(upsertRecords).toHaveBeenCalledWith(1, [{ url: 'x', title: 'new' }], ['url'], 'merge')
       expect(result).toEqual(expect.objectContaining({
         summary: 'Updated 1 record in Bookmarks',
       }))
@@ -394,13 +405,15 @@ describe('createRecords', () => {
         slug: 'bookmarks',
         uniqueKey: ['url'],
       })
-      selectLimit.mockResolvedValue([{ id: 7, data: { url: 'x' } }])
+      vi.mocked(upsertRecords).mockResolvedValue(upserted({ action: 'skipped', record: { id: 7, data: { url: 'x' } } }))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
         data: { url: 'x' },
         on_conflict: 'skip',
       })
+
+      expect(upsertRecords).toHaveBeenCalledWith(1, [{ url: 'x' }], ['url'], 'skip')
 
       expect(result).toEqual(expect.objectContaining({
         summary: 'Skipped 1 record in Bookmarks',
@@ -414,15 +427,12 @@ describe('createRecords', () => {
         slug: 'bookmarks',
         uniqueKey: ['url'],
       })
-      // First call: existing match -> updated. Second & third: no match -> created.
-      selectLimit
-        .mockResolvedValueOnce([{ id: 1, data: { url: 'a', title: 'old' } }])
-        .mockResolvedValueOnce([])
-        .mockResolvedValueOnce([])
-      updateReturning.mockResolvedValue([{ id: 1, data: { url: 'a', title: 'new' } }])
-      insertReturning
-        .mockResolvedValueOnce([{ id: 2, data: { url: 'b' } }])
-        .mockResolvedValueOnce([{ id: 3, data: { url: 'c' } }])
+      // First: existing match -> updated. Second & third: no match -> created.
+      vi.mocked(upsertRecords).mockResolvedValue(upserted(
+        { action: 'updated', record: { id: 1, data: { url: 'a', title: 'new' } } },
+        { action: 'created', record: { id: 2, data: { url: 'b' } } },
+        { action: 'created', record: { id: 3, data: { url: 'c' } } },
+      ))
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -451,7 +461,7 @@ describe('createRecords', () => {
         slug: 'bookmarks',
         uniqueKey: ['url'],
       })
-      selectLimit.mockResolvedValue([{ id: 7, data: { url: 'x' } }])
+      vi.mocked(upsertRecords).mockResolvedValue({ conflict: true })
 
       const result = await createRecords('user-test', 'org-test', {
         collection: 'Bookmarks',
@@ -509,9 +519,8 @@ describe('createRecords', () => {
       expect(findCollectionByNameInOrg).not.toHaveBeenCalled()
       expect(findCollectionBySlugInOrg).not.toHaveBeenCalled()
       expect(createCollectionWithOwner).not.toHaveBeenCalled()
-      const { db } = await import('@/lib/db')
-      expect(vi.mocked(db.insert)).not.toHaveBeenCalled()
-      expect(insertReturning).not.toHaveBeenCalled()
+      expect(insertRecords).not.toHaveBeenCalled()
+      expect(upsertRecords).not.toHaveBeenCalled()
     })
 
     it('still propagates non-quota errors from beforeCreateRecord (not swallowed)', async () => {
@@ -522,7 +531,7 @@ describe('createRecords', () => {
       ).rejects.toThrow('quota backend unreachable')
 
       expect(findCollectionByNameInOrg).not.toHaveBeenCalled()
-      expect(insertReturning).not.toHaveBeenCalled()
+      expect(insertRecords).not.toHaveBeenCalled()
     })
   })
 })
@@ -532,19 +541,19 @@ describe('queryRecords', () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
     const result = await queryRecords('users', 'user-test', {})
     expect(result).toBeNull()
-    expect(queryRecordsEngine).not.toHaveBeenCalled()
+    expect(queryTable).not.toHaveBeenCalled()
   })
 
-  it('forwards the collectionId to the query engine when access is granted', async () => {
+  it('forwards the collection to the query engine when access is granted', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'viewer' })
-    vi.mocked(queryRecordsEngine).mockResolvedValue({ records: [], total: 0, count: 0, limit: 50, offset: 0, has_more: false, next_offset: null })
+    vi.mocked(queryTable).mockResolvedValue({ records: [], total: 0, count: 0, limit: 50, offset: 0, has_more: false, next_offset: null, indexed: true, plan: '' })
 
     await queryRecords('users', 'user-test', { search: 'foo' })
 
-    expect(queryRecordsEngine).toHaveBeenCalledWith(expect.objectContaining({
-      collectionId: baseCollection.id,
-      search: 'foo',
-    }))
+    expect(queryTable).toHaveBeenCalledWith(
+      expect.objectContaining({ id: baseCollection.id }),
+      expect.objectContaining({ search: 'foo' }),
+    )
   })
 })
 
@@ -559,6 +568,7 @@ describe('truncateRecords', () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
     const result = await truncateRecords('users', 'user-test')
     expect(result).toEqual({ truncated: true, slug: 'users' })
+    expect(softDeleteAll).toHaveBeenCalledWith(1)
   })
 })
 
@@ -571,15 +581,16 @@ describe('updateRecord', () => {
 
   it('returns 404 when no row matches the record id', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    updateReturning.mockResolvedValue([])
+    vi.mocked(updateRecordData).mockResolvedValue(undefined)
     const result = await updateRecord('users', 'user-test', 99, { name: 'Alice' })
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
 
   it('returns the updated record on success', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    updateReturning.mockResolvedValue([{ id: 5, data: { name: 'Alice' } }])
+    vi.mocked(updateRecordData).mockResolvedValue(rows({ id: 5, data: { name: 'Alice' } })[0])
     const result = await updateRecord('users', 'user-test', 5, { name: 'Alice' })
+    expect(updateRecordData).toHaveBeenCalledWith(1, 5, { name: 'Alice' })
     expect(result).toEqual(expect.objectContaining({ updated: true }))
   })
 })
@@ -621,6 +632,7 @@ describe('transformRecords', () => {
     const renderedChunks = (dbExecute.mock.calls[0][0] as { queryChunks?: unknown[] }).queryChunks ?? []
     const sqlText = JSON.stringify(renderedChunks)
     expect(sqlText).toContain('::text')
+    expect(sqlText).toContain('\\"hc_1\\"')
   })
 
   it('remove_fields only touches records holding a removed field and counts them', async () => {
@@ -657,7 +669,7 @@ describe('updateRecordStatus', () => {
 
   it('returns 404 when the record does not exist', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    updateReturning.mockResolvedValue([])
+    vi.mocked(setRecordStatus).mockResolvedValue(undefined)
     const result = await updateRecordStatus('users', 'user-test', 99, 'active')
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
@@ -672,15 +684,16 @@ describe('deleteRecord', () => {
 
   it('returns 404 when no matching active record exists', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    selectLimit.mockResolvedValue([])
+    vi.mocked(softDeleteRecord).mockResolvedValue(false)
     const result = await deleteRecord('users', 'user-test', 99)
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
 
   it('soft-deletes and returns the id when the record exists', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    selectLimit.mockResolvedValue([{ id: 5 }])
+    vi.mocked(softDeleteRecord).mockResolvedValue(true)
     const result = await deleteRecord('users', 'user-test', 5)
+    expect(softDeleteRecord).toHaveBeenCalledWith(1, 5)
     expect(result).toEqual({ deleted: true, id: 5 })
   })
 })
@@ -721,12 +734,12 @@ describe('exportRecords', () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue(undefined as never)
     const result = await exportRecords('users', 'user-test', {})
     expect(result).toBeNull()
-    expect(queryRecordsEngine).not.toHaveBeenCalled()
+    expect(queryTable).not.toHaveBeenCalled()
   })
 
   it('defaults to JSON with count/total/truncated metadata', async () => {
     grantAccess()
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: engineRows, total: 2, count: 2, limit: 1000, offset: 0, has_more: false, next_offset: null,
     } as never)
 
@@ -751,7 +764,7 @@ describe('exportRecords', () => {
 
   it('serializes CSV with system columns first and nested values JSON-stringified', async () => {
     grantAccess()
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: engineRows, total: 2, count: 2, limit: 1000, offset: 0, has_more: false, next_offset: null,
     } as never)
 
@@ -764,7 +777,7 @@ describe('exportRecords', () => {
 
   it('forwards filter/search/sort/fields to the engine and clamps limit to 10000', async () => {
     grantAccess()
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: [], total: 0, count: 0, limit: 10000, offset: 0, has_more: false, next_offset: null,
     } as never)
 
@@ -776,30 +789,32 @@ describe('exportRecords', () => {
       limit: 99999,
     })
 
-    expect(queryRecordsEngine).toHaveBeenCalledWith(expect.objectContaining({
-      collectionId: baseCollection.id,
-      filter: { status: { $ne: 'archived' } },
-      search: 'foo',
-      sort: '-created_at',
-      fields: ['title'],
-      limit: 10000,
-      limitCap: 10000,
-    }))
+    expect(queryTable).toHaveBeenCalledWith(
+      expect.objectContaining({ id: baseCollection.id }),
+      expect.objectContaining({
+        filter: { status: { $ne: 'archived' } },
+        search: 'foo',
+        sort: '-created_at',
+        fields: ['title'],
+        limit: 10000,
+        limitCap: 10000,
+      }),
+    )
   })
 
   it('defaults limit to 1000', async () => {
     grantAccess()
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: [], total: 0, count: 0, limit: 1000, offset: 0, has_more: false, next_offset: null,
     } as never)
 
     await exportRecords('users', 'user-test', {})
-    expect(queryRecordsEngine).toHaveBeenCalledWith(expect.objectContaining({ limit: 1000 }))
+    expect(queryTable).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ limit: 1000 }))
   })
 
   it('sets truncated=true when the query has more rows than the limit', async () => {
     grantAccess()
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: engineRows, total: 5000, count: 2, limit: 2, offset: 0, has_more: true, next_offset: 2,
     } as never)
 
@@ -812,16 +827,16 @@ describe('importRecords', () => {
   beforeEach(() => {
     // createRecords path: collection exists, no unique key, batch insert.
     vi.mocked(findCollectionByNameInOrg).mockResolvedValue(baseCollection)
-    insertReturning.mockResolvedValue([{ id: 1 }, { id: 2 }])
+    vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }, { id: 2 }))
   })
 
   it('parses CSV (with type inference) and routes through createRecords', async () => {
     const content = 'name,age,active\r\nAlice,30,true\r\nBob,forty,false\r\n'
     const result = await importRecords('user-test', 'org-test', { collection: 'Users', content })
 
-    expect(insertValues).toHaveBeenCalledWith([
-      expect.objectContaining({ collectionId: 1, data: { name: 'Alice', age: 30, active: true } }),
-      expect.objectContaining({ collectionId: 1, data: { name: 'Bob', age: 'forty', active: false } }),
+    expect(insertRecords).toHaveBeenCalledWith(1, [
+      { name: 'Alice', age: 30, active: true },
+      { name: 'Bob', age: 'forty', active: false },
     ])
     expect(result).toEqual(expect.objectContaining({
       collection: { name: 'Users', slug: 'users' },
@@ -846,7 +861,7 @@ describe('importRecords', () => {
 
   it('passes on_conflict through to createRecords upsert handling', async () => {
     vi.mocked(findCollectionByNameInOrg).mockResolvedValue({ ...baseCollection, uniqueKey: ['name'] })
-    selectLimit.mockResolvedValue([{ id: 7, data: { name: 'Alice', age: 1 } }])
+    vi.mocked(upsertRecords).mockResolvedValue(upserted({ action: 'skipped', record: { id: 7, data: { name: 'Alice', age: 1 } } }))
 
     const result = await importRecords('user-test', 'org-test', {
       collection: 'Users',
@@ -854,6 +869,7 @@ describe('importRecords', () => {
       on_conflict: 'skip',
     })
 
+    expect(upsertRecords).toHaveBeenCalledWith(1, [{ name: 'Alice', age: 30 }], ['name'], 'skip')
     expect(result).toEqual(expect.objectContaining({ count: 1, created: 0, updated: 0, skipped: 1 }))
   })
 
@@ -869,24 +885,19 @@ describe('importRecords', () => {
       content: JSON.stringify([{ name: 'Alice' }, { name: 'Bob' }]),
     })
 
-    expect(insertValues).toHaveBeenCalledWith([
-      expect.objectContaining({ data: { name: 'Alice' } }),
-      expect.objectContaining({ data: { name: 'Bob' } }),
-    ])
+    expect(insertRecords).toHaveBeenCalledWith(1, [{ name: 'Alice' }, { name: 'Bob' }])
     expect(result).toEqual(expect.objectContaining({ count: 2 }))
   })
 
   it('unwraps hutch_export_records JSON output so exports round-trip', async () => {
-    insertReturning.mockResolvedValue([{ id: 1 }])
+    vi.mocked(insertRecords).mockResolvedValue(rows({ id: 1 }))
     const exported = JSON.stringify([
       { id: 9, created_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-02T00:00:00.000Z', data: { title: 'Hello' } },
     ])
 
     await importRecords('user-test', 'org-test', { collection: 'Users', format: 'json', content: exported })
 
-    expect(insertValues).toHaveBeenCalledWith([
-      expect.objectContaining({ data: { title: 'Hello' } }),
-    ])
+    expect(insertRecords).toHaveBeenCalledWith(1, [{ title: 'Hello' }])
   })
 
   it('returns 400 when content exceeds the 10MB limit before parsing', async () => {
@@ -895,7 +906,7 @@ describe('importRecords', () => {
       content: 'a'.repeat(10 * 1024 * 1024 + 1),
     })
     expect(result).toEqual({ error: 'Import content exceeds 10MB limit', status: 400 })
-    expect(insertValues).not.toHaveBeenCalled()
+    expect(insertRecords).not.toHaveBeenCalled()
   })
 
   it('returns 400 when the parsed content exceeds 10000 records', async () => {
@@ -906,7 +917,7 @@ describe('importRecords', () => {
       content,
     })
     expect(result).toEqual({ error: 'Import is limited to 10000 records per call', status: 400 })
-    expect(insertValues).not.toHaveBeenCalled()
+    expect(insertRecords).not.toHaveBeenCalled()
   })
 
   it('returns 400 for invalid JSON content', async () => {
@@ -923,7 +934,7 @@ describe('importRecords', () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({
       organization: mockOrg, collection: baseCollection, role: 'viewer',
     })
-    vi.mocked(queryRecordsEngine).mockResolvedValue({
+    vi.mocked(queryTable).mockResolvedValue({
       records: [{
         id: 3,
         createdAt: new Date('2026-02-01T00:00:00.000Z'),
@@ -935,16 +946,14 @@ describe('importRecords', () => {
     const exported = await exportRecords('users', 'user-test', { format: 'csv' })
 
     // Import side
-    insertReturning.mockResolvedValue([{ id: 4 }])
+    vi.mocked(insertRecords).mockResolvedValue(rows({ id: 4 }))
     await importRecords('user-test', 'org-test', {
       collection: 'Users',
       content: (exported as { content: string }).content,
     })
 
-    expect(insertValues).toHaveBeenCalledWith([
-      expect.objectContaining({
-        data: { title: 'Widget, "deluxe"', price: 19.99, in_stock: true, meta: { color: 'red' }, notes: 'a\nb' },
-      }),
+    expect(insertRecords).toHaveBeenCalledWith(1, [
+      { title: 'Widget, "deluxe"', price: 19.99, in_stock: true, meta: { color: 'red' }, notes: 'a\nb' },
     ])
   })
 })

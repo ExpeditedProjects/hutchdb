@@ -1,12 +1,9 @@
 import { cache } from "react";
 import { db } from "./index";
-import { collections, records, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, asc, isNull, inArray, SQL } from "drizzle-orm";
-import { FIELD_NAME_RE } from "@/lib/constants";
+import { collections, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
+import { eq, and, sql, asc, inArray, SQL } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
-import { defaultStorageLayout } from "@/lib/storage/registry";
-
-export const notDeleted = isNull(records.deletedAt);
+import { createCollectionTable } from "@/lib/storage/ddl";
 
 export type CollectionAccess = {
   collection: typeof collections.$inferSelect;
@@ -173,7 +170,7 @@ export async function findCollectionBySlugInOrg(slug: string, organizationId: st
 }
 
 /**
- * Insert a collection and its owner row atomically. The collection lands in
+ * Insert a collection, its owner row and its hc_<id> table atomically. The collection lands in
  * the supplied org; the caller becomes its owner via collection_members.
  */
 export async function createCollectionWithOwner(
@@ -183,17 +180,14 @@ export async function createCollectionWithOwner(
   }
 ): Promise<typeof collections.$inferSelect> {
   const { ownerUserId, ...collectionValues } = values;
-  // HUTCH_STORAGE_LAYOUT=table gives new collections their own table; unset
-  // (or "shared") leaves the insert exactly as it was, so the column default
-  // ('shared') applies. An explicit layout from the caller always wins.
-  const layout = defaultStorageLayout();
-  const insertValues = layout === "shared" || collectionValues.layout ? collectionValues : { ...collectionValues, layout };
   return db.transaction(async (tx) => {
-    const [created] = await tx.insert(collections).values(insertValues).returning();
+    const [created] = await tx.insert(collections).values(collectionValues).returning();
     await tx
       .insert(collectionMembers)
       .values({ collectionId: created.id, userId: ownerUserId, role: "owner" })
       .onConflictDoNothing();
+    // Every collection's rows live in its own table (src/lib/storage).
+    await createCollectionTable(tx, created.id);
     return created;
   });
 }
@@ -219,23 +213,6 @@ export async function findPublishedCollectionBySlug(slug: string) {
     .where(and(eq(collections.slug, slug), eq(collections.published, true)))
     .limit(1);
   return collection;
-}
-
-export async function getCollectionRecordCount(collectionId: number): Promise<number> {
-  const [result] = await db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted));
-  return result?.count ?? 0;
-}
-
-export async function getLastRecordAt(collectionId: number): Promise<Date | null> {
-  const [result] = await db
-    .select({ lastAt: sql<Date>`max(${records.createdAt})` })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted))
-    .limit(1);
-  return result?.lastAt ?? null;
 }
 
 export type QueryParams = {
@@ -315,25 +292,22 @@ export function isOperatorSpec(value: unknown): value is Record<string, unknown>
  * cast errors; string operands compare lexicographically as text (which
  * also works for ISO-8601 date strings).
  *
- * `data` is the document column: the shared `records.data` by default, or
- * an aliased column (`t.data`, `e.val`) for the table-layout compiler.
+ * `data` is the document column the compiler aliases (`t.data`, `e.val`).
  */
-export function buildFilterConditions(filter: Record<string, unknown>, data: DataRef = records.data): SQL[] {
+export function buildFilterConditions(filter: Record<string, unknown>, data: SQL): SQL[] {
   const conditions: SQL[] = [];
   const containment: Record<string, unknown> = {};
 
   for (const [field, value] of Object.entries(filter)) {
-    // A dotted key ("address.city") addresses a nested object, and still
-    // matches a literal top-level key of that name (e.g. a CSV column
-    // "first.name"), as it did before paths existed. Any other key is a
-    // literal top-level key.
+    // A dotted key ("address.city") addresses a nested object; any other
+    // key is a literal top-level key.
     const path = dottedPathSegments(field);
     if (isOperatorSpec(value)) {
       for (const [op, operand] of Object.entries(value)) {
         conditions.push(buildOperatorCondition(field, op, operand, path, data));
       }
     } else if (path) {
-      conditions.push(sql`(${data} @> ${JSON.stringify(nestValue(path, value))}::jsonb OR ${data} @> ${JSON.stringify({ [field]: value })}::jsonb)`);
+      conditions.push(sql`${data} @> ${JSON.stringify(nestValue(path, value))}::jsonb`);
     } else {
       containment[field] = value;
     }
@@ -346,35 +320,21 @@ export function buildFilterConditions(filter: Record<string, unknown>, data: Dat
   return conditions;
 }
 
-/** A reference to the jsonb document column a filter compiles against. */
-export type DataRef = SQL | typeof records.data;
-
 /**
- * One operator condition. `data` is the document column (see
- * buildFilterConditions). `literalKey: false` drops the literal top-level
- * key fallback for dotted paths: the table-layout compiler addresses only
- * the nested path, so its document route matches its projection columns.
+ * One operator condition against the document column `data` (see
+ * buildFilterConditions). Top-level fields use `->` / `->>` / `?`; dotted
+ * object paths use `#>` / `#>>` with the path bound as a text[] parameter.
  */
 export function buildOperatorCondition(
   field: string,
   op: string,
   operand: unknown,
-  path: string[] | null = null,
-  data: DataRef = records.data,
-  literalKey = true,
+  path: string[] | null,
+  data: SQL,
 ): SQL {
-  // Top-level fields keep their original `->` / `->>` / `?` SQL; dotted
-  // object paths use `#>` / `#>>` with the path bound as a text[] parameter,
-  // falling back to a literal top-level key of the same name.
-  const json = !path ? sql`${data}->${field}`
-    : literalKey ? sql`coalesce(${data} #> ${pathLiteral(path)}::text[], ${data}->${field})`
-    : sql`${data} #> ${pathLiteral(path)}::text[]`;
-  const text = !path ? sql`${data}->>${field}`
-    : literalKey ? sql`coalesce(${data} #>> ${pathLiteral(path)}::text[], ${data}->>${field})`
-    : sql`${data} #>> ${pathLiteral(path)}::text[]`;
-  const contains = (v: unknown) => !path ? sql`${data} @> ${JSON.stringify({ [field]: v })}::jsonb`
-    : literalKey ? sql`(${data} @> ${JSON.stringify(nestValue(path, v))}::jsonb OR ${data} @> ${JSON.stringify({ [field]: v })}::jsonb)`
-    : sql`${data} @> ${JSON.stringify(nestValue(path, v))}::jsonb`;
+  const json = path ? sql`${data} #> ${pathLiteral(path)}::text[]` : sql`${data}->${field}`;
+  const text = path ? sql`${data} #>> ${pathLiteral(path)}::text[]` : sql`${data}->>${field}`;
+  const contains = (v: unknown) => sql`${data} @> ${JSON.stringify(path ? nestValue(path, v) : { [field]: v })}::jsonb`;
 
   if (Object.hasOwn(COMPARISON_OPS, op)) {
     const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
@@ -434,183 +394,7 @@ export function projectData(data: unknown, fields: string[]): unknown {
   return projected;
 }
 
-export async function queryRecords(params: QueryParams) {
-  const {
-    collectionId,
-    filter,
-    search,
-    sort,
-    fields,
-    createdAfter,
-    createdBefore,
-    limit = 50,
-    offset = 0,
-    limitCap = 1000,
-    groupBy,
-    aggregate,
-    timeBucket,
-  } = params;
-
-  const conditions: SQL[] = [eq(records.collectionId, collectionId), notDeleted];
-
-  if (filter && Object.keys(filter).length > 0) {
-    conditions.push(...buildFilterConditions(filter));
-  }
-
-  if (search) {
-    conditions.push(
-      sql`to_tsvector('english', ${records.data}::text) @@ plainto_tsquery('english', ${search})`
-    );
-  }
-
-  if (createdAfter) {
-    conditions.push(sql`${records.createdAt} >= ${createdAfter}::timestamptz`);
-  }
-
-  if (createdBefore) {
-    conditions.push(sql`${records.createdAt} < ${createdBefore}::timestamptz`);
-  }
-
-  const whereClause = conditions.length > 1
-    ? and(...conditions)!
-    : conditions[0];
-
-  // Handle aggregation queries
-  const groupByKeys = normalizeGroupBy(groupBy);
-  if (groupByKeys.length > 0 || aggregate) {
-    return queryWithAggregation(whereClause, { groupBy: groupByKeys, aggregate, timeBucket, sort, limit });
-  }
-
-  const { orderBy, valuePath: sortPath } = buildRecordSort(sort);
-
-  const clampedLimit = Math.min(Math.max(limit, 1), limitCap);
-
-  const selectQuery = db
-    .select()
-    .from(records)
-    .where(whereClause)
-    .orderBy(orderBy)
-    .limit(clampedLimit)
-    .offset(offset);
-
-  let results: typeof selectQuery extends Promise<infer R> ? R : never;
-  let total: number;
-
-  if (offset === 0) {
-    // First page: wait for results; if they fit in one page, results.length is the total.
-    results = await selectQuery;
-    await assertSortedPageIsOrdered(collectionId, sort, sortPath, results);
-    total = results.length < clampedLimit ? results.length : await runCount(whereClause);
-  } else {
-    // Paginated read: count and results are independent — run in parallel.
-    const [rs, [{ count }]] = await Promise.all([selectQuery, runCountQuery(whereClause)]);
-    results = rs;
-    total = count;
-    await assertSortedPageIsOrdered(collectionId, sort, sortPath, results);
-  }
-
-  const projected = fields && fields.length > 0
-    ? results.map((r) => ({ ...r, data: projectData(r.data, fields) }))
-    : results;
-
-  const hasMore = offset + results.length < total;
-  return {
-    records: projected,
-    total,
-    count: results.length,
-    limit: clampedLimit,
-    offset,
-    has_more: hasMore,
-    next_offset: hasMore ? offset + results.length : null,
-  };
-}
-
-/**
- * ORDER BY for a records query. `valuePath` is the data path the sort reads
- * (absent for system columns and `id`), used to detect a sort on a field no
- * record has. Every order ends on the row id so ties (equal values, records
- * from one batch sharing created_at) come back in the same order every time
- * and top-N pages are stable.
- */
-export function buildRecordSort(sort: string | undefined): { orderBy: SQL; valuePath?: string[] } {
-  if (sort === undefined || sort === null || sort === "") {
-    return { orderBy: sql`${records.createdAt} DESC, ${records.id} DESC` };
-  }
-  const descending = sort.startsWith("-");
-  const field = descending ? sort.slice(1) : sort;
-  const dir = sql.raw(descending ? "DESC" : "ASC");
-
-  if (field === "created_at") return { orderBy: sql`${records.createdAt} ${dir}, ${records.id} ${dir}` };
-  if (field === "updated_at") return { orderBy: sql`${records.updatedAt} ${dir}, ${records.id} ${dir}` };
-  if (field === "id") {
-    // A data field named `id` sorts as it always has; records without one
-    // (the usual case) fall through to the record id, so `id` is always valid.
-    return { orderBy: sql`${records.data}->${field} ${dir} NULLS LAST, ${records.id} ${dir}` };
-  }
-  if (FIELD_NAME_RE.test(field)) {
-    // `->` keeps jsonb typing so numbers sort numerically; `->>` would cast
-    // to text and sort them lexicographically ("12" < "3" < "5").
-    return { orderBy: sql`${records.data}->${field} ${dir} NULLS LAST, ${records.id} ASC`, valuePath: [field] };
-  }
-  const path = dottedPathSegments(field);
-  if (path) {
-    // `#>` keeps jsonb typing too.
-    return { orderBy: sql`${records.data} #> ${pathLiteral(path)}::text[] ${dir} NULLS LAST, ${records.id} ASC`, valuePath: path };
-  }
-  throw new Error(`Invalid sort field '${field}' — ${SORT_FIELD_HELP}`);
-}
-
-function valueAtPath(data: unknown, path: string[]): unknown {
-  let current: unknown = data;
-  for (const key of path) {
-    if (!isPlainObject(current) || !Object.hasOwn(current, key)) return undefined;
-    current = current[key];
-  }
-  return current;
-}
-
-/**
- * A sort on a field or path no record has (a typo, or a path into an
- * array) orders every row by NULL and would silently return the default
- * order. Sorting is NULLS LAST, so when the page's first row has a value
- * the sort was applied and no extra query runs; otherwise one EXISTS
- * probe over the collection's live records decides whether to refuse it.
- * An empty page has no order to get wrong.
- */
-async function assertSortedPageIsOrdered(
-  collectionId: number,
-  sort: string | undefined,
-  path: string[] | undefined,
-  rows: { data: unknown }[],
-): Promise<void> {
-  if (!path || rows.length === 0 || valueAtPath(rows[0].data, path) !== undefined) return;
-  const [found] = await db
-    .select({ one: sql<number>`1` })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted, sql`${records.data} #> ${pathLiteral(path)}::text[] IS NOT NULL`))
-    .limit(1);
-  if (!found) {
-    const field = sort!.startsWith("-") ? sort!.slice(1) : sort!;
-    throw new Error(`Invalid sort field '${field}': no record in this collection has it — ${SORT_FIELD_HELP}`);
-  }
-}
-
-function runCountQuery(whereClause: SQL) {
-  return db
-    .select({ count: sql<number>`count(*)::int` })
-    .from(records)
-    .where(whereClause);
-}
-
-async function runCount(whereClause: SQL): Promise<number> {
-  const [{ count }] = await runCountQuery(whereClause);
-  return count;
-}
-
 export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
-
-/** Internal column carrying the group count; stripped from every result row. */
-const TOTAL_COLUMN = "__hutch_total";
 
 export function normalizeGroupBy(groupBy: string | string[] | undefined): string[] {
   if (Array.isArray(groupBy)) {
@@ -622,150 +406,6 @@ export function normalizeGroupBy(groupBy: string | string[] | undefined): string
     return groupBy;
   }
   return groupBy ? [groupBy] : [];
-}
-
-/** `data->'f'` for a top-level field, `data #> '{a,b,c}'` for a dotted object path (jsonb). */
-function jsonbAt(field: string): string {
-  const segments = escapeFieldPath(field).split(".");
-  return segments.length === 1 ? `data->'${segments[0]}'` : `data #> '${pathLiteral(segments)}'`;
-}
-
-/** `data->>'f'` / `data #>> '{a,b,c}'` (text). */
-function textAt(field: string): string {
-  const segments = escapeFieldPath(field).split(".");
-  return segments.length === 1 ? `data->>'${segments[0]}'` : `data #>> '${pathLiteral(segments)}'`;
-}
-
-/**
- * Build the aggregate statement. Every identifier and path is validated
- * (escapeField / escapeFieldPath) before it is interpolated; filter values
- * stay bound parameters inside whereClause.
- *
- * Ordering happens before LIMIT, so `sort: "-alias", limit: 10` is the true
- * top 10 groups. `count(*) OVER ()` runs after grouping and before LIMIT,
- * giving the number of groups for the response's `total`.
- */
-export function buildAggregationQuery(
-  whereClause: SQL,
-  params: { groupBy?: string[]; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; sort?: string; limit?: number }
-): SQL {
-  const { groupBy = [], aggregate, timeBucket, sort, limit = 50 } = params;
-
-  const selectParts: string[] = [];
-  const groupByParts: string[] = [];
-  // Output columns addressable by sort, mapped to their select-list ordinal.
-  // Ordinals keep ORDER BY unambiguous with real columns such as `status`.
-  const sortable = new Map<string, number>();
-  const defaultOrder: number[] = [];
-
-  if (timeBucket) {
-    selectParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at) as time_bucket`);
-    groupByParts.push(`date_trunc('${escapeBucket(timeBucket)}', created_at)`);
-    sortable.set("time_bucket", selectParts.length);
-    defaultOrder.push(selectParts.length);
-  }
-
-  for (const key of groupBy) {
-    // Result columns are named by the key itself; a validated path only
-    // holds [a-zA-Z0-9_.], so it is safe inside a quoted identifier.
-    selectParts.push(`${textAt(key)} as "${escapeFieldPath(key)}"`);
-    groupByParts.push(textAt(key));
-    sortable.set(key, selectParts.length);
-    // Without a time bucket the first group key leads the default order, as
-    // before; further keys make the order within it deterministic.
-    defaultOrder.push(selectParts.length);
-  }
-
-  if (aggregate) {
-    for (const [alias, spec] of Object.entries(aggregate)) {
-      if (spec === "count" || (isPlainObject(spec) && "count" in spec)) {
-        selectParts.push(`count(*)::int as "${escapeField(alias)}"`);
-        sortable.set(alias, selectParts.length);
-        continue;
-      }
-      const specEntry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
-      if (!specEntry) {
-        const label = typeof spec === "string" ? spec : JSON.stringify(spec);
-        throw new Error(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
-      }
-      const [op, field] = specEntry;
-      const json = jsonbAt(field);
-      const text = textAt(field);
-      const safeAlias = escapeField(alias);
-      // Numeric values only (jsonb_typeof guard), so mixed-type fields can't
-      // raise cast errors. Results go through to_jsonb because node-postgres
-      // returns a bare numeric as a string; jsonb comes back as a JS number.
-      const numeric = `CASE WHEN jsonb_typeof(${json}) = 'number' THEN (${text})::numeric END`;
-      switch (op) {
-        case "min":
-        case "max":
-          // Numeric when the field holds any numbers (as text "10" < "9"),
-          // otherwise text so strings and ISO dates still order correctly.
-          selectParts.push(`coalesce(to_jsonb(${op}(${numeric})), to_jsonb(${op}(${text}))) as "${safeAlias}"`);
-          break;
-        case "distinct":
-          selectParts.push(`array_agg(distinct ${text}) as "${safeAlias}"`);
-          break;
-        case "sum":
-        case "avg":
-          // NULL when the group has no numeric values.
-          selectParts.push(`to_jsonb(${op}(${numeric})) as "${safeAlias}"`);
-          break;
-        default:
-          throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
-      }
-      sortable.set(alias, selectParts.length);
-    }
-  } else {
-    selectParts.push("count(*)::int as count");
-    sortable.set("count", selectParts.length);
-  }
-
-  let order = defaultOrder.map((n) => `${n} ASC`);
-  if (sort) {
-    const descending = sort.startsWith("-");
-    const field = descending ? sort.slice(1) : sort;
-    const ordinal = sortable.get(field);
-    if (ordinal === undefined) {
-      throw new Error(
-        `Invalid sort field '${field}' for a group_by/aggregate query — sort accepts an aggregate alias or a group_by key here (${[...sortable.keys()].join(", ")}), optionally prefixed with - for descending`
-      );
-    }
-    order = [`${ordinal} ${descending ? "DESC" : "ASC"} NULLS LAST`, ...defaultOrder.filter((n) => n !== ordinal).map((n) => `${n} ASC`)];
-  }
-
-  selectParts.push(`count(*) OVER ()::int as "${TOTAL_COLUMN}"`);
-
-  const selectClause = selectParts.join(", ");
-  const groupClause = groupByParts.length > 0 ? `GROUP BY ${groupByParts.join(", ")}` : "";
-  const orderClause = order.length > 0 ? `ORDER BY ${order.join(", ")}` : "";
-
-  return sql`
-    SELECT ${sql.raw(selectClause)}
-    FROM records
-    WHERE ${whereClause}
-    ${sql.raw(groupClause)}
-    ${sql.raw(orderClause)}
-    LIMIT ${Math.min(limit, 1000)}
-  `;
-}
-
-async function queryWithAggregation(
-  whereClause: SQL,
-  params: { groupBy?: string[]; aggregate?: Record<string, string | Record<string, string>>; timeBucket?: string; sort?: string; limit?: number }
-) {
-  const rows = await db.execute(buildAggregationQuery(whereClause, params));
-  const raw = rows.rows as Record<string, unknown>[];
-  const total = raw.length > 0 ? Number(raw[0][TOTAL_COLUMN] ?? raw.length) : 0;
-  const results = raw.map(({ [TOTAL_COLUMN]: _total, ...rest }) => rest);
-  return { results, total };
-}
-
-function escapeField(field: string): string {
-  if (!FIELD_NAME_RE.test(field)) {
-    throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed`);
-  }
-  return field;
 }
 
 /** escapeField for a field or a dotted path into nested objects (each segment as strict as a field name). */

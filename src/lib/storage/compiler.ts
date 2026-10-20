@@ -438,7 +438,7 @@ function objectPathConditions(ctx: Ctx, key: string, segments: string[], value: 
       out.push(sql`t.data @> ${JSON.stringify(nestValue(segments, cond.operand))}::jsonb`);
       clauses.push({ label, indexes: [ctx.gin], ...(note ? { note } : {}) });
     } else {
-      out.push(buildOperatorCondition(key, cond.op, cond.operand, segments, sql`t.data`, false));
+      out.push(buildOperatorCondition(key, cond.op, cond.operand, segments, sql`t.data`));
       clauses.push({ label, indexes: [], ...(note ? { note } : {}) });
     }
   }

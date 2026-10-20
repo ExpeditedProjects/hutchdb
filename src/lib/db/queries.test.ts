@@ -40,10 +40,7 @@ import type { SQL } from 'drizzle-orm'
 import { sql as drizzleSql } from 'drizzle-orm'
 import {
   findAccessibleCollectionBySlug,
-  queryRecords,
-  buildFilterConditions,
-  buildRecordSort,
-  buildAggregationQuery,
+  buildFilterConditions as buildFilterConditionsOn,
   normalizeGroupBy,
 } from './queries'
 
@@ -54,6 +51,10 @@ function render(chunk: SQL): { sql: string; params: unknown[] } {
   const { sql, params } = dialect.sqlToQuery(chunk)
   return { sql, params }
 }
+
+// Filters compile against the collection table's document column.
+const DATA = drizzleSql`t.data`
+const buildFilterConditions = (filter: Record<string, unknown>) => buildFilterConditionsOn(filter, DATA)
 
 const collectionRow = {
   id: 1,
@@ -169,7 +170,7 @@ describe('buildFilterConditions', () => {
     it('guards numeric operands with jsonb_typeof = number and casts to numeric', () => {
       const [cond] = buildFilterConditions({ price: { $gt: 5 } })
       const { sql, params } = render(cond)
-      expect(sql).toMatch(/jsonb_typeof\("records"\."data"->\$\d+\) = 'number'/)
+      expect(sql).toMatch(/jsonb_typeof\(t\.data->\$\d+\) = 'number'/)
       expect(sql).toContain('::numeric >')
       expect(params).toEqual(['price', 'price', 5])
     })
@@ -177,7 +178,7 @@ describe('buildFilterConditions', () => {
     it('compares string operands lexicographically as text (mixed-type safe)', () => {
       const [cond] = buildFilterConditions({ due: { $lt: '2026-09-01' } })
       const { sql, params } = render(cond)
-      expect(sql).toMatch(/jsonb_typeof\("records"\."data"->\$\d+\) = 'string'/)
+      expect(sql).toMatch(/jsonb_typeof\(t\.data->\$\d+\) = 'string'/)
       expect(sql).not.toContain('::numeric')
       expect(params).toContain('2026-09-01')
     })
@@ -278,7 +279,7 @@ describe('buildFilterConditions', () => {
     it('compiles to a string-guarded case-insensitive ILIKE', () => {
       const [cond] = buildFilterConditions({ title: { $contains: 'widget' } })
       const { sql, params } = render(cond)
-      expect(sql).toMatch(/jsonb_typeof\("records"\."data"->\$\d+\) = 'string'/)
+      expect(sql).toMatch(/jsonb_typeof\(t\.data->\$\d+\) = 'string'/)
       expect(sql).toContain('ILIKE')
       expect(params).toContain('%widget%')
     })
@@ -298,264 +299,39 @@ describe('buildFilterConditions', () => {
   })
 })
 
-describe('queryRecords field projection', () => {
-  it('limits data to the requested top-level keys, keeping system columns', async () => {
-    selectLimit.mockReturnValue({ offset: selectOffset })
-    selectOffset.mockResolvedValue([
-      {
-        id: 1,
-        collectionId: 1,
-        status: 'active',
-        createdAt: new Date('2026-01-01'),
-        updatedAt: new Date('2026-01-02'),
-        data: { title: 'A', url: 'https://a.test', secret: 'hide-me' },
-      },
-    ])
-
-    const result = await queryRecords({ collectionId: 1, fields: ['title', 'url'] })
-    expect('records' in result && result.records[0]).toEqual(expect.objectContaining({
-      id: 1,
-      status: 'active',
-      data: { title: 'A', url: 'https://a.test' },
-    }))
-  })
-
-  it('omits requested keys absent from a record instead of inserting undefined', async () => {
-    selectLimit.mockReturnValue({ offset: selectOffset })
-    selectOffset.mockResolvedValue([
-      { id: 1, data: { title: 'A' }, createdAt: new Date(), updatedAt: new Date() },
-    ])
-
-    const result = await queryRecords({ collectionId: 1, fields: ['title', 'missing'] })
-    const record = ('records' in result ? result.records[0] : undefined) as { data: Record<string, unknown> }
-    expect(record.data).toEqual({ title: 'A' })
-    expect('missing' in record.data).toBe(false)
-  })
-
-  it('returns full data when fields is omitted (existing behavior)', async () => {
-    selectLimit.mockReturnValue({ offset: selectOffset })
-    selectOffset.mockResolvedValue([
-      { id: 1, data: { a: 1, b: 2 }, createdAt: new Date(), updatedAt: new Date() },
-    ])
-
-    const result = await queryRecords({ collectionId: 1 })
-    expect('records' in result && result.records[0].data).toEqual({ a: 1, b: 2 })
-  })
-})
-
-describe('queryRecords sort', () => {
-  it('sorts data fields as jsonb values so numbers compare numerically, not as text', async () => {
-    selectLimit.mockReturnValue({ offset: selectOffset })
-    selectOffset.mockResolvedValue([])
-
-    await queryRecords({ collectionId: 1, sort: '-price' })
-
-    const { sql: rendered, params } = render(orderByCapture.mock.calls[0][0])
-    // `->` keeps jsonb typing (numeric comparison); `->>` casts to text and
-    // sorts numbers lexicographically ("12" < "3" < "5").
-    expect(rendered).toContain('->')
-    expect(rendered).not.toContain('->>')
-    expect(rendered.toLowerCase()).toContain('desc nulls last')
-    expect(params).toEqual(['price'])
-  })
-
-  it('ascending data-field sort also uses jsonb comparison', async () => {
-    selectLimit.mockReturnValue({ offset: selectOffset })
-    selectOffset.mockResolvedValue([])
-
-    await queryRecords({ collectionId: 1, sort: 'price' })
-
-    const { sql: rendered } = render(orderByCapture.mock.calls[0][0])
-    expect(rendered).not.toContain('->>')
-    expect(rendered.toLowerCase()).toContain('asc nulls last')
-  })
-})
-
-describe('queryRecords aggregation', () => {
-  it('routes through db.execute when groupBy is set, returning the group total', async () => {
-    dbExecute.mockResolvedValue({ rows: [{ status: 'open', count: 3, __hutch_total: 4 }] })
-    const result = await queryRecords({ collectionId: 1, groupBy: 'status' })
-    expect(dbExecute).toHaveBeenCalledTimes(1)
-    expect(result).toEqual({ results: [{ status: 'open', count: 3 }], total: 4 })
-  })
-
-  it('routes through db.execute when aggregate is set', async () => {
-    dbExecute.mockResolvedValue({ rows: [{ count: 7 }] })
-    await queryRecords({ collectionId: 1, aggregate: { count: 'count' } })
-    expect(dbExecute).toHaveBeenCalledTimes(1)
-  })
-
-  it('rejects an invalid time_bucket value', async () => {
-    await expect(queryRecords({ collectionId: 1, timeBucket: '; DROP TABLE records--' }))
-      .rejects.toThrow()
-  })
-
-  it('rejects a groupBy field that sanitizes to empty', async () => {
-    await expect(queryRecords({ collectionId: 1, groupBy: '!!!' }))
-      .rejects.toThrow(/Invalid field name/)
-  })
-
-  it('rejects a groupBy field with any invalid character, naming the field', async () => {
-    await expect(queryRecords({ collectionId: 1, groupBy: 'name; DROP TABLE records--' }))
-      .rejects.toThrow(/Invalid field name 'name; DROP TABLE records--'/)
-  })
-
-  it('rejects an unknown aggregation op with the supported list', async () => {
-    await expect(queryRecords({ collectionId: 1, aggregate: { m: { median: 'price' } } }))
-      .rejects.toThrow(/Unsupported aggregation 'median'\. Supported: count, min, max, distinct, sum, avg/)
-  })
-
-  it('rejects a bare string aggregation spec other than count', async () => {
-    await expect(queryRecords({ collectionId: 1, aggregate: { total: 'sum' } }))
-      .rejects.toThrow(/Unsupported aggregation 'sum'/)
-  })
-
-  it('rejects an empty object aggregation spec', async () => {
-    await expect(queryRecords({ collectionId: 1, aggregate: { x: {} } }))
-      .rejects.toThrow(/Unsupported aggregation '\{\}'/)
-  })
-
-  describe('sum and avg', () => {
-    async function aggregationSql(aggregate: Record<string, Record<string, string>>): Promise<string> {
-      dbExecute.mockResolvedValue({ rows: [] })
-      await queryRecords({ collectionId: 1, aggregate })
-      return render(dbExecute.mock.calls[0][0]).sql
-    }
-
-    it('sum aggregates only numeric values via a jsonb_typeof guard', async () => {
-      const sql = await aggregationSql({ revenue: { sum: 'amount' } })
-      expect(sql).toContain(`to_jsonb(sum(CASE WHEN jsonb_typeof(data->'amount') = 'number' THEN (data->>'amount')::numeric END)) as "revenue"`)
-    })
-
-    it('avg aggregates only numeric values via a jsonb_typeof guard', async () => {
-      const sql = await aggregationSql({ mean: { avg: 'price' } })
-      expect(sql).toContain(`to_jsonb(avg(CASE WHEN jsonb_typeof(data->'price') = 'number' THEN (data->>'price')::numeric END)) as "mean"`)
-    })
-
-    it('rejects field and alias names with invalid characters instead of stripping them', async () => {
-      await expect(queryRecords({ collectionId: 1, aggregate: { 'x"; DROP TABLE records--': { sum: 'amount' } } }))
-        .rejects.toThrow(/Invalid field name 'x"; DROP TABLE records--'/)
-      await expect(queryRecords({ collectionId: 1, aggregate: { revenue: { sum: "a'; --" } } }))
-        .rejects.toThrow(/Invalid field name 'a'; --'/)
-    })
-
-    it('min/max prefer numeric values and fall back to text', async () => {
-      const sql = await aggregationSql({ earliest: { min: 'created' }, latest: { max: 'created' } })
-      expect(sql).toContain(`coalesce(to_jsonb(min(CASE WHEN jsonb_typeof(data->'created') = 'number' THEN (data->>'created')::numeric END)), to_jsonb(min(data->>'created'))) as "earliest"`)
-      expect(sql).toContain(`coalesce(to_jsonb(max(CASE WHEN jsonb_typeof(data->'created') = 'number' THEN (data->>'created')::numeric END)), to_jsonb(max(data->>'created'))) as "latest"`)
-    })
-  })
-})
-
 describe('buildFilterConditions dotted object paths', () => {
-  it('compiles a plain dotted filter to nested containment, or the literal dotted key', () => {
+  it('compiles a plain dotted filter to nested containment', () => {
     const conditions = buildFilterConditions({ status: 'active', 'address.city': 'Austin' })
     expect(conditions).toHaveLength(2)
     expect(render(conditions[0]).params).toEqual([JSON.stringify({ status: 'active' })])
     const { sql, params } = render(conditions[1])
-    expect(sql).toContain(' OR ')
-    expect(params).toEqual([JSON.stringify({ address: { city: 'Austin' } }), JSON.stringify({ 'address.city': 'Austin' })])
+    expect(sql).toBe('t.data @> $1::jsonb')
+    expect(params).toEqual([JSON.stringify({ address: { city: 'Austin' } })])
   })
 
-  it('compiles operators on a dotted path with #> / #>> and a bound path, falling back to the literal key', () => {
+  it('compiles operators on a dotted path with #> / #>> and a bound path', () => {
     const [cond] = buildFilterConditions({ 'totals.veterans.points': { $gte: 20 } })
     const { sql, params } = render(cond)
-    expect(sql).toContain('coalesce(')
     expect(sql).toContain('#> $1::text[]')
-    expect(sql).toContain('#>> $3::text[]')
-    expect(params).toEqual([
-      '{totals,veterans,points}', 'totals.veterans.points',
-      '{totals,veterans,points}', 'totals.veterans.points',
-      20,
-    ])
+    expect(sql).toContain('#>> $2::text[]')
+    expect(params).toEqual(['{totals,veterans,points}', '{totals,veterans,points}', 20])
   })
 
-  it('$exists on a dotted path checks the path or the literal key IS [NOT] NULL', () => {
-    expect(render(buildFilterConditions({ 'a.b': { $exists: true } })[0]).sql).toMatch(/coalesce\(.*#> \$1::text\[\].*\) IS NOT NULL$/)
-    expect(render(buildFilterConditions({ 'a.b': { $exists: false } })[0]).sql).toMatch(/coalesce\(.*#> \$1::text\[\].*\) IS NULL$/)
+  it('$exists on a dotted path checks the path IS [NOT] NULL', () => {
+    expect(render(buildFilterConditions({ 'a.b': { $exists: true } })[0]).sql).toBe('t.data #> $1::text[] IS NOT NULL')
+    expect(render(buildFilterConditions({ 'a.b': { $exists: false } })[0]).sql).toBe('t.data #> $1::text[] IS NULL')
   })
 
-  it('$ne on a dotted path negates nested and literal containment', () => {
+  it('$ne on a dotted path negates nested containment', () => {
     const { sql, params } = render(buildFilterConditions({ 'a.b': { $ne: 1 } })[0])
     expect(sql).toMatch(/^NOT \(/)
-    expect(params).toEqual([JSON.stringify({ a: { b: 1 } }), JSON.stringify({ 'a.b': 1 })])
+    expect(params).toEqual([JSON.stringify({ a: { b: 1 } })])
   })
 
   it('keys with other characters stay literal top-level keys (unchanged behavior)', () => {
     const conditions = buildFilterConditions({ 'odd key.x!': 1, 'a..b': 2 })
     expect(conditions).toHaveLength(1)
     expect(render(conditions[0]).params).toEqual([JSON.stringify({ 'odd key.x!': 1, 'a..b': 2 })])
-  })
-})
-
-describe('buildRecordSort', () => {
-  it('defaults to created_at DESC with an id tiebreak', () => {
-    const { orderBy, valuePath } = buildRecordSort(undefined)
-    expect(render(orderBy).sql).toBe('"records"."created_at" DESC, "records"."id" DESC')
-    expect(valuePath).toBeUndefined()
-  })
-
-  it('sorts system columns in both directions with a same-direction id tiebreak', () => {
-    expect(render(buildRecordSort('-created_at').orderBy).sql).toBe('"records"."created_at" DESC, "records"."id" DESC')
-    expect(render(buildRecordSort('updated_at').orderBy).sql).toBe('"records"."updated_at" ASC, "records"."id" ASC')
-  })
-
-  it('sorts id by a data id when present, else the record id', () => {
-    const { orderBy, valuePath } = buildRecordSort('-id')
-    expect(render(orderBy).sql).toBe('"records"."data"->$1 DESC NULLS LAST, "records"."id" DESC')
-    expect(valuePath).toBeUndefined()
-  })
-
-  it('sorts a top-level field via -> (jsonb) with an id ASC tiebreak', () => {
-    const { orderBy, valuePath } = buildRecordSort('-price')
-    const { sql, params } = render(orderBy)
-    expect(sql).toBe('"records"."data"->$1 DESC NULLS LAST, "records"."id" ASC')
-    expect(params).toEqual(['price'])
-    expect(valuePath).toEqual(['price'])
-  })
-
-  it('sorts a dotted object path via #> with the path bound as text[]', () => {
-    for (const [sort, dir] of [['-totals.veterans.points', 'DESC'], ['totals.veterans.points', 'ASC']]) {
-      const { orderBy, valuePath } = buildRecordSort(sort)
-      const { sql, params } = render(orderBy)
-      expect(sql).toBe(`"records"."data" #> $1::text[] ${dir} NULLS LAST, "records"."id" ASC`)
-      expect(params).toEqual(['{totals,veterans,points}'])
-      expect(valuePath).toEqual(['totals', 'veterans', 'points'])
-    }
-  })
-
-  it('throws on any other sort field instead of falling back to created_at', () => {
-    for (const bad of ['-', 'a..b', '.a', 'a.', 'name; DROP TABLE records--', 'a b', "x'y", 'a.b-c']) {
-      expect(() => buildRecordSort(bad)).toThrow(/Invalid sort field .* sort accepts a top-level field name, a dotted path/)
-    }
-  })
-})
-
-describe('queryRecords sort validation', () => {
-  it('rejects an invalid sort field before running any query', async () => {
-    await expect(queryRecords({ collectionId: 1, sort: '-not a field' })).rejects.toThrow(/Invalid sort field 'not a field'/)
-    expect(selectLimit).not.toHaveBeenCalled()
-  })
-
-  it('skips the existence probe when the first row has the sorted value', async () => {
-    selectLimit.mockReturnValueOnce({ offset: selectOffset })
-    selectOffset.mockResolvedValue([{ id: 1, data: { totals: { veterans: { points: 29 } } } }])
-    await queryRecords({ collectionId: 1, sort: '-totals.veterans.points' })
-    expect(selectLimit).toHaveBeenCalledTimes(1)
-  })
-
-  it('throws when no record in the collection has the sorted path', async () => {
-    selectLimit.mockReturnValueOnce({ offset: selectOffset }).mockResolvedValueOnce([])
-    selectOffset.mockResolvedValue([{ id: 1, data: { name: 'A' } }])
-    await expect(queryRecords({ collectionId: 1, sort: '-totals.veterans.points' }))
-      .rejects.toThrow(/Invalid sort field 'totals\.veterans\.points': no record in this collection has it/)
-  })
-
-  it('returns the page when some other record in the collection has the field', async () => {
-    selectLimit.mockReturnValueOnce({ offset: selectOffset }).mockResolvedValueOnce([{ one: 1 }])
-    selectOffset.mockResolvedValue([{ id: 1, data: { name: 'A' } }])
-    const result = await queryRecords({ collectionId: 1, sort: 'score' })
-    expect('records' in result && result.records).toHaveLength(1)
   })
 })
 
@@ -569,53 +345,5 @@ describe('normalizeGroupBy', () => {
   it('rejects more than 3 keys and invalid names', () => {
     expect(() => normalizeGroupBy(['a', 'b', 'c', 'd'])).toThrow(/at most 3 keys/)
     expect(() => normalizeGroupBy(['a', "b'; --"])).toThrow(/Invalid field name/)
-  })
-})
-
-describe('buildAggregationQuery', () => {
-  const where = drizzleSql`true`
-  const build = (params: Parameters<typeof buildAggregationQuery>[1]) => render(buildAggregationQuery(where, params))
-
-  it('keeps the default order: group key ASC, time_bucket ASC first when bucketing', () => {
-    expect(build({ groupBy: ['status'] }).sql).toMatch(/ORDER BY 1 ASC\s+LIMIT/)
-    expect(build({ groupBy: ['status'], timeBucket: 'day' }).sql).toMatch(/ORDER BY 1 ASC, 2 ASC\s+LIMIT/)
-  })
-
-  it('orders by an aggregate alias before LIMIT for a true top-N', () => {
-    const { sql, params } = build({ groupBy: ['party'], aggregate: { points: { sum: 'score' } }, sort: '-points', limit: 10 })
-    expect(sql).toMatch(/ORDER BY 2 DESC NULLS LAST, 1 ASC\s+LIMIT \$1/)
-    expect(params).toEqual([10])
-  })
-
-  it('orders by a group_by key in either direction', () => {
-    expect(build({ groupBy: ['a', 'b'], sort: '-b' }).sql).toMatch(/ORDER BY 2 DESC NULLS LAST, 1 ASC\s+LIMIT/)
-    expect(build({ groupBy: ['a'], sort: 'count' }).sql).toMatch(/ORDER BY 2 ASC NULLS LAST, 1 ASC\s+LIMIT/)
-  })
-
-  it('computes the group total with a window count', () => {
-    expect(build({ groupBy: ['status'] }).sql).toContain('count(*) OVER ()::int as "__hutch_total"')
-  })
-
-  it('names multi-key and dotted group_by columns by the key', () => {
-    const { sql } = build({ groupBy: ['chamber', 'totals.veterans.points'] })
-    expect(sql).toContain(`data->>'chamber' as "chamber"`)
-    expect(sql).toContain(`data #>> '{totals,veterans,points}' as "totals.veterans.points"`)
-    expect(sql).toContain(`GROUP BY data->>'chamber', data #>> '{totals,veterans,points}'`)
-  })
-
-  it('aggregates a dotted path with the numeric guard', () => {
-    const { sql } = build({ aggregate: { points: { sum: 'totals.veterans.points' } } })
-    expect(sql).toContain(`to_jsonb(sum(CASE WHEN jsonb_typeof(data #> '{totals,veterans,points}') = 'number' THEN (data #>> '{totals,veterans,points}')::numeric END)) as "points"`)
-  })
-
-  it('rejects a sort that is neither an alias nor a group key, listing the accepted ones', () => {
-    expect(() => build({ groupBy: ['party'], aggregate: { points: { sum: 'score' } }, sort: '-created_at' }))
-      .toThrow(/Invalid sort field 'created_at' for a group_by\/aggregate query .*\(party, points\)/)
-  })
-
-  it('rejects injection attempts in dotted group_by / aggregate paths and keeps aliases strict', () => {
-    expect(() => build({ groupBy: ["a.b'}; DROP TABLE records--"] })).toThrow(/Invalid field name/)
-    expect(() => build({ aggregate: { x: { sum: 'a.b,c' } } })).toThrow(/Invalid field name/)
-    expect(() => build({ aggregate: { 'a.b': 'count' } })).toThrow(/Invalid field name 'a\.b'/)
   })
 })

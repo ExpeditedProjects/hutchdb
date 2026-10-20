@@ -23,9 +23,9 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - **REST seed** at `/api/v1/collections` (list only). Everything else goes through MCP.
 - **Auth seam** at `src/lib/auth/seam.ts` — the only place auth lives.
 - **Singleton bootstrap** at `src/lib/auth/singleton.ts` — lazy user + personal org insert.
-- **DB schema** in `src/lib/db/schema.ts` — users, organizations, organization_members, collections, records, views (schema stays merge-compatible with Cloud; do not drop Cloud-only tables).
-- **Query engine** in `src/lib/db/queries.ts` — JSONB containment, full-text search, aggregation.
-- **Per-collection storage** in `src/lib/storage/` — `HUTCH_STORAGE_LAYOUT` (`shared` default | `table`) picks the layout of newly created collections; each collection's `layout` column decides how it is read and written. `table` collections live in `hc_<id>` with inferred projection columns (top-level and nested object scalars) and unwound child tables `hc_<id>__<path>`, recorded in `collections.storage`; `compiler.ts` routes queries to them and reports `indexed`/`plan`. SQL helpers are in migration `0021`.
+- **DB schema** in `src/lib/db/schema.ts` — users, organizations, organization_members, collections, views (schema stays merge-compatible with Cloud; do not drop Cloud-only tables). There is no shared `records` table: each collection's rows live in its own table.
+- **Query engine** in `src/lib/storage/compiler.ts` — compiles filter/search/sort/aggregate to a collection's table (projection columns where they exist, JSONB containment and full-text search otherwise); shared filter helpers in `src/lib/db/queries.ts`.
+- **Per-collection storage** in `src/lib/storage/` — every collection lives in `hc_<id>` (created with the collection) with inferred projection columns (top-level and nested object scalars) and unwound child tables `hc_<id>__<path>`, recorded in `collections.storage`; `compiler.ts` routes queries to them and reports `indexed`/`plan`. SQL helpers are in migration `0021`.
 
 ## Key Design Decisions
 

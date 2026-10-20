@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import { migrate } from "drizzle-orm/node-postgres/migrator";
-import { sql, eq, asc } from "drizzle-orm";
+import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +99,11 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     // Cascades to records, views, collection_members, collection_invitations.
     // The seeded user/org rows survive across tests.
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
+    // Collection ids restart, so drop the per-collection tables too.
+    const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
+    for (const row of tables.rows as { tablename: string }[]) {
+      await testDb.execute(sql`DROP TABLE IF EXISTS ${sql.identifier(row.tablename)} CASCADE`);
+    }
   });
 
   afterAll(async () => {
@@ -112,15 +117,16 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     return (result as { collection: { slug: string } }).collection.slug;
   }
 
+  /** A collection's rows straight from its hc_<id> table, in id order. */
+  async function rawRows(slug: string): Promise<{ data: Record<string, unknown>; deleted_at: string | null; updated_at: string }[]> {
+    const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
+    const result = await testDb.execute(sql`SELECT data, deleted_at, updated_at FROM ${sql.identifier(`hc_${coll.id}`)} ORDER BY id`);
+    return result.rows as { data: Record<string, unknown>; deleted_at: string | null; updated_at: string }[];
+  }
+
   /** Read a collection's live records straight from the scratch DB. */
   async function rawData(slug: string): Promise<Record<string, unknown>[]> {
-    const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
-    const rows = await testDb
-      .select()
-      .from(schema.records)
-      .where(eq(schema.records.collectionId, coll.id))
-      .orderBy(asc(schema.records.id));
-    return rows.filter((r) => r.deletedAt === null).map((r) => r.data as Record<string, unknown>);
+    return (await rawRows(slug)).filter((r) => r.deleted_at === null).map((r) => r.data);
   }
 
   async function query(slug: string, params: Parameters<RecordsService["queryRecords"]>[2]) {
@@ -164,7 +170,7 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("remove_fields leaves records without the field untouched", async () => {
       const slug = await seed("transform_remove_sparse", [{ a: 1, c: 1 }, { c: 2 }]);
       const updatedAt = async () =>
-        (await testDb.select().from(schema.records).orderBy(asc(schema.records.id))).map((r) => r.updatedAt?.getTime());
+        (await rawRows(slug)).map((r) => new Date(r.updated_at).getTime());
       const before = await updatedAt();
 
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["a"] }));
@@ -462,10 +468,10 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("time_bucket buckets by created_at", async () => {
       // Push two records into yesterday's bucket directly in the DB.
       const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, slug));
+      const table = sql.identifier(`hc_${coll.id}`);
       await testDb.execute(sql`
-        UPDATE records SET created_at = created_at - interval '1 day'
-        WHERE collection_id = ${coll.id}
-          AND id IN (SELECT id FROM records WHERE collection_id = ${coll.id} ORDER BY id ASC LIMIT 2)
+        UPDATE ${table} SET created_at = created_at - interval '1 day'
+        WHERE id IN (SELECT id FROM ${table} ORDER BY id ASC LIMIT 2)
       `);
 
       const rows = await aggregated({ timeBucket: "day", aggregate: { n: "count" } });
@@ -604,7 +610,7 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
     it("ignores soft-deleted records when checking the sort path exists", async () => {
       const lone = await seed("lonely", [{ name: "kept" }, { name: "gone", score: 1 }]);
       const [coll] = await testDb.select().from(schema.collections).where(eq(schema.collections.slug, lone));
-      await testDb.execute(sql`UPDATE records SET deleted_at = now() WHERE collection_id = ${coll.id} AND data->>'name' = 'gone'`);
+      await testDb.execute(sql`UPDATE ${sql.identifier(`hc_${coll.id}`)} SET deleted_at = now() WHERE data->>'name' = 'gone'`);
       await expect(recordsSvc.queryRecords(lone, USER_ID, { sort: "score" })).rejects.toThrow(/no record in this collection has it/);
     });
 
@@ -621,8 +627,9 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(await names({ filter: { "totals.veterans": { $exists: false } } })).toEqual(["NOVETS"]);
     });
 
-    it("dotted filter keys still match a literal top-level key of that name", async () => {
-      // e.g. a CSV import with a "first.name" column, filterable before paths existed.
+    it("dotted filter keys address the nested path, not a literal top-level key of that name", async () => {
+      // A CSV import with a "first.name" column keeps the key, but a filter
+      // on "first.name" reads first -> name.
       const csv = await seed("csvish", [
         { "first.name": "Ada", "age.years": 36 },
         { first: { name: "Ada" }, age: { years: 40 } },
@@ -633,12 +640,12 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
         if (!("records" in result)) throw new Error("expected records shape");
         return result.records.length;
       };
-      expect(await count({ "first.name": "Ada" })).toBe(2);
-      expect(await count({ "age.years": { $gte: 40 } })).toBe(2);
-      expect(await count({ "first.name": { $ne: "Ada" } })).toBe(1);
-      expect(await count({ "first.name": { $in: ["Grace"] } })).toBe(1);
-      expect(await count({ "first.name": { $exists: true } })).toBe(3);
-      expect(await count({ "first.name": { $contains: "rac" } })).toBe(1);
+      expect(await count({ "first.name": "Ada" })).toBe(1);
+      expect(await count({ "age.years": { $gte: 40 } })).toBe(1);
+      expect(await count({ "first.name": { $ne: "Ada" } })).toBe(2);
+      expect(await count({ "first.name": { $in: ["Grace"] } })).toBe(0);
+      expect(await count({ "first.name": { $exists: true } })).toBe(1);
+      expect(await count({ "first.name": { $contains: "da" } })).toBe(1);
     });
 
     it("aggregate sort by alias + limit returns the true top-N groups and the group total", async () => {
@@ -669,7 +676,7 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
 
     it("rejects an aggregate sort that is neither an alias nor a group key", async () => {
       await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: "party", aggregate: { n: "count" }, sort: "-created_at" }))
-        .rejects.toThrow(/Invalid sort field 'created_at' for a group_by\/aggregate query/);
+        .rejects.toThrow(/Invalid sort field 'created_at' for an aggregate query/);
     });
 
     it("multi-key group_by names columns by key, including a dotted path", async () => {

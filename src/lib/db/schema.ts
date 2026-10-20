@@ -142,18 +142,10 @@ export const collections = pgTable("collections", {
   publishedAt: timestamp("published_at", { withTimezone: true }),
   visibility: text("visibility").notNull().default("private"),
   orgDefaultRole: text("org_default_role").notNull().default("viewer"),
-  // Storage layout: 'shared' = rows live in the shared `records` table;
-  // 'table' = rows live in a per-collection table (hc_<id>) managed by
-  // src/lib/storage. `storage` is the registry of what inference created
-  // there (projections, unwinds); see src/lib/storage/registry.ts.
-  layout: text("layout").notNull().default("shared"),
+  // Rows live in a per-collection table (hc_<id>) managed by src/lib/storage;
+  // `storage` is the registry of what inference created there (projections,
+  // unwinds); see src/lib/storage/registry.ts.
   storage: jsonb("storage").notNull().default({}),
-  // shared -> table migration bookkeeping (src/lib/storage/migrate.ts).
-  // migrationState is NULL until the job first touches the collection.
-  migrationState: text("migration_state"),
-  migrationSwappedAt: timestamp("migration_swapped_at", { withTimezone: true }),
-  migrationReport: jsonb("migration_report"),
-  migrationError: text("migration_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
@@ -197,19 +189,10 @@ export type CollectionRole = (typeof COLLECTION_ROLES)[number];
 export const INVITABLE_ROLES = ["viewer", "editor"] as const;
 export type InvitableRole = (typeof INVITABLE_ROLES)[number];
 
-export const records = pgTable("records", {
-  id: serial("id").primaryKey(),
-  collectionId: integer("collection_id").references(() => collections.id, { onDelete: "cascade" }).notNull(),
-  data: jsonb("data").notNull(),
-  source: text("source"),
-  status: text("status").default("active"),
-  deletedAt: timestamp("deleted_at", { withTimezone: true }),
-  createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
-  updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
-}, (table) => [
-  index("idx_records_collection_created").on(table.collectionId, table.createdAt),
-  index("idx_records_data_gin").using("gin", table.data),
-]);
+// The shared `records` table is gone from Core: every collection has its
+// own table (src/lib/storage). `npm run storage:cutover` copies an existing
+// database's `records` rows into those tables and, with --drop-records,
+// drops it.
 
 // ── MCP OAuth tables (custom CIMD OAuth 2.1) ─────────────────────────────────
 

@@ -7,13 +7,14 @@ import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
-// HUTCH_STORAGE_LAYOUT against real Postgres:
+// Per-collection storage against real Postgres:
 // - projecting nested object paths never changes a result: the same queries
-//   over a projected table collection, an unprojected one and a shared-layout
-//   collection return the same rows, sums and groups;
+//   over a projected collection and an unprojected one return the same rows,
+//   sums and groups;
 // - the sticky `mixed` flag that keeps sorts on the document;
 // - the map rule on dollarvote-shaped documents;
-// - the flag default and both layouts serving at once in one database.
+// - several collections side by side: counts, listing, search, describe,
+//   delete.
 //
 // Auto-skipped unless HUTCH_TEST_DATABASE_URL is set.
 // ---------------------------------------------------------------------------
@@ -42,19 +43,17 @@ function ok<T>(result: T): Exclude<T, { error: unknown } | null | undefined> {
   return result as Exclude<T, { error: unknown } | null | undefined>;
 }
 
-describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
+describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", () => {
   let testPool: Pool;
   let testDb: NodePgDatabase<typeof schema>;
   let appPool: Pool | undefined;
   let recordsSvc: RecordsService;
   let collectionsSvc: CollectionsService;
-  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_STORAGE_LAYOUT", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
+  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
-  /** Set the layout for collections created next, and the inference thresholds. */
-  function useLayout(layout: "table" | "shared" | undefined, threshold = 100) {
-    if (layout === undefined) delete process.env.HUTCH_STORAGE_LAYOUT;
-    else process.env.HUTCH_STORAGE_LAYOUT = layout;
+  /** Set the inference thresholds for the writes that follow. */
+  function useThreshold(threshold = 100) {
     process.env.HUTCH_PROJECT_THRESHOLD = String(threshold);
     process.env.HUTCH_UNWIND_THRESHOLD = String(threshold);
   }
@@ -76,7 +75,7 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
   });
 
   beforeEach(async () => {
-    useLayout(undefined);
+    useThreshold();
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
     for (const row of tables.rows as { tablename: string }[]) {
@@ -116,7 +115,7 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
     return ok(await recordsSvc.queryRecords(slug, USER_ID, params)) as QueryResult;
   }
 
-  /** What must not depend on layout or projection: rows in order, totals, aggregate rows. */
+  /** What must not depend on projection: rows in order, totals, aggregate rows. */
   function answer(r: QueryResult) {
     return r.records ? { total: r.total, data: r.records.map((x) => x.data) } : { total: r.total, results: r.results };
   }
@@ -163,15 +162,12 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
       ["filtered sum", { filter: { "stats.ok": false, "totals.veterans.votes": 3 }, aggregate: { s: { sum: "stats.score" }, p: { sum: "totals.veterans.points" } } }],
     ];
 
-    it("projected, unprojected and shared collections answer every query the same", async () => {
-      useLayout("table", 100);
+    it("projected and unprojected collections answer every query the same", async () => {
+      useThreshold(100);
       const projected = await store("projected", docs);
-      useLayout("table", 1_000_000_000);
+      useThreshold(1_000_000_000);
       const plain = await store("unprojected", docs);
-      useLayout(undefined);
-      const shared = await store("shared_copy", docs);
 
-      expect((await collectionRow(shared)).layout).toBe("shared");
       expect((await registry(plain)).projections).toEqual([]);
       const reg = await registry(projected);
       expect(reg.projections.map((p) => p.field)).toEqual([
@@ -188,10 +184,8 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
       await analyze(plain);
 
       for (const [name, params] of QUERIES) {
-        const [a, b, c] = await Promise.all([query(projected, params), query(plain, params), query(shared, params)]);
+        const [a, b] = await Promise.all([query(projected, params), query(plain, params)]);
         expect(answer(a), `${name}: projected vs unprojected`).toEqual(answer(b));
-        expect(answer(a), `${name}: table vs shared layout`).toEqual(answer(c));
-        expect(c).not.toHaveProperty("indexed");
       }
 
       // The decimal sums are exact, not float8-accumulated.
@@ -210,7 +204,7 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
 
   it("a descending sort on a nested projection is served by its index, rows without a value last", async () => {
     // Large enough that the planner prefers the index over a top-N sort.
-    useLayout("table", 100);
+    useThreshold(100);
     const docs = Array.from({ length: 12000 }, (_, i) => (i % 40 === 0 ? { k: i } : { k: i, totals: { veterans: { points: (i * 7919) % 10007 } } }));
     let slug = "";
     for (let i = 0; i < docs.length; i += 1000) slug = await store("big_points", docs.slice(i, i + 1000));
@@ -234,9 +228,9 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
     it("a projection created over mixed values is flagged and sorts like the document", async () => {
       // 2 strings and a JSON null among 300: still declared a number (> 95%).
       const docs = Array.from({ length: 300 }, (_, i) => ({ k: i, m: { v: i === 10 || i === 20 ? `s${i}` : i === 30 ? null : (i * 7) % 101 } }));
-      useLayout("table", 100);
+      useThreshold(100);
       const projected = await store("mixed_projected", docs);
-      useLayout("table", 1_000_000_000);
+      useThreshold(1_000_000_000);
       const plain = await store("mixed_plain", docs);
       const p = (await registry(projected)).projections.find((x) => x.field === "m.v");
       expect(p).toMatchObject({ type: "number", mixed: true });
@@ -254,7 +248,7 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
     });
 
     it("a later store or update with another type flips the flag", async () => {
-      useLayout("table", 100);
+      useThreshold(100);
       const docs = Array.from({ length: 200 }, (_, i) => ({ k: i, m: { v: i } }));
       const slug = await store("flips", docs);
       expect((await registry(slug)).projections.find((x) => x.field === "m.v")?.mixed).toBeUndefined();
@@ -286,7 +280,7 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
       totals: Object.fromEntries(CATS.map((c, k) => [c, { points: (i * (k + 3)) % 29, possible: 29, votes: 24 }])),
       votes: [{ bill_id: "HR1", vote: "yea" }, { bill_id: "HR2", vote: "nay" }],
     }));
-    useLayout("table", 100);
+    useThreshold(100);
     const slug = await store("legislators", legs);
     const reg = await registry(slug);
     expect(reg.unwinds.map((u) => u.path)).toEqual(["votes"]);
@@ -301,39 +295,22 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
     expect(result.reason).toMatch(/'totals.cat_05.points' is a nested object path with no projection/);
   });
 
-  describe("flag default and both layouts in one database", () => {
-    it("new collections are shared unless the flag says table; each keeps its own layout after the flag changes", async () => {
+  describe("several collections in one database", () => {
+    it("each keeps its rows in its own table; counts, listing, search, describe and delete see them", async () => {
       const alpha = await store("alpha", [{ title: "zebra crossing", n: 1 }, { title: "plain", n: 2 }]);
-      expect((await collectionRow(alpha)).layout).toBe("shared");
-      expect(await testDb.select().from(schema.records)).toHaveLength(2);
-
-      useLayout("table");
       const beta = await store("beta", [{ title: "zebra stripes", n: 1 }, { title: "plain", n: 2 }]);
-      const betaRow = await collectionRow(beta);
-      expect(betaRow.layout).toBe("table");
-      expect(await testDb.select().from(schema.records)).toHaveLength(2);
-
-      // Writes follow the collection, not the flag.
       await store("alpha", [{ title: "third", n: 3 }]);
-      useLayout(undefined);
       await store("beta", [{ title: "third", n: 3 }]);
-      const gamma = await store("gamma", [{ title: "g" }]);
-      expect((await collectionRow(gamma)).layout).toBe("shared");
-      expect(await testDb.select().from(schema.records)).toHaveLength(4);
+      const betaRow = await collectionRow(beta);
       const hc = await testDb.execute(sql`SELECT count(*)::int AS n FROM ${sql.identifier(`hc_${betaRow.id}`)}`);
       expect((hc.rows[0] as { n: number }).n).toBe(3);
 
-      // Same data, same answers; only the table collection reports indexed/plan.
+      // Same data, same answers.
       const params: QueryParams = { filter: { n: { $gte: 2 } }, sort: "-n" };
       const [qa, qb] = await Promise.all([query(alpha, params), query(beta, params)]);
       expect(answer(qa)).toEqual(answer(qb));
-      expect(qa).not.toHaveProperty("indexed");
       expect(qb).toHaveProperty("indexed");
-      const [aa, ab] = await Promise.all([
-        query(alpha, { groupBy: "title", aggregate: { n: "count" } }),
-        query(beta, { groupBy: "title", aggregate: { n: "count" } }),
-      ]);
-      expect(Object.keys(aa).sort()).toEqual(["results", "total"]);
+      const ab = await query(beta, { groupBy: "title", aggregate: { n: "count" } });
       expect(answer(ab)).toEqual({ total: 3, results: [{ title: "plain", n: 1 }, { title: "third", n: 1 }, { title: "zebra stripes", n: 1 }] });
 
       const listed = await collectionsSvc.listCollections(USER_ID, ORG_ID);
@@ -342,13 +319,21 @@ describe.skipIf(!TEST_DB_URL)("storage layouts against real Postgres", () => {
       expect(bySlug[beta].recordCount).toBe(3);
       expect(bySlug[beta].fields).toEqual(["n", "title"]);
 
+      // Every listing that counts records counts the collection tables.
+      const dashboard = await collectionsSvc.listCollectionsForDashboard(USER_ID, ORG_ID);
+      expect(Object.fromEntries(dashboard.map((c) => [c.slug, c.recordCount]))).toEqual({ [alpha]: 3, [beta]: 3 });
+      const recent = await collectionsSvc.listRecentCollectionsAcrossOrgs(USER_ID, 10);
+      expect(Object.fromEntries(recent.map((c) => [c.slug, c.recordCount]))).toEqual({ [alpha]: 3, [beta]: 3 });
+      expect(recent.every((c) => typeof c.lastRecordAt === "string")).toBe(true);
+      ok(await recordsSvc.deleteRecord(alpha, USER_ID, (await query(alpha, { filter: { n: 3 } })).records![0].id));
+      expect(ok(await collectionsSvc.getCollection(alpha, USER_ID)).recordCount).toBe(2);
+      expect((await collectionsSvc.listCollectionsForDashboard(USER_ID, ORG_ID)).find((c) => c.slug === alpha)?.recordCount).toBe(2);
+
       const found = await recordsSvc.searchGlobal(USER_ID, "zebra");
       expect(found.results.map((r) => r.collection.slug).sort()).toEqual([alpha, beta].sort());
 
-      const describedAlpha = ok(await collectionsSvc.describeCollection(alpha, USER_ID));
       const describedBeta = ok(await collectionsSvc.describeCollection(beta, USER_ID));
-      expect(describedAlpha).not.toHaveProperty("storage");
-      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { layout: "table" } });
+      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { projections: [], unwinds: [] } });
 
       ok(await collectionsSvc.deleteCollection(beta, USER_ID));
       const gone = await testDb.execute(sql`SELECT to_regclass(${`hc_${betaRow.id}`}) IS NULL AS gone`);

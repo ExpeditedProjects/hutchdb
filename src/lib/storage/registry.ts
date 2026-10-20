@@ -2,8 +2,8 @@ import { createHash } from "node:crypto";
 import { sql, type SQL } from "drizzle-orm";
 
 /**
- * Storage registry for a layout='table' collection: what inference created
- * on its hc_<id> table. Persisted verbatim in collections.storage.
+ * Storage registry for a collection: what inference created on its hc_<id>
+ * table. Persisted verbatim in collections.storage.
  */
 export type ProjectionType = "number" | "text" | "boolean" | "date";
 
@@ -56,17 +56,6 @@ export type StorageRegistry = {
 };
 
 export const EMPTY_REGISTRY: StorageRegistry = { projections: [], unwinds: [], evaluated_rows: 0 };
-
-export type StorageLayout = "shared" | "table";
-
-/** The layout new collections get. Read at call time so tests can flip it. */
-export function defaultStorageLayout(): StorageLayout {
-  return process.env.HUTCH_STORAGE_LAYOUT === "table" ? "table" : "shared";
-}
-
-export function isTableLayout(collection: { layout?: string | null } | null | undefined): boolean {
-  return collection?.layout === "table";
-}
 
 /** Normalize whatever is in collections.storage into a full registry. */
 export function readRegistry(raw: unknown): StorageRegistry {

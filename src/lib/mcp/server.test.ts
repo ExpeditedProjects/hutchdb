@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 
 const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
   registeredTools: new Map<string, (params: unknown) => Promise<unknown>>(),
@@ -161,7 +161,7 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
-      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
       { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
       { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
       { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
@@ -337,21 +337,12 @@ describe('query, store and import descriptions', () => {
   it('describes dotted object paths, alias/key sort with top-N, total, multi-key group_by and unknown-sort errors', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const description = descriptionOf('hutch_query_records')
-    expect(description).toMatch(/dotted paths into nested objects of any depth/)
+    expect(description).toMatch(/dotted paths of any depth: "a\.b\.c" reaches into nested objects/)
     expect(description).toMatch(/aggregate alias or a group_by key and limit applies after sorting/)
     expect(description).toMatch(/include total/)
     expect(description).toMatch(/array of up to 3 keys/)
     expect(description).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
     expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
-  })
-
-  it('does not describe storage-layout features this layout lacks', () => {
-    createMcpServer('user-1', 'org-test', 'https://example.test')
-    const text = [descriptionOf('hutch_query_records'), descriptionOf('hutch_store_records'), descriptionOf('hutch_import_records'),
-      ...Object.values(shapeOf('hutch_query_records')).map((f) => f.description ?? '')].join('\n')
-    for (const forbidden of [/indexed/i, /\bplan\b/i, /queryable automatically/i, /unwind/i, /`record`/, /record: false/]) {
-      expect(text).not.toMatch(forbidden)
-    }
   })
 
   it('accepts group_by as a string or up to 3 keys', () => {
@@ -388,34 +379,12 @@ describe('query, store and import descriptions', () => {
   })
 })
 
-describe('descriptions follow HUTCH_STORAGE_LAYOUT', () => {
+describe('storage-aware descriptions', () => {
   type Shape = Record<string, { description?: string }>
   const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
   const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
-  const snapshot = () => Object.fromEntries([...registeredConfigs.entries()].map(([name, c]) => [
-    name,
-    { description: c.description, inputs: Object.fromEntries(Object.entries((c.inputSchema as { shape?: Shape }).shape ?? {}).map(([k, v]) => [k, v.description])) },
-  ]))
 
-  afterEach(() => {
-    vi.unstubAllEnvs()
-  })
-
-  it('serves the shared-layout surface when the flag is unset, "shared" or unrecognised', () => {
-    vi.stubEnv('HUTCH_STORAGE_LAYOUT', undefined as unknown as string)
-    createMcpServer('user-1', 'org-test', 'https://example.test')
-    const unset = snapshot()
-    expect(Object.keys(shapeOf('hutch_query_records'))).not.toContain('record')
-    for (const value of ['shared', 'bogus', '']) {
-      registeredConfigs.clear()
-      vi.stubEnv('HUTCH_STORAGE_LAYOUT', value)
-      createMcpServer('user-1', 'org-test', 'https://example.test')
-      expect(snapshot()).toEqual(unset)
-    }
-  })
-
-  it('describes nested arrays, automatic indexing, indexed/plan and record with the table layout', () => {
-    vi.stubEnv('HUTCH_STORAGE_LAYOUT', 'table')
+  it('describes nested arrays, automatic indexing, indexed/plan and record', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const query = descriptionOf('hutch_query_records')
     expect(query).toMatch(/reaches into an array of objects/)
@@ -438,18 +407,11 @@ describe('descriptions follow HUTCH_STORAGE_LAYOUT', () => {
     expect(shape.limit.description).toMatch(/max 1000/)
   })
 
-  it('forwards record only with the table layout', async () => {
+  it('forwards record to the service', async () => {
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
-    vi.stubEnv('HUTCH_STORAGE_LAYOUT', 'table')
     createMcpServer('user-1', 'org-test', 'https://example.test')
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', record: false })
     expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ record: false }))
-
-    vi.stubEnv('HUTCH_STORAGE_LAYOUT', '')
-    registeredTools.clear()
-    createMcpServer('user-1', 'org-test', 'https://example.test')
-    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'status' })
-    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.not.objectContaining({ record: expect.anything() }))
   })
 })
 

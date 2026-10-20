@@ -12,7 +12,6 @@ import {
   EMPTY_REGISTRY,
   PG_MAX_IDENTIFIER,
   childTableName,
-  defaultStorageLayout,
   findPathProjection,
   findProjection,
   indexName,
@@ -224,25 +223,6 @@ describe('inferDecisions', () => {
     const d = inferDecisions(input({ docs: batch2, rowCount: 1000 }))
     const columns = d.projections.map((p) => p.column)
     expect(new Set(columns).size).toBe(2)
-  })
-})
-
-describe('defaultStorageLayout', () => {
-  it('is shared unless HUTCH_STORAGE_LAYOUT is exactly "table"', () => {
-    const saved = process.env.HUTCH_STORAGE_LAYOUT
-    try {
-      delete process.env.HUTCH_STORAGE_LAYOUT
-      expect(defaultStorageLayout()).toBe('shared')
-      for (const v of ['', 'shared', 'TABLE', 'tables', ' table']) {
-        process.env.HUTCH_STORAGE_LAYOUT = v
-        expect(defaultStorageLayout()).toBe('shared')
-      }
-      process.env.HUTCH_STORAGE_LAYOUT = 'table'
-      expect(defaultStorageLayout()).toBe('table')
-    } finally {
-      if (saved === undefined) delete process.env.HUTCH_STORAGE_LAYOUT
-      else process.env.HUTCH_STORAGE_LAYOUT = saved
-    }
   })
 })
 

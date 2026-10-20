@@ -1,7 +1,3 @@
-import { db } from "./db";
-import { records } from "./db/schema";
-import { eq, and, sql } from "drizzle-orm";
-import { notDeleted } from "./db/queries";
 import { inferFieldType } from "./schema-inference";
 import { ISO_DATE, URL_RE } from "./constants";
 
@@ -21,22 +17,12 @@ type FieldInfo = {
   latest?: string;
 };
 
-export async function describeCollection(collectionId: number, totalRecords: number, layout: string | null = "shared"): Promise<FieldInfo[]> {
+export async function describeCollection(collectionId: number, totalRecords: number): Promise<FieldInfo[]> {
   if (totalRecords === 0) return [];
 
   const sampleSize = Math.min(totalRecords, 500);
-  let sampleRecords: { data: unknown }[];
-  if (layout === "table") {
-    const { sampleDocuments } = await import("./storage/rows");
-    sampleRecords = (await sampleDocuments(collectionId, sampleSize, true)).map((data) => ({ data }));
-  } else {
-    sampleRecords = await db
-      .select({ data: records.data })
-      .from(records)
-      .where(and(eq(records.collectionId, collectionId), notDeleted))
-      .orderBy(sql`random()`)
-      .limit(sampleSize);
-  }
+  const { sampleDocuments } = await import("./storage/rows");
+  const sampleRecords = (await sampleDocuments(collectionId, sampleSize, true)).map((data) => ({ data }));
 
   const fieldStats: Record<string, {
     count: number;

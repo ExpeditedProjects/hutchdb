@@ -7,7 +7,7 @@ import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
-// Per-collection storage (layout='table') against real Postgres: table
+// Per-collection storage against real Postgres: table
 // creation, exact document round-trips, projection and unwind inference at
 // low thresholds, index-backed filters, nested aggregates checked against an
 // in-memory oracle, child-row resync, soft deletes and table drops.
@@ -48,18 +48,17 @@ function makeDocs(n: number, votesPer: number): Doc[] {
   }));
 }
 
-describe.skipIf(!TEST_DB_URL)("table storage layout against real Postgres", () => {
+describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
   let testPool: Pool;
   let testDb: NodePgDatabase<typeof schema>;
   let appPool: Pool | undefined;
   let recordsSvc: RecordsService;
   let collectionsSvc: CollectionsService;
-  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_STORAGE_LAYOUT", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
+  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
   beforeAll(async () => {
     process.env.HUTCH_DATABASE_URL = TEST_DB_URL;
-    process.env.HUTCH_STORAGE_LAYOUT = "table";
     process.env.HUTCH_PROJECT_THRESHOLD = String(THRESHOLD);
     process.env.HUTCH_UNWIND_THRESHOLD = String(THRESHOLD);
 
@@ -134,7 +133,6 @@ describe.skipIf(!TEST_DB_URL)("table storage layout against real Postgres", () =
     const stored = await store("roundtrip", docs);
     const slug = (stored as { collection: { slug: string } }).collection.slug;
     const row = await collectionRow(slug);
-    expect(row.layout).toBe("table");
     expect(await tableExists(`hc_${row.id}`)).toBe(true);
 
     const result = await query(slug, { limit: 10 });
@@ -145,10 +143,6 @@ describe.skipIf(!TEST_DB_URL)("table storage layout against real Postgres", () =
     expect(result.total).toBe(3);
     expect(typeof result.indexed).toBe("boolean");
     expect(typeof result.plan).toBe("string");
-
-    // No records table rows were written for a table-layout collection.
-    const shared = await testDb.select().from(schema.records);
-    expect(shared).toHaveLength(0);
   });
 
   it("projects declared scalar fields at the row threshold and serves filters from the index", async () => {

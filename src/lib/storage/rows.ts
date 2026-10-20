@@ -1,12 +1,11 @@
 import { db } from "@/lib/db";
 import { sql, type SQL } from "drizzle-orm";
 import { collectionTableName, ident } from "./registry";
-import type { Conn } from "./lock";
 
 /**
- * Row operations on a layout='table' collection's hc_<id> table. Result
- * rows mirror the drizzle shape of the shared `records` table so service
- * responses look the same whichever layout a collection uses.
+ * Row operations on a collection's hc_<id> table. Result rows keep the
+ * drizzle shape of the old shared `records` table, so service responses
+ * look as they always have.
  */
 export type TableRecord = {
   id: number;
@@ -56,9 +55,9 @@ function table(collectionId: number): SQL {
 }
 
 /** Plain batch insert, one statement, rows returned in input order. */
-export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api", ex: Conn = db): Promise<TableRecord[]> {
+export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api"): Promise<TableRecord[]> {
   if (docs.length === 0) return [];
-  const result = await ex.execute(sql`
+  const result = await db.execute(sql`
     INSERT INTO ${table(collectionId)} AS t (data, source)
     SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(docs)}::jsonb)
     RETURNING ${RECORD_COLUMNS}`);
@@ -84,7 +83,6 @@ export async function upsertRecords(
   keys: string[],
   mode: UpsertMode,
   source = "api",
-  ex: Conn = db,
 ): Promise<UpsertResult> {
   const keyOf = (doc: Record<string, unknown>): string | null =>
     keys.every((k) => doc[k] !== undefined) ? JSON.stringify(keys.map((k) => doc[k])) : null;
@@ -115,7 +113,7 @@ export async function upsertRecords(
       ? sql`DO UPDATE SET data = t.data || excluded.data, source = excluded.source, updated_at = now()`
       : sql`DO NOTHING`;
 
-  return ex.transaction(async (tx) => {
+  return db.transaction(async (tx) => {
     const result = await tx.execute(sql`
       INSERT INTO ${table(collectionId)} AS t (data, source)
       SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(deduped)}::jsonb)
@@ -167,8 +165,8 @@ async function findByKey(
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>, ex: Conn = db): Promise<TableRecord | undefined> {
-  const result = await ex.execute(sql`
+export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>): Promise<TableRecord | undefined> {
+  const result = await db.execute(sql`
     UPDATE ${table(collectionId)} AS t SET data = ${JSON.stringify(data)}::jsonb, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -176,8 +174,8 @@ export async function updateRecordData(collectionId: number, recordId: number, d
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function setRecordStatus(collectionId: number, recordId: number, status: string, ex: Conn = db): Promise<TableRecord | undefined> {
-  const result = await ex.execute(sql`
+export async function setRecordStatus(collectionId: number, recordId: number, status: string): Promise<TableRecord | undefined> {
+  const result = await db.execute(sql`
     UPDATE ${table(collectionId)} AS t SET status = ${status}::text, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -186,16 +184,16 @@ export async function setRecordStatus(collectionId: number, recordId: number, st
 }
 
 /** Soft delete; returns false when the record does not exist (or is already deleted). */
-export async function softDeleteRecord(collectionId: number, recordId: number, ex: Conn = db): Promise<boolean> {
-  const result = await ex.execute(sql`
+export async function softDeleteRecord(collectionId: number, recordId: number): Promise<boolean> {
+  const result = await db.execute(sql`
     UPDATE ${table(collectionId)} SET deleted_at = now()
     WHERE id = ${recordId} AND deleted_at IS NULL
     RETURNING id`);
   return result.rows.length > 0;
 }
 
-export async function softDeleteAll(collectionId: number, ex: Conn = db): Promise<void> {
-  await ex.execute(sql`UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL`);
+export async function softDeleteAll(collectionId: number): Promise<void> {
+  await db.execute(sql`UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL`);
 }
 
 export async function countRecords(collectionId: number): Promise<number> {
@@ -312,6 +310,28 @@ export async function childTableCounts(tables: string[]): Promise<Record<string,
   for (const name of tables) {
     const result = await db.execute(sql`SELECT count(*)::int AS count FROM ${ident(name)}`);
     counts[name] = (result.rows[0] as { count: number } | undefined)?.count ?? 0;
+  }
+  return counts;
+}
+
+/**
+ * Live record count and newest created_at for several collections in one
+ * round trip (a UNION ALL over their tables). A collection whose table does
+ * not exist yet counts as empty.
+ */
+export async function recordCounts(collectionIds: number[]): Promise<Map<number, { count: number; lastAt: Date | null }>> {
+  const counts = new Map<number, { count: number; lastAt: Date | null }>();
+  for (const id of collectionIds) counts.set(id, { count: 0, lastAt: null });
+  if (collectionIds.length === 0) return counts;
+  const present = await db.execute(sql`
+    SELECT id FROM unnest(${toIntArrayLiteral(collectionIds)}::int[]) AS id
+    WHERE to_regclass('hc_' || id) IS NOT NULL`);
+  const ids = (present.rows as { id: number }[]).map((r) => r.id);
+  if (ids.length === 0) return counts;
+  const parts = ids.map((id) => sql`SELECT ${id}::int AS id, count(*)::int AS count, max(created_at) AS last_at FROM ${table(id)} WHERE deleted_at IS NULL`);
+  const result = await db.execute(sql.join(parts, sql` UNION ALL `));
+  for (const row of result.rows as { id: number; count: number; last_at: Date | string | null }[]) {
+    counts.set(row.id, { count: row.count, lastAt: toDate(row.last_at) });
   }
   return counts;
 }
