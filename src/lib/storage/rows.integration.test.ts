@@ -202,6 +202,37 @@ describe.skipIf(!TEST_DB_URL)("row helpers with and without a transaction", () =
     expect(await live()).toEqual([{ k: "a", n: 1 }, { k: "b" }, { k: "c" }]);
   });
 
+  it("exactDistinctCounts sorts only the projected values, never whole documents", async () => {
+    const { randomBytes } = await import("node:crypto");
+    // 300 documents of ~20 KB (incompressible, so TOASTed at full size): 6 MB to sort if documents were carried.
+    const docs = Array.from({ length: 300 }, (_, i) => ({ k: `k${i}`, status: ["a", "b", "c"][i % 3], n: i % 7, pad: randomBytes(10_000).toString("hex") }));
+    for (let i = 0; i < docs.length; i += 100) await rows.insertRecords(COLLECTION_ID, docs.slice(i, i + 100));
+    expect(await rows.exactDistinctCounts(COLLECTION_ID, ["status", "n", "k", "missing"])).toEqual({ status: 3, n: 7, k: 300, missing: 0 });
+
+    const { PgDialect } = await import("drizzle-orm/pg-core");
+    const { sql: text, params } = new PgDialect().sqlToQuery(rows.exactDistinctCountsQuery(COLLECTION_ID, ["status", "n", "k"]));
+    const client = await testPool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("SET LOCAL work_mem = '1MB'");
+      const plan = (await client.query(`EXPLAIN (ANALYZE, FORMAT JSON) ${text}`, params)).rows[0]["QUERY PLAN"][0].Plan;
+      const sorts: { "Sort Space Type"?: string; "Sort Space Used"?: number }[] = [];
+      const walk = (node: Record<string, unknown>) => {
+        if (node["Sort Space Type"]) sorts.push(node as (typeof sorts)[number]);
+        for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) walk(child);
+      };
+      walk(plan);
+      expect(sorts.length).toBeGreaterThan(0);
+      for (const sort of sorts) {
+        expect(sort["Sort Space Type"]).toBe("Memory");
+        expect(sort["Sort Space Used"]).toBeLessThan(1024);
+      }
+    } finally {
+      await client.query("ROLLBACK");
+      client.release();
+    }
+  });
+
   it("searchRecords ranks matches and runs inside a tx", async () => {
     await rows.insertRecords(COLLECTION_ID, [{ t: "otter" }, { t: "otter otter otter" }, { t: "seal" }]);
     const hits = await rows.searchRecords(COLLECTION_ID, "otter", 10);

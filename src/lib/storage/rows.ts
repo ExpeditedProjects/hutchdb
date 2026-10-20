@@ -674,10 +674,24 @@ export async function recordCounts(collectionIds: number[]): Promise<Map<number,
  */
 export async function exactDistinctCounts(collectionId: number, keys: string[]): Promise<Record<string, number>> {
   if (keys.length === 0) return {};
-  const cols = keys.map((k, i) => sql`count(DISTINCT s.d->${k}::text)::int AS ${sql.raw(`"d${i}"`)}`);
-  const result = await db.execute(sql`SELECT ${sql.join(cols, sql`, `)} FROM ${documentsOnce(collectionId)} s`);
+  const result = await db.execute(exactDistinctCountsQuery(collectionId, keys));
   const row = result.rows[0] as Record<string, number>;
   return Object.fromEntries(keys.map((k, i) => [k, Number(row[`d${i}`])]));
+}
+
+/**
+ * The exactDistinctCounts statement (columns d0, d1, ... for `keys`). The
+ * per-key values are projected first (inner OFFSET 0 subquery), so each
+ * count(DISTINCT ...) sorts only its values, not whole documents: on a
+ * large-document table (stress hc_5, 69 MB) sorting the documents spilled
+ * 254 MB to disk and took 1.3 s; projected, 0.4 s in memory.
+ */
+export function exactDistinctCountsQuery(collectionId: number, keys: string[]): SQL {
+  const values = keys.map((k, i) => sql`s.d->${k}::text AS ${sql.raw(`"v${i}"`)}`);
+  const cols = keys.map((_, i) => sql`count(DISTINCT x.${sql.raw(`"v${i}"`)})::int AS ${sql.raw(`"d${i}"`)}`);
+  return sql`
+    SELECT ${sql.join(cols, sql`, `)}
+    FROM (SELECT ${sql.join(values, sql`, `)} FROM ${documentsOnce(collectionId)} s OFFSET 0) x`;
 }
 
 /**
