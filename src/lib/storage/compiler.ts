@@ -888,6 +888,33 @@ function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
   }
 }
 
+/**
+ * Each results row is one object keyed by the group_by keys and aggregate
+ * aliases, plus time_bucket (with time_bucket) and parent_id/record (with
+ * per_record). Two of those sharing a name would silently drop one value,
+ * so the names must be distinct. Top-level response fields (plan, total,
+ * indexed) are outside the rows and never collide.
+ */
+function assertDistinctColumns(groupKeys: string[], aliases: string[], opts: { timeBucket: boolean; perRecord: boolean }): void {
+  const reserved = new Set([...(opts.timeBucket ? ["time_bucket"] : []), ...(opts.perRecord ? ["parent_id", "record"] : [])]);
+  for (const name of [...groupKeys, ...aliases]) {
+    if (reserved.has(name) || name.startsWith("__")) {
+      const why = name.startsWith("__") ? "names starting with __ are used internally"
+        : name === "time_bucket" ? "with time_bucket, each row carries its bucket as time_bucket"
+        : "with per_record, each row carries parent_id and record";
+      throw new Error(`'${name}' is reserved in this aggregate's rows (${why}); ${groupKeys.includes(name) ? "a field with this name can't be a group_by key in this query" : "use another alias"}.`);
+    }
+  }
+  for (const alias of aliases) {
+    if (groupKeys.includes(alias)) {
+      throw new Error(`'${alias}' is both a group_by key and an aggregate alias; each results row would hold only one of them. Use a different alias, e.g. {"n": "count"}.`);
+    }
+  }
+  if (aliases.length === 0 && groupKeys.includes("count")) {
+    throw new Error(`group_by key 'count' collides with the default count column; pass an aggregate with another alias, e.g. {"n": "count"}.`);
+  }
+}
+
 export const AGGREGATE_SPEC_EXAMPLE = '{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}';
 
 /**
@@ -1038,6 +1065,7 @@ function compileAggregate(
   const { registry } = ctx;
   const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, offset, countOnly, perRecord, scalarArrayKeys } = params;
   const aggs = parseAggregate(aggregate);
+  assertDistinctColumns(groupKeys, aggs.map((a) => a.alias), { timeBucket: !!timeBucket, perRecord });
 
   // Which nested array (if any) this aggregation runs over.
   const refs = [...groupKeys, ...aggs.flatMap((a) => (a.field ? [a.field] : []))].map((f) => ({ field: f, parsed: parsePath(registry, ctx.arrayPaths, f) }));

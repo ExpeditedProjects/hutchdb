@@ -745,3 +745,31 @@ describe('indexed reason wording', () => {
     expect(report.reason).not.toMatch(/sort on/)
   })
 })
+
+describe('compileQuery: result column names never collide', () => {
+  it('rejects an aggregate alias that is also a group_by key', () => {
+    expect(() => compileQuery(collection, { groupBy: 'plan', aggregate: { plan: 'count' } })).toThrow(/'plan' is both a group_by key and an aggregate alias/)
+  })
+
+  it('rejects grouping by a field named count without an aggregate (the default count column)', () => {
+    expect(() => compileQuery(collection, { groupBy: 'count' })).toThrow(/group_by key 'count' collides with the default count column.*aggregate/)
+    expect(() => compileQuery(collection, { groupBy: 'count', aggregate: { n: 'count' } })).not.toThrow()
+  })
+
+  it('rejects names the response adds to each row: time_bucket, parent_id and record', () => {
+    expect(() => compileQuery(collection, { groupBy: 'time_bucket', timeBucket: 'day' })).toThrow(/'time_bucket'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: 'status', aggregate: { time_bucket: 'count' }, timeBucket: 'day' })).toThrow(/'time_bucket'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: 'items.sku', aggregate: { record: 'count' }, perRecord: true }, { arrayPaths: ['items'] })).toThrow(/'record'.*reserved/)
+    expect(() => compileQuery(collection, { groupBy: ['parent_id', 'items.sku'], perRecord: true }, { arrayPaths: ['items'] })).toThrow(/'parent_id'.*reserved/)
+    // Without per_record / time_bucket those names are ordinary fields.
+    expect(() => compileQuery(collection, { groupBy: 'record', aggregate: { parent_id: 'count' } })).not.toThrow()
+  })
+
+  it('rejects aliases starting with __ (internal columns)', () => {
+    expect(() => compileQuery(collection, { groupBy: 'status', aggregate: { __total: 'count' } })).toThrow(/'__total'.*reserved/)
+  })
+
+  it('allows group keys named like response fields (plan, total, indexed): they live inside each results object', () => {
+    expect(() => compileQuery(collection, { groupBy: ['plan', 'total', 'indexed'], aggregate: { n: 'count' } })).not.toThrow()
+  })
+})

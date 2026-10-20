@@ -217,4 +217,33 @@ describe.skipIf(!TEST_DB_URL)("bounded tool output, real Postgres", () => {
       expect(whole.results[0].records[0].data.body).toBe(body(7));
     });
   });
+
+  describe("status: data field vs system status", () => {
+    it("filter and group_by on status target the data's status key; records of every system status are returned; stats count system statuses", async () => {
+      const { slug } = await seed("orders_status", [
+        { order: 1, status: "delivered" }, { order: 2, status: "delivered" }, { order: 3, status: "pending" }, { order: 4 },
+      ]);
+      const all = await recordsSvc.queryRecords(slug, USER_ID, { sort: "order" }) as { records: { id: number; status: string }[] };
+      await recordsSvc.updateRecordStatus(slug, USER_ID, all.records[0].id, "archived");
+
+      const delivered = await recordsSvc.queryRecords(slug, USER_ID, { filter: { status: "delivered" }, sort: "order" }) as { records: { status: string; data: { order: number } }[] };
+      expect(delivered.records.map((r) => [r.data.order, r.status])).toEqual([[1, "archived"], [2, "active"]]);
+      expect((await recordsSvc.queryRecords(slug, USER_ID, { filter: { status: "active" }, limit: 0 }) as { total: number }).total).toBe(0);
+      expect((await recordsSvc.queryRecords(slug, USER_ID, { filter: { status: "archived" }, limit: 0 }) as { total: number }).total).toBe(0);
+
+      const grouped = await recordsSvc.queryRecords(slug, USER_ID, { groupBy: "status", aggregate: { n: "count" }, sort: "status" }) as unknown as { results: { status: string | null; n: number }[] };
+      expect(grouped.results).toEqual([{ status: "delivered", n: 2 }, { status: "pending", n: 1 }, { status: null, n: 1 }]);
+
+      const stats = await collectionsSvc.getCollectionStats(slug, USER_ID);
+      expect(stats!.by_status).toEqual({ active: 3, archived: 1 });
+    });
+  });
+
+  describe("min/max over mixed types", () => {
+    it("takes the numbers when a group has any, as documented", async () => {
+      const { slug } = await seed("mixed_max", [{ g: "a", v: 5 }, { g: "a", v: "99" }, { g: "b", v: "x" }, { g: "b", v: "y" }]);
+      const r = await recordsSvc.queryRecords(slug, USER_ID, { groupBy: "g", aggregate: { hi: { max: "v" }, lo: { min: "v" } }, sort: "g" }) as unknown as { results: { g: string; hi: unknown; lo: unknown }[] };
+      expect(r.results).toEqual([{ g: "a", hi: 5, lo: 5 }, { g: "b", hi: "y", lo: "x" }]);
+    });
+  });
 });

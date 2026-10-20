@@ -452,6 +452,30 @@ describe('string cap and page budget', () => {
   })
 })
 
+describe('documentation fixes', () => {
+  it('says which status filter and group_by target, and how to reach the system status', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const shape = (registeredConfigs.get('hutch_query_records')!.inputSchema as { shape: Record<string, { description?: string }> }).shape
+    for (const key of ['filter', 'group_by']) {
+      expect(shape[key].description).toMatch(/match a status key inside the data, never the record's system status/)
+      expect(shape[key].description).toMatch(/hutch_collection_stats by_status/)
+    }
+  })
+
+  it('leads hutch_infer_schema with the fact that it writes', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.get('hutch_infer_schema')!.description as string).toMatch(/^Writes: infers field types .* saves them as the collection's schema/)
+  })
+
+  it('documents that numbers win in min/max over mixed values, and that group keys cannot shadow response fields', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const config = registeredConfigs.get('hutch_query_records')!
+    const shape = (config.inputSchema as { shape: Record<string, { description?: string }> }).shape
+    expect(shape.aggregate.description).toMatch(/over mixed values the numbers win, so max of 5 and "99" is 5/)
+    expect(config.description as string).toMatch(/a group key named plan never clashes with them; a group_by key and an aggregate alias may not share a name/)
+  })
+})
+
 describe('tool input schemas and descriptions', () => {
   it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
