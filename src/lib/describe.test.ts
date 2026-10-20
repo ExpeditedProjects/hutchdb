@@ -1,7 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 
 vi.mock('./db', () => ({ db: {} }))
-vi.mock('./db/queries', () => ({ notDeleted: {} }))
 
 import { truncateSample, MAX_SAMPLE_STRING } from './describe'
 

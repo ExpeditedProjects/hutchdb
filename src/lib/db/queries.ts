@@ -1,7 +1,7 @@
 import { cache } from "react";
 import { db } from "./index";
 import { collections, collectionMembers, organizations, organizationMembers, user, type CollectionRole, type OrganizationRole } from "./schema";
-import { eq, and, sql, asc, inArray, SQL } from "drizzle-orm";
+import { eq, and, sql, asc, inArray } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { createCollectionTable } from "@/lib/storage/ddl";
 
@@ -226,7 +226,7 @@ export type QueryParams = {
   groupBy?: string | string[];
   aggregate?: Record<string, string | Record<string, string>>;
   timeBucket?: string;
-  /** Table layout, aggregates over a nested array only: false omits the embedded parent `record`. */
+  /** Aggregates over a nested array only: false omits the embedded parent `record`. */
   record?: boolean;
   createdAfter?: string;
   createdBefore?: string;
@@ -236,152 +236,19 @@ export type QueryParams = {
   limitCap?: number;
 };
 
-export const SORT_FIELD_HELP =
-  "sort accepts a top-level field name, a dotted path into nested objects (a.b.c), id, created_at or updated_at, optionally prefixed with - for descending";
-
 export const MAX_GROUP_BY_KEYS = 3;
 
-/**
- * A field name, or a dotted path into nested objects ("totals.veterans.points").
- * Every segment is letters, digits and underscores only, so a validated path
- * can never carry quotes, braces or commas into SQL.
- */
-const FIELD_PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
-
-/** Segments of a dotted object path, or null when `field` is not one (plain keys stay literal). */
-function dottedPathSegments(field: string): string[] | null {
-  return field.includes(".") && FIELD_PATH_RE.test(field) ? field.split(".") : null;
-}
-
-/** Postgres text[] literal for a validated path, bound as a parameter for `#>` / `#>>`. */
-function pathLiteral(segments: string[]): string {
-  return `{${segments.join(",")}}`;
-}
-
-/** {a: {b: {c: value}}} for path [a, b, c] — the containment shape of a dotted filter. */
-function nestValue(segments: string[], value: unknown): Record<string, unknown> {
-  return segments.reduceRight<unknown>((acc, key) => ({ [key]: acc }), value) as Record<string, unknown>;
-}
-
 export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
-export type FilterOperator = (typeof FILTER_OPERATORS)[number];
-
-type ComparisonOp = Extract<FilterOperator, "$gt" | "$gte" | "$lt" | "$lte">;
-const COMPARISON_OPS: Record<ComparisonOp, string> = { $gt: ">", $gte: ">=", $lt: "<", $lte: "<=" };
-
-const IN_ARRAY_LIMIT = 1000;
 
 /**
  * An operator spec is an object value whose keys ALL start with `$`
  * (e.g. {"$gte": 10, "$lt": 100}). Anything else — plain values, arrays,
- * nested objects, mixed keys — falls back to JSONB containment, which
- * keeps existing filter call shapes byte-for-byte compatible.
+ * nested objects, mixed keys — is a plain value (containment).
  */
 export function isOperatorSpec(value: unknown): value is Record<string, unknown> {
   if (!isPlainObject(value)) return false;
   const keys = Object.keys(value);
   return keys.length > 0 && keys.every((k) => k.startsWith("$"));
-}
-
-/**
- * Build WHERE conditions for a filter object. Plain (non-operator) pairs
- * are collected into a single JSONB containment condition, exactly as
- * before; operator pairs each compile to a guarded, fully parameterized
- * comparison. Numeric comparisons only apply where
- * jsonb_typeof(data->field) = 'number' so mixed-type fields can't raise
- * cast errors; string operands compare lexicographically as text (which
- * also works for ISO-8601 date strings).
- *
- * `data` is the document column the compiler aliases (`t.data`, `e.val`).
- */
-export function buildFilterConditions(filter: Record<string, unknown>, data: SQL): SQL[] {
-  const conditions: SQL[] = [];
-  const containment: Record<string, unknown> = {};
-
-  for (const [field, value] of Object.entries(filter)) {
-    // A dotted key ("address.city") addresses a nested object; any other
-    // key is a literal top-level key.
-    const path = dottedPathSegments(field);
-    if (isOperatorSpec(value)) {
-      for (const [op, operand] of Object.entries(value)) {
-        conditions.push(buildOperatorCondition(field, op, operand, path, data));
-      }
-    } else if (path) {
-      conditions.push(sql`${data} @> ${JSON.stringify(nestValue(path, value))}::jsonb`);
-    } else {
-      containment[field] = value;
-    }
-  }
-
-  if (Object.keys(containment).length > 0) {
-    conditions.unshift(sql`${data} @> ${JSON.stringify(containment)}::jsonb`);
-  }
-
-  return conditions;
-}
-
-/**
- * One operator condition against the document column `data` (see
- * buildFilterConditions). Top-level fields use `->` / `->>` / `?`; dotted
- * object paths use `#>` / `#>>` with the path bound as a text[] parameter.
- */
-export function buildOperatorCondition(
-  field: string,
-  op: string,
-  operand: unknown,
-  path: string[] | null,
-  data: SQL,
-): SQL {
-  const json = path ? sql`${data} #> ${pathLiteral(path)}::text[]` : sql`${data}->${field}`;
-  const text = path ? sql`${data} #>> ${pathLiteral(path)}::text[]` : sql`${data}->>${field}`;
-  const contains = (v: unknown) => sql`${data} @> ${JSON.stringify(path ? nestValue(path, v) : { [field]: v })}::jsonb`;
-
-  if (Object.hasOwn(COMPARISON_OPS, op)) {
-    const cmp = sql.raw(COMPARISON_OPS[op as ComparisonOp]);
-    if (typeof operand === "number") {
-      return sql`(jsonb_typeof(${json}) = 'number' AND (${text})::numeric ${cmp} ${operand})`;
-    }
-    if (typeof operand === "string") {
-      return sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ${cmp} ${operand})`;
-    }
-    throw new Error(`${op} requires a number or string operand`);
-  }
-
-  switch (op) {
-    case "$ne":
-      // Mongo semantics: matches records where the field differs OR is absent.
-      return sql`NOT (${contains(operand)})`;
-    case "$in":
-    case "$nin": {
-      if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
-      if (operand.length > IN_ARRAY_LIMIT) {
-        throw new Error(`$in/$nin arrays are limited to ${IN_ARRAY_LIMIT} elements`);
-      }
-      if (operand.length === 0) {
-        // $in [] matches nothing; $nin [] matches everything.
-        return op === "$in" ? sql`false` : sql`true`;
-      }
-      const list = sql.join(operand.map((v) => sql`${JSON.stringify(v)}::jsonb`), sql`, `);
-      const inCondition = sql`${json} = ANY(ARRAY[${list}])`;
-      return op === "$in"
-        ? inCondition
-        : sql`(${json} IS NULL OR NOT (${inCondition}))`;
-    }
-    case "$exists":
-      if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
-      if (path) {
-        // `#>` yields SQL NULL only when the key is absent (a stored JSON null is present).
-        return operand ? sql`${json} IS NOT NULL` : sql`${json} IS NULL`;
-      }
-      return operand ? sql`${data} ? ${field}` : sql`NOT (${data} ? ${field})`;
-    case "$contains": {
-      if (typeof operand !== "string") throw new Error("$contains requires a string operand");
-      const pattern = `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
-      return sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ILIKE ${pattern})`;
-    }
-    default:
-      throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
-  }
 }
 
 /** Keep only the requested top-level keys of a record's data (projection). */
@@ -408,7 +275,14 @@ export function normalizeGroupBy(groupBy: string | string[] | undefined): string
   return groupBy ? [groupBy] : [];
 }
 
-/** escapeField for a field or a dotted path into nested objects (each segment as strict as a field name). */
+/**
+ * A field name, or a dotted path into nested objects ("totals.veterans.points").
+ * Every segment is letters, digits and underscores only, so a validated path
+ * can never carry quotes, braces or commas into SQL.
+ */
+const FIELD_PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
+
+/** A field or a dotted path into nested objects (each segment as strict as a field name). */
 function escapeFieldPath(field: string): string {
   if (typeof field !== "string" || !FIELD_PATH_RE.test(field)) {
     throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed, with dots separating nested object keys`);

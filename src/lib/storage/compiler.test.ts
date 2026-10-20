@@ -45,7 +45,7 @@ describe('compileQuery: records', () => {
     expect(params).toEqual([50, 0])
   })
 
-  it('caps limit at 1000 like the shared layout, unless limitCap (export) raises it to at most 10000', () => {
+  it('caps limit at 1000, unless limitCap (export) raises it to at most 10000', () => {
     expect(compile({ limit: 50_000 }).params[0]).toBe(1000)
     expect(compile({ limit: 5000, limitCap: 10_000 }).params[0]).toBe(5000)
     expect(compile({ limit: 50_000, limitCap: 50_000 }).params[0]).toBe(10_000)
@@ -109,7 +109,7 @@ describe('compileQuery: records', () => {
     expect(sql).not.toContain('EXISTS')
   })
 
-  it('compiles a dotted path into nested objects like the shared layout, without the literal-key fallback', () => {
+  it('compiles a dotted path into nested objects, without a literal-key fallback', () => {
     const { sql, params } = compile({ filter: { 'address.city': 'Oslo', 'address.zip': { $gte: '0100' } } })
     // Equality also matches an array holding the value (Mongo semantics).
     expect(sql).toContain('(t.data @> $1::jsonb OR t.data @> $2::jsonb)')
@@ -138,7 +138,7 @@ describe('compileQuery: records', () => {
     expect(compile({ sort: 'other' }).sql).toContain('ORDER BY t.data->$1::text ASC NULLS LAST')
   })
 
-  it('keeps search and created_at bounds as in the shared layout', () => {
+  it('compiles search and created_at bounds', () => {
     const { sql } = compile({ search: 'hello', createdAfter: '2026-01-01', createdBefore: '2026-02-01' })
     expect(sql).toContain("to_tsvector('english', t.data::text) @@ plainto_tsquery('english', $1)")
     expect(sql).toContain('t.created_at >= $2::timestamptz')
@@ -205,7 +205,7 @@ describe('compileQuery: aggregation', () => {
   it('validates field names and aggregation ops', () => {
     expect(() => compile({ groupBy: 'a;b' })).toThrow(/Invalid field name/)
     expect(() => compile({ aggregate: { x: { median: 'price' } } })).toThrow(/Unsupported aggregation/)
-    // An unknown bucket falls back to 'day', as in the shared layout.
+    // An unknown bucket falls back to 'day'.
     expect(compile({ timeBucket: 'bogus', aggregate: { n: 'count' } }).sql).toContain("date_trunc('day', t.created_at) AS time_bucket")
   })
 })
@@ -630,5 +630,27 @@ describe('summarizePlan: plan text agrees with indexed', () => {
     expect(report.plan).toBe("Index Scan using hc_12_created_at_idx on hc_12, serving none of the query's clauses")
     expect(report.reason).toMatch(/hc_12_created_at_idx only supplied row order or the live-row check/)
     expect(report.reason!.match(/evaluated over the stored documents/g)).toHaveLength(1)
+  })
+})
+
+describe('filter operator validation', () => {
+  it('rejects malformed operands before any SQL runs', () => {
+    expect(() => compile({ filter: { f: { $gt: true } } })).toThrow(/\$gt requires a number or string operand/)
+    expect(() => compile({ filter: { f: { $lte: null } } })).toThrow(/\$lte requires a number or string operand/)
+    expect(() => compile({ filter: { f: { $in: 'active' } } })).toThrow(/\$in requires an array operand/)
+    expect(() => compile({ filter: { f: { $exists: 'yes' } } })).toThrow(/\$exists requires a boolean operand/)
+    expect(() => compile({ filter: { f: { $regex: 'a' } } })).toThrow(/Unsupported filter operator '\$regex'/)
+  })
+
+  it('caps $in/$nin lists at 1000 elements', () => {
+    const big = Array.from({ length: 1001 }, (_, i) => i)
+    expect(() => compile({ filter: { f: { $in: big } } })).toThrow(/limited to 1000 elements/)
+    expect(() => compile({ filter: { f: { $nin: big } } })).toThrow(/limited to 1000 elements/)
+    expect(() => compile({ filter: { f: { $in: big.slice(0, 1000) } } })).not.toThrow()
+  })
+
+  it('compiles empty $in to false and empty $nin to true', () => {
+    expect(compile({ filter: { f: { $in: [] } } }).sql).toContain('false')
+    expect(compile({ filter: { f: { $nin: [] } } }).sql).toContain('true')
   })
 })
