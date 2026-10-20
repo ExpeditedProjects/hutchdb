@@ -441,7 +441,9 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
         await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
         await blocker.query("SELECT 1");
         const building = builder.buildPendingIndexes({ collectionId: id });
-        await new Promise((r) => setTimeout(r, 800));
+        // Once the build is waiting for the old snapshot, keep it waiting past its 200 ms lock timeout.
+        await waitForLockWaiter("%CREATE INDEX CONCURRENTLY%");
+        await new Promise((r) => setTimeout(r, 500));
         await blocker.query("ROLLBACK");
         report = await building;
       } finally {
@@ -512,6 +514,37 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       // Past the backoff, an automatic build retries.
       await builder.buildPendingIndexes();
       expect((await registry(slug)).projections.every((p) => p.build?.state === "ready")).toBe(true);
+    });
+
+    it("a build that finds an INVALID index left by a cancelled CREATE INDEX CONCURRENTLY replaces it and is ready on the first attempt", async () => {
+      const slug = await store("leftover", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      const target = (await registry(slug)).projections.find((p) => p.field === "score")!;
+      const index = `hc_${id}_${target.column}_idx`;
+      const { projectionIndexDdl } = await import("./ddl");
+      const { db } = await import("@/lib/db");
+      const ddl = await projectionIndexDdl(db, id, target);
+      // An older snapshot makes the CREATE INDEX CONCURRENTLY wait after creating its catalog entry; the statement timeout cancels it there.
+      const blocker = await testPool.connect();
+      const creator = await testPool.connect();
+      try {
+        await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        await blocker.query("SELECT 1");
+        await creator.query("SET statement_timeout = 300");
+        await expect(creator.query(ddl)).rejects.toMatchObject({ code: "57014" });
+      } finally {
+        await blocker.query("ROLLBACK");
+        blocker.release();
+        await creator.query("RESET statement_timeout");
+        creator.release();
+      }
+      expect(await indexState(index)).toBe("invalid");
+
+      const report = await builder.buildPendingIndexes({ collectionId: id });
+      expect(report.failed).toBe(0);
+      expect(report.collections[0].outcomes.find((o) => o.key === JSON.stringify(["score"]))).toMatchObject({ state: "ready" });
+      expect((await registry(slug)).projections.find((p) => p.field === "score")!.build).toEqual({ state: "ready", at: expect.any(String) });
+      expect(await indexState(index)).toBe("valid");
     });
 
     it("a build left 'building' by a builder that died is picked up again, whether or not its index got built", async () => {
@@ -818,6 +851,60 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       const retried = await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
       expect(retried.failed).toBe(0);
       expect(await childMatchesDocuments(id)).toMatchObject({ missing: 0, extra: 0 });
+    });
+
+    describe("parent rows a writer holds locked during the backfill", () => {
+      async function unwindOnly(name: string) {
+        const docs = orders(0, 120);
+        const slug = await store(name, docs);
+        const id = (await collectionRow(slug)).id;
+        // Only the unwind: a projection's CREATE INDEX CONCURRENTLY would wait for the locking transaction too.
+        await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{projections}', '[]') WHERE id = ${id}`);
+        return { slug, id, docs };
+      }
+
+      async function holdRow(id: number) {
+        const holder = await testPool.connect();
+        await holder.query("BEGIN");
+        await holder.query(`SELECT id FROM hc_${id} WHERE id = 7 FOR UPDATE`);
+        return async () => {
+          await holder.query("ROLLBACK");
+          holder.release();
+        };
+      }
+
+      it("a row released within the retry rounds is backfilled and the child table is exact", async () => {
+        const { slug, id, docs } = await unwindOnly("locked-brief");
+        const release = await holdRow(id);
+        const building = builder.buildPendingIndexes({ collectionId: id });
+        await new Promise((r) => setTimeout(r, 300));
+        await release();
+        const report = await building;
+        expect(report.failed).toBe(0);
+        expect((await registry(slug)).unwinds[0].build).toEqual({ state: "ready", at: expect.any(String) });
+        expect(await childMatchesDocuments(id)).toEqual({ missing: 0, extra: 0, total: docs.reduce((n, d) => n + d.items.length, 0) });
+      });
+
+      it("a row held past every retry round fails the build with the generic reason; queries stay correct and a retry is exact", async () => {
+        const { slug, id, docs } = await unwindOnly("locked-long");
+        const release = await holdRow(id);
+        let report;
+        try {
+          report = await builder.buildPendingIndexes({ collectionId: id });
+        } finally {
+          await release();
+        }
+        expect(report.collections[0].outcomes).toEqual([expect.objectContaining({ kind: "unwind", state: "failed", error: "writes kept some records locked through every backfill retry" })]);
+        expect((await registry(slug)).unwinds[0].build).toMatchObject({ state: "failed", attempts: 1 });
+        // The compiler ignores the failed unwind: answers come from the documents.
+        const filter = { "items.sku": "s3", "items.qty": 2 };
+        const expected = docs.filter((d) => d.items.some((x) => x.sku === "s3" && x.qty === 2)).map((d) => d.key);
+        const page = ok(await recordsSvc.queryRecords(slug, USER_ID, { filter, sort: "key", limit: 1000 })) as { records: { data: Order }[] };
+        expect(page.records.map((r) => r.data.key)).toEqual(expected);
+        const retried = await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
+        expect(retried.failed).toBe(0);
+        expect(await childMatchesDocuments(id)).toEqual({ missing: 0, extra: 0, total: docs.reduce((n, d) => n + d.items.length, 0) });
+      }, 20_000);
     });
 
     it("the backfill stays exact while inserts, updates and transforms run during it", async () => {
