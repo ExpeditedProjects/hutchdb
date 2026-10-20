@@ -2,7 +2,7 @@ import { db } from "@/lib/db";
 import { collections, collectionMembers } from "@/lib/db/schema";
 import { createCollectionWithOwner, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
-import { eq, and, sql, type SQL } from "drizzle-orm";
+import { eq, and, type SQL } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, CollectionSchema } from "@/lib/schema-inference";
 import { seedAutoViews } from "./views";
@@ -11,7 +11,7 @@ import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
-import { collectionTableName, ident, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
+import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
@@ -586,8 +586,6 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   return { updated: true, record: updated, slug };
 }
 
-class TransformFailed extends Error {}
-
 export async function transformRecords(slug: string, userId: string, params: {
   remove_fields?: string[];
   rename_fields?: Record<string, string>;
@@ -621,14 +619,6 @@ export async function transformRecords(slug: string, userId: string, params: {
     return { error: "Invalid field name", status: 400 };
   }
 
-  // Distinct ids, not summed rowCounts: one call can run several UPDATEs
-  // over the same records (rename + remove + set), and the caller wants to
-  // know how many records changed.
-  const touched = new Set<number>();
-  const track = (result: { rows: Record<string, unknown>[] }) => {
-    for (const row of result.rows) touched.add(Number(row.id));
-  };
-
   // Database failures return this clean message instead of surfacing raw
   // driver/SQL text through the MCP tool output.
   const transformFailed = {
@@ -636,75 +626,35 @@ export async function transformRecords(slug: string, userId: string, params: {
     status: 500,
   };
 
-  // The statements run in one transaction, so a failure leaves none of
-  // them applied. Projection columns are generated from data and the
-  // unwind triggers fire on data changes, so both stay in sync.
+  // set_field.filter takes the full query filter language (operators,
+  // dotted paths, array elements), as in hutch_query_records.
   const collection = access.collection;
-  const target = ident(collectionTableName(collection.id));
+  let setFilter: SQL | undefined;
+  if (set_field?.filter && Object.keys(set_field.filter).length > 0) {
+    try {
+      setFilter = await tableFilterWhere(collection, set_field.filter);
+    } catch (err) {
+      console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
+      return transformFailed;
+    }
+  }
+
+  // The statements run in one transaction, so a failure leaves none of
+  // them applied.
+  let touched: Set<number>;
   try {
-    await db.transaction(async (tx) => {
-      const run = async (step: string, query: SQL) => {
-        try {
-          track(await tx.execute(query));
-        } catch (err) {
-          console.error(`transformRecords ${step} failed for collection ${collection.id}`, err);
-          throw new TransformFailed();
-        }
-      };
-
-      if (remove_fields && remove_fields.length > 0) {
-        // Remove all fields in a single query using array subtraction
-        const fieldsLiteral = `{${remove_fields.join(",")}}`;
-        await run("remove_fields", sql`UPDATE ${target} SET data = data - ${fieldsLiteral}::text[], updated_at = now()
-            WHERE data ?| ${fieldsLiteral}::text[] AND deleted_at IS NULL
-            RETURNING id`);
-      }
-
-      if (rename_fields && Object.keys(rename_fields).length > 0) {
-        for (const [oldName, newName] of Object.entries(rename_fields)) {
-          // Every ::text cast is load-bearing: `->` and `-` are overloaded on
-          // (jsonb, text)/(jsonb, integer), and jsonb_build_object is VARIADIC
-          // "any" — an untyped bind param in any of these makes Postgres reject
-          // the statement ("could not determine data type of parameter").
-          // Verified against node-postgres, which sends params untyped.
-          await run("rename_fields", sql`UPDATE ${target}
-              SET data = (data || jsonb_build_object(${newName}::text, data->${oldName}::text)) - ${oldName}::text,
-                  updated_at = now()
-              WHERE data ? ${oldName}
-              AND deleted_at IS NULL
-              RETURNING id`);
-        }
-      }
-
-      if (set_field) {
-        const { field, value, filter } = set_field;
-        const overlay = JSON.stringify({ [field]: value });
-        if (filter && Object.keys(filter).length > 0) {
-          // The full query filter language (operators, dotted paths, array
-          // elements), as in hutch_query_records.
-          let where: SQL;
-          try {
-            where = await tableFilterWhere(collection, filter);
-          } catch (err) {
-            console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
-            throw new TransformFailed();
-          }
-          await run("set_field", sql`UPDATE ${target} AS t
-              SET data = t.data || ${overlay}::jsonb,
-                  updated_at = now()
-              WHERE ${where}
-              RETURNING t.id`);
-        } else {
-          await run("set_field", sql`UPDATE ${target}
-              SET data = data || ${overlay}::jsonb,
-                  updated_at = now()
-              WHERE deleted_at IS NULL
-              RETURNING id`);
-        }
-      }
+    const result = await tableRows.transformRows(collection.id, {
+      remove_fields,
+      rename_fields,
+      set_field: set_field ? { field: set_field.field, value: set_field.value } : undefined,
+      setFilter,
     });
+    touched = new Set(result.touched);
   } catch (err) {
-    if (err instanceof TransformFailed) return transformFailed;
+    if (err instanceof tableRows.TransformStepError) {
+      console.error(`transformRecords ${err.step} failed for collection ${collection.id}`, err.cause);
+      return transformFailed;
+    }
     throw err;
   }
 

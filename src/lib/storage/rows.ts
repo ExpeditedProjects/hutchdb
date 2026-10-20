@@ -28,6 +28,19 @@ type RawRow = {
   inserted?: boolean;
 };
 
+/**
+ * Where a row helper runs: the shared pool (the default) or a drizzle
+ * transaction opened from it. Hutch Cloud passes the transaction that
+ * holds its storage-quota claim, so the write and the claim commit or roll
+ * back together. Helpers that need several statements open a savepoint
+ * inside a passed transaction (a transaction of their own on the pool), so
+ * a refused upsert or a failed transform undoes only its own statements.
+ */
+export type RowExecutor = typeof db | Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/** Options every write helper takes; `tx` defaults to the shared pool. */
+export type RowOptions = { tx?: RowExecutor };
+
 export const RECORD_COLUMNS = sql`t.id, t.data, t.source, t.status, t.deleted_at, t.created_at, t.updated_at`;
 
 /** drizzle's node-postgres driver leaves timestamps as strings on raw execute. */
@@ -54,9 +67,9 @@ function table(collectionId: number): SQL {
 }
 
 /** Plain batch insert, one statement, rows returned in input order. */
-export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api"): Promise<TableRecord[]> {
+export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api", { tx = db }: RowOptions = {}): Promise<TableRecord[]> {
   if (docs.length === 0) return [];
-  const result = await db.execute(sql`
+  const result = await tx.execute(sql`
     INSERT INTO ${table(collectionId)} AS t (data, source)
     SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(docs)}::jsonb)
     RETURNING ${RECORD_COLUMNS}`);
@@ -65,8 +78,27 @@ export async function insertRecords(collectionId: number, docs: Record<string, u
 
 export type UpsertMode = "replace" | "merge" | "skip" | "error";
 export type UpsertResult =
-  | { results: { action: "created" | "updated" | "skipped"; record: TableRecord | { data: Record<string, unknown> } }[] }
+  | {
+      results: {
+        action: "created" | "updated" | "skipped";
+        record: TableRecord | { data: Record<string, unknown> };
+        /** With `lock`: the live record an "updated" result replaced, as it was just before. */
+        previous?: TableRecord;
+      }[];
+    }
   | { conflict: true };
+
+export type UpsertOptions = RowOptions & {
+  /**
+   * Lock the live records the batch's keys match (SELECT ... FOR UPDATE)
+   * before writing, and report each replaced record's prior state as
+   * `previous` on its "updated" result. Cloud uses it to charge its
+   * storage quota by exactly the bytes a write adds. A key inserted by a
+   * concurrent writer after the lock read still upserts correctly; its
+   * result just has no `previous`.
+   */
+  lock?: boolean;
+};
 
 /**
  * Upsert over the table's unique key (uk_* columns + partial unique index,
@@ -83,6 +115,7 @@ export async function upsertRecords(
   keys: string[],
   mode: UpsertMode,
   source = "api",
+  { tx: ex = db, lock = false }: UpsertOptions = {},
 ): Promise<UpsertResult> {
   const keyOf = (doc: Record<string, unknown>): string | null =>
     keys.every((k) => doc[k] !== undefined) ? JSON.stringify(keys.map((k) => doc[k])) : null;
@@ -117,10 +150,26 @@ export async function upsertRecords(
       ? sql`DO UPDATE SET data = t.data || excluded.data, source = excluded.source, updated_at = now()`
       : sql`DO NOTHING`;
 
-  return db.transaction(async (tx) => {
+  const payload = JSON.stringify(deduped);
+  return ex.transaction(async (tx) => {
+    const before = new Map<number, TableRecord>();
+    if (lock) {
+      const matchColumns = sql.join(keys.map((_, i) => sql`t.${ident(`uk_${i}`)}`), sql`, `);
+      const docKeys = sql.join(keys.map((k) => sql`d.value->${k}::text`), sql`, `);
+      const locked = await tx.execute(sql`
+        SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
+        WHERE t.deleted_at IS NULL
+          AND (${matchColumns}) IN (SELECT ${docKeys} FROM jsonb_array_elements(${payload}::jsonb) AS d)
+        ORDER BY t.id
+        FOR UPDATE OF t`);
+      for (const r of locked.rows as RawRow[]) before.set(r.id, toRecord(collectionId, r));
+      // 'error' refuses the whole batch when any key already exists.
+      if (mode === "error" && before.size > 0) tx.rollback();
+    }
+
     const result = await tx.execute(sql`
       INSERT INTO ${table(collectionId)} AS t (data, source)
-      SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(deduped)}::jsonb)
+      SELECT value, ${source}::text FROM jsonb_array_elements(${payload}::jsonb)
       ON CONFLICT (${ukColumns}) WHERE deleted_at IS NULL ${conflictAction}
       RETURNING ${RECORD_COLUMNS}, (t.xmax = 0) AS inserted`);
     const rows = (result.rows as RawRow[]).map((r) => ({ record: toRecord(collectionId, r), inserted: r.inserted === true }));
@@ -129,17 +178,18 @@ export async function upsertRecords(
       tx.rollback();
     }
 
-    const results: Extract<UpsertResult, { results: unknown }>["results"] = rows.map(({ record, inserted }) => ({
-      action: inserted ? "created" : "updated",
-      record,
-    }));
+    const results: Extract<UpsertResult, { results: unknown }>["results"] = rows.map(({ record, inserted }) => {
+      const previous = inserted ? undefined : before.get(record.id);
+      return { action: inserted ? "created" : "updated", record, ...(previous ? { previous } : {}) };
+    });
 
     if (mode === "skip" && rows.length < deduped.length) {
       const landed = new Set(rows.map(({ record }) => keyOf(record.data as Record<string, unknown>)).filter((k) => k !== null));
       for (const doc of deduped) {
         const key = keyOf(doc);
         if (key === null || landed.has(key)) continue;
-        const existing = await findByKey(tx, collectionId, keys, doc);
+        const existing = [...before.values()].find((r) => keyOf(r.data as Record<string, unknown>) === key)
+          ?? await findByKey(tx, collectionId, keys, doc);
         results.push({ action: "skipped", record: existing ?? { data: doc } });
       }
     }
@@ -169,8 +219,22 @@ async function findByKey(
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>): Promise<TableRecord | undefined> {
-  const result = await db.execute(sql`
+/**
+ * A live record locked for the rest of the caller's transaction (SELECT
+ * ... FOR UPDATE), so its current state is what a following write in the
+ * same transaction replaces. Undefined when no live record has that id.
+ */
+export async function lockRecord(collectionId: number, recordId: number, { tx = db }: RowOptions = {}): Promise<TableRecord | undefined> {
+  const result = await tx.execute(sql`
+    SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
+    WHERE t.id = ${recordId} AND t.deleted_at IS NULL
+    FOR UPDATE OF t`);
+  const row = result.rows[0] as RawRow | undefined;
+  return row ? toRecord(collectionId, row) : undefined;
+}
+
+export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>, { tx = db }: RowOptions = {}): Promise<TableRecord | undefined> {
+  const result = await tx.execute(sql`
     UPDATE ${table(collectionId)} AS t SET data = ${JSON.stringify(data)}::jsonb, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -178,8 +242,8 @@ export async function updateRecordData(collectionId: number, recordId: number, d
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function setRecordStatus(collectionId: number, recordId: number, status: string): Promise<TableRecord | undefined> {
-  const result = await db.execute(sql`
+export async function setRecordStatus(collectionId: number, recordId: number, status: string, { tx = db }: RowOptions = {}): Promise<TableRecord | undefined> {
+  const result = await tx.execute(sql`
     UPDATE ${table(collectionId)} AS t SET status = ${status}::text, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -187,17 +251,167 @@ export async function setRecordStatus(collectionId: number, recordId: number, st
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-/** Soft delete; returns false when the record does not exist (or is already deleted). */
-export async function softDeleteRecord(collectionId: number, recordId: number): Promise<boolean> {
-  const result = await db.execute(sql`
-    UPDATE ${table(collectionId)} SET deleted_at = now()
-    WHERE id = ${recordId} AND deleted_at IS NULL
-    RETURNING id`);
-  return result.rows.length > 0;
+/**
+ * Soft delete, guarded: the live→deleted transition happens at most once,
+ * and returns the record as deleted (data included, so a caller can credit
+ * its size exactly once). Undefined when the record does not exist or is
+ * already deleted.
+ */
+export async function softDeleteRecord(collectionId: number, recordId: number, { tx = db }: RowOptions = {}): Promise<TableRecord | undefined> {
+  const result = await tx.execute(sql`
+    UPDATE ${table(collectionId)} AS t SET deleted_at = now()
+    WHERE t.id = ${recordId} AND t.deleted_at IS NULL
+    RETURNING ${RECORD_COLUMNS}`);
+  const row = result.rows[0] as RawRow | undefined;
+  return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function softDeleteAll(collectionId: number): Promise<void> {
-  await db.execute(sql`UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL`);
+/**
+ * Soft-delete every live record. Returns how many; with `returnData`, also
+ * each deleted record's data (Cloud credits their sizes to its quota).
+ */
+export async function softDeleteAll(
+  collectionId: number,
+  { tx = db, returnData = false }: RowOptions & { returnData?: boolean } = {},
+): Promise<{ count: number; data?: unknown[] }> {
+  const result = await tx.execute(sql`
+    UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL
+    RETURNING ${returnData ? sql`data` : sql`id`}`);
+  const rows = result.rows as { data?: unknown }[];
+  return returnData ? { count: rows.length, data: rows.map((r) => r.data) } : { count: rows.length };
+}
+
+export type TransformOps = {
+  remove_fields?: string[];
+  rename_fields?: Record<string, string>;
+  set_field?: { field: string; value: unknown };
+  /** Limits set_field to matching records (compileFilterWhere over alias `t`). */
+  setFilter?: SQL;
+};
+
+export type TransformOptions = RowOptions & {
+  /**
+   * Lock every record an operation can touch before writing, confine the
+   * writes to that snapshot (a record inserted meanwhile is never
+   * rewritten), and report the touched records' data before and after.
+   * Cloud uses it to charge its quota by the net growth.
+   */
+  measure?: boolean;
+};
+
+export type TransformRowsResult = {
+  /** Distinct ids of the records changed. */
+  touched: number[];
+  /** With `measure`: every locked record's data before any operation. */
+  before?: { id: number; data: unknown }[];
+  /** With `measure`: each touched record's data after all operations. */
+  after?: { id: number; data: unknown }[];
+};
+
+/** A transform statement failed; `step` names it. The statements already run are rolled back. */
+export class TransformStepError extends Error {
+  constructor(readonly step: string, readonly cause: unknown) {
+    super(`transform ${step} failed`);
+  }
+}
+
+/**
+ * hutch_transform_records' statements: remove fields, then each rename,
+ * then set_field. They run in one transaction (a savepoint inside a passed
+ * `tx`), so a failure leaves none of them applied. Field names must already
+ * be validated (FIELD_NAME_RE: letters, digits, underscore), since they go
+ * into a Postgres array literal. Projection columns are generated from data
+ * and the unwind triggers fire on data changes, so both stay in sync.
+ */
+export async function transformRows(
+  collectionId: number,
+  ops: TransformOps,
+  { tx: ex = db, measure = false }: TransformOptions = {},
+): Promise<TransformRowsResult> {
+  const { remove_fields, set_field, setFilter } = ops;
+  const renames = Object.entries(ops.rename_fields ?? {});
+  const target = table(collectionId);
+  const textArray = (names: string[]) => sql`${`{${names.join(",")}}`}::text[]`;
+
+  return ex.transaction(async (tx) => {
+    const step = async (name: string, query: SQL) => {
+      try {
+        return await tx.execute(query);
+      } catch (err) {
+        throw new TransformStepError(name, err);
+      }
+    };
+
+    let scope = sql`t.deleted_at IS NULL`;
+    let before: { id: number; data: unknown }[] | undefined;
+    if (measure) {
+      // A filter that only matches after a rename is covered by the rename
+      // term; removals can only make the filter stop matching.
+      const touchable = [
+        ...(remove_fields?.length ? [sql`t.data ?| ${textArray(remove_fields)}`] : []),
+        ...(renames.length ? [sql`t.data ?| ${textArray(renames.map(([oldName]) => oldName))}`] : []),
+        ...(set_field ? [setFilter ? sql`(${setFilter})` : sql`TRUE`] : []),
+      ];
+      if (touchable.length === 0) return { touched: [], before: [], after: [] };
+      const snapshot = await step("snapshot", sql`
+        SELECT t.id, t.data FROM ${target} t
+        WHERE t.deleted_at IS NULL AND (${sql.join(touchable, sql` OR `)})
+        ORDER BY t.id
+        FOR UPDATE OF t`);
+      before = (snapshot.rows as { id: number; data: unknown }[]).map((r) => ({ id: Number(r.id), data: r.data }));
+      if (before.length === 0) return { touched: [], before, after: [] };
+      // One array bind param: drizzle expands a bare JS array into one
+      // param per element, which breaks past Postgres' 65,535-param limit.
+      scope = sql`t.id = ANY(${`{${before.map((r) => r.id).join(",")}}`}::integer[])`;
+    }
+
+    // Distinct ids, not summed row counts: one call can run several UPDATEs
+    // over the same records (rename + remove + set).
+    const touched = new Set<number>();
+    const run = async (name: string, query: SQL) => {
+      for (const row of (await step(name, query)).rows) touched.add(Number(row.id));
+    };
+
+    if (remove_fields?.length) {
+      await run("remove_fields", sql`UPDATE ${target} AS t SET data = t.data - ${textArray(remove_fields)}, updated_at = now()
+          WHERE ${scope} AND t.data ?| ${textArray(remove_fields)}
+          RETURNING t.id`);
+    }
+
+    for (const [oldName, newName] of renames) {
+      // Every ::text cast is load-bearing: `->` and `-` are overloaded on
+      // (jsonb, text)/(jsonb, integer), and jsonb_build_object is VARIADIC
+      // "any" — an untyped bind param in any of these makes Postgres reject
+      // the statement ("could not determine data type of parameter").
+      // Verified against node-postgres, which sends params untyped.
+      await run("rename_fields", sql`UPDATE ${target} AS t
+          SET data = (t.data || jsonb_build_object(${newName}::text, t.data->${oldName}::text)) - ${oldName}::text,
+              updated_at = now()
+          WHERE ${scope} AND t.data ? ${oldName}
+          RETURNING t.id`);
+    }
+
+    if (set_field) {
+      const overlay = JSON.stringify({ [set_field.field]: set_field.value });
+      await run("set_field", sql`UPDATE ${target} AS t
+          SET data = t.data || ${overlay}::jsonb,
+              updated_at = now()
+          WHERE ${scope} ${setFilter ? sql`AND (${setFilter})` : sql.empty()}
+          RETURNING t.id`);
+    }
+
+    const ids = [...touched];
+    if (!measure) return { touched: ids };
+    if (ids.length === 0) return { touched: ids, before, after: [] };
+    const after = await step("measure", sql`
+      SELECT t.id, t.data FROM ${target} t
+      WHERE t.id = ANY(${`{${ids.join(",")}}`}::integer[])`);
+    return {
+      touched: ids,
+      before,
+      after: (after.rows as { id: number; data: unknown }[]).map((r) => ({ id: Number(r.id), data: r.data })),
+    };
+  });
 }
 
 export async function countRecords(collectionId: number): Promise<number> {
@@ -250,8 +464,8 @@ function toIntArrayLiteral(ids: number[]): string {
 }
 
 /** Full-text matches for hutch_search. */
-export async function searchRecords(collectionId: number, search: string, limit: number): Promise<TableRecord[]> {
-  const result = await db.execute(sql`
+export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<TableRecord[]> {
+  const result = await tx.execute(sql`
     SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
     WHERE t.deleted_at IS NULL AND to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})
     LIMIT ${limit}`);

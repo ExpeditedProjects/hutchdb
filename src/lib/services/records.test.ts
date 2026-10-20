@@ -32,14 +32,16 @@ vi.mock('@/lib/db', () => ({
   },
 }))
 
-// Row operations on the collection's hc_<id> table.
-vi.mock('@/lib/storage/rows', () => ({
+// Row operations on the collection's hc_<id> table. transformRows stays
+// real, so its statements reach the dbExecute mock.
+vi.mock('@/lib/storage/rows', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/storage/rows')>()),
   insertRecords: vi.fn(),
   upsertRecords: vi.fn(),
   updateRecordData: vi.fn(),
   setRecordStatus: vi.fn(),
   softDeleteRecord: vi.fn(),
-  softDeleteAll: vi.fn().mockResolvedValue(undefined),
+  softDeleteAll: vi.fn().mockResolvedValue({ count: 0 }),
   listRecords: vi.fn().mockResolvedValue([]),
   countRecords: vi.fn().mockResolvedValue(0),
   searchRecords: vi.fn().mockResolvedValue([]),
@@ -653,7 +655,7 @@ describe('transformRecords', () => {
     expect(result).toEqual(expect.objectContaining({ transformed: true, updated: 1 }))
     const sqlText = JSON.stringify((dbExecute.mock.calls[0][0] as { queryChunks?: unknown[] }).queryChunks ?? [])
     expect(sqlText).toContain('?|')
-    expect(sqlText).toContain('RETURNING id')
+    expect(sqlText).toContain('RETURNING t.id')
   })
 
   it('returns a clean error (no SQL text) when the rename query fails', async () => {
@@ -695,14 +697,14 @@ describe('deleteRecord', () => {
 
   it('returns 404 when no matching active record exists', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    vi.mocked(softDeleteRecord).mockResolvedValue(false)
+    vi.mocked(softDeleteRecord).mockResolvedValue(undefined)
     const result = await deleteRecord('users', 'user-test', 99)
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
 
   it('soft-deletes and returns the id when the record exists', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    vi.mocked(softDeleteRecord).mockResolvedValue(true)
+    vi.mocked(softDeleteRecord).mockResolvedValue(rows({ id: 5 })[0])
     const result = await deleteRecord('users', 'user-test', 5)
     expect(softDeleteRecord).toHaveBeenCalledWith(1, 5)
     expect(result).toEqual({ deleted: true, id: 5, slug: 'users' })
