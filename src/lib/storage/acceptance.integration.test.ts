@@ -524,4 +524,31 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       await expect(query(projected, { limit: -5 })).rejects.toThrow(/0 or more/);
     });
   });
+
+  // ── 6. a plain indexed equality filter under the default order ────────────
+
+  describe("indexed equality with the default order", () => {
+    it("filter on a projected field with limit 1 is served by the projection index, which carries the default order", async () => {
+      const docs = makeQuestions(3000);
+      const slug = await store("questions", docs);
+      await analyze(slug);
+      const id = (await collectionRow(slug)).id;
+      const column = (await registry(slug)).projections.find((p) => p.field === "owner_user_id")!.column;
+      const def = await testDb.execute(sql`SELECT indexdef FROM pg_indexes WHERE indexname = ${`hc_${id}_${column}_idx`}`);
+      expect((def.rows[0] as { indexdef: string }).indexdef).toMatch(/\(p_owner_user_id, created_at DESC, id DESC\)$/);
+
+      const matching = docs.filter((d) => d.owner_user_id === 4);
+      const r = await query(slug, { filter: { owner_user_id: 4 }, fields: ["question_id"], limit: 1 });
+      expect(r.indexed).toBe(true);
+      expect(r.plan).toBe(`Index Scan using hc_${id}_${column}_idx`);
+      expect(r.total).toBe(matching.length);
+      // Newest first: same-batch rows share created_at, so the highest row id (the last stored) wins.
+      expect((r.records![0].data as Question).question_id).toBe(matching.at(-1)!.question_id);
+
+      // A range on the column and a sort on it still use the same index.
+      const ranged = await query(slug, { filter: { owner_user_id: { $gte: 15 } }, sort: "-owner_user_id", limit: 3 });
+      expect(ranged.indexed).toBe(true);
+      expect(ranged.records!.map((x) => (x.data as Question).owner_user_id)).toEqual([16, 16, 16]);
+    });
+  });
 });

@@ -63,7 +63,11 @@ export async function collectionTableExists(ex: Executor, collectionId: number):
 
 /**
  * Add a stored generated projection column plus its btree index. Idempotent:
- * both statements are IF NOT EXISTS.
+ * both statements are IF NOT EXISTS. The index carries the default record
+ * order (created_at DESC, id DESC) after the column, so a filter on the
+ * column with the default order and a limit reads matching rows already
+ * in order from this one index, instead of the planner walking the
+ * created_at index and filtering.
  */
 export async function addProjection(ex: Executor, collectionId: number, projection: Projection): Promise<void> {
   const table = collectionTableName(collectionId);
@@ -74,7 +78,7 @@ export async function addProjection(ex: Executor, collectionId: number, projecti
   }
   await ex.execute(sql`
     CREATE INDEX IF NOT EXISTS ${ident(indexName(table, projection.column))}
-    ON ${ident(table)} (${ident(projection.column)})`);
+    ON ${ident(table)} (${ident(projection.column)}, created_at DESC, id DESC)`);
 }
 
 /**
