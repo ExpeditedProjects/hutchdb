@@ -71,3 +71,24 @@ describe('limitQueryOutput', () => {
     expect(limitQueryOutput(small, { maxStringLength: 2000, maxPageChars: 200_000 })).toEqual(small)
   })
 })
+
+describe('truncated values in writes', () => {
+  it('finds the marker at any depth and names its path', async () => {
+    const { findTruncatedString, truncateStrings } = await import('./output-limits')
+    const cut = truncateStrings('x'.repeat(50), 10).value
+    expect(findTruncatedString({ a: 1, b: 'fine' })).toBeNull()
+    expect(findTruncatedString({ body: cut })).toBe('body')
+    expect(findTruncatedString({ meta: { title: cut } })).toBe('meta.title')
+    expect(findTruncatedString({ items: [{ t: 'ok' }, { t: 'ok' }, { t: cut }] })).toBe('items[2].t')
+    expect(findTruncatedString(cut, 'notes')).toBe('notes')
+    // Without the ellipsis, or with text appended after it, it is still a cut value.
+    expect(findTruncatedString({ s: `${cut.slice(0, -1).replace('…', '')}] and more` })).toBe('s')
+  })
+
+  it('leaves prose that only talks about truncation alone', async () => {
+    const { findTruncatedString } = await import('./output-limits')
+    for (const s of ['the log was truncated: 40 more chars were lost', '[truncated]', '[truncated: 12 more chars]', 'pass max_string_length: 0 for full values']) {
+      expect(findTruncatedString({ s })).toBeNull()
+    }
+  })
+})

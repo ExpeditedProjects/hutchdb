@@ -18,7 +18,7 @@ import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
-import { limitQueryOutput, truncateStrings, type OutputLimits } from "./output-limits";
+import { limitQueryOutput, rejectTruncatedValues, truncateStrings, type OutputLimits } from "./output-limits";
 import { classifyDbError, describeDbError, findPgError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
@@ -80,6 +80,9 @@ export async function createRecords(userId: string, organizationId: string, para
   }
 
   const recordsToInsert = bulkRecords || [singleData!];
+
+  const truncated = rejectTruncatedValues(recordsToInsert, (i) => (bulkRecords ? ` (record ${i + 1} of ${bulkRecords.length})` : ""));
+  if (truncated) return truncated;
 
   // Validate size and capture total bytes for the quota hook.
   let totalBytes = 0;
@@ -661,6 +664,8 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   // The argument may be the collection's name; continue with its slug.
   slug = access.collection.slug;
   const collection = access.collection;
+  const truncated = rejectTruncatedValues([data]);
+  if (truncated) return truncated;
   const updated = await tableRows.updateRecordData(collection.id, recordId, data);
 
   if (!updated) return { error: "Record not found", status: 404 };
@@ -714,6 +719,10 @@ export async function transformRecords(slug: string, userId: string, params: {
   // only) before any statement runs.
   if (!fieldNames.every((f) => FIELD_NAME_RE.test(f))) {
     return { error: "Invalid field name", status: 400 };
+  }
+  if (set_field) {
+    const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");
+    if (truncated) return truncated;
   }
 
   // Database failures return a clean message that says what happened (a

@@ -23,6 +23,54 @@ export function truncationMarker(remaining: number): string {
 }
 
 /**
+ * The marker truncationMarker() appends, with or without its ellipsis.
+ * Specific enough (a count and the exact max_string_length hint) that
+ * stored prose that merely says "truncated" never matches.
+ */
+export const TRUNCATION_MARKER_RE = /\[truncated: \d+ more chars; pass max_string_length: 0 for full values\]/;
+
+/**
+ * The path of the first string in `value` (at any depth) that carries the
+ * truncation marker — "body", "meta.title", "items[2].text"; `base` names
+ * a top-level string — or null when there is none.
+ */
+export function findTruncatedString(value: unknown, base = ""): string | null {
+  if (typeof value === "string") return TRUNCATION_MARKER_RE.test(value) ? base : null;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const found = findTruncatedString(value[i], `${base}[${i}]`);
+      if (found !== null) return found;
+    }
+    return null;
+  }
+  if (value !== null && typeof value === "object" && !(value instanceof Date)) {
+    for (const [k, inner] of Object.entries(value)) {
+      const found = findTruncatedString(inner, base ? `${base}.${k}` : k);
+      if (found !== null) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * A write must never store a value a query cut short: hutch_update_record
+ * and replace upserts overwrite the whole record, so a read → edit → write
+ * of a truncated record would replace the full text with the cut one.
+ * Returns the 400 error for the first such value in `docs`, else null.
+ */
+export function rejectTruncatedValues(docs: unknown[], label: (index: number) => string = () => ""): { error: string; status: number } | null {
+  for (let i = 0; i < docs.length; i++) {
+    const path = findTruncatedString(docs[i]);
+    if (path === null) continue;
+    return {
+      error: `Nothing was written: field '${path}'${label(i)} contains a "[truncated: N more chars …]" marker, so it is a value a query cut short, not the full value; writing it would replace the stored text. Re-read the record with max_string_length: 0 and write the full value.`,
+      status: 400,
+    };
+  }
+  return null;
+}
+
+/**
  * `value` with every string longer than `max` cut to `max` characters plus
  * a marker saying how many were cut, at any depth (object keys untouched),
  * and how many strings were cut. max <= 0 returns the value unchanged.
