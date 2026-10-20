@@ -551,4 +551,35 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       expect(ranged.records!.map((x) => (x.data as Question).owner_user_id)).toEqual([16, 16, 16]);
     });
   });
+
+  // ── 7. describe's distinct counts ─────────────────────────────────────────
+
+  describe("describe distinct counts", () => {
+    it("are exact over every record for a collection this size, not counted from a sample", async () => {
+      const docs = makeQuestions(1200);
+      const slug = await store("questions", docs);
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { fields: { name: string; distinctCount?: number; distinctCountEstimate?: number }[] };
+      const field = (name: string) => described.fields.find((f) => f.name === name)!;
+      expect(field("owner_user_id").distinctCount).toBe(17);
+      expect(field("question_id").distinctCount).toBe(1200);
+      expect(field("score").distinctCount).toBe(new Set(docs.map((d) => d.score)).size);
+      expect(field("closed").distinctCount).toBe(1);
+      // Arrays and objects have none.
+      expect(field("answers").distinctCount).toBeUndefined();
+      expect(field("meta").distinctCount).toBeUndefined();
+      expect(described.fields.every((f) => f.distinctCountEstimate === undefined)).toBe(true);
+    });
+
+    it("larger collections get pg_stats estimates for indexed fields, labelled as estimates", async () => {
+      const docs = makeQuestions(1200);
+      const slug = await store("questions", docs);
+      await analyze(slug);
+      const row = await collectionRow(slug);
+      const { estimatedDistinctCounts } = await import("./rows");
+      const estimates = await estimatedDistinctCounts(row.id, row.storage, ["owner_user_id", "question_id", "title", "answers"]);
+      expect(estimates.owner_user_id).toBe(17);
+      expect(estimates.question_id).toBe(1200);
+      expect(estimates.answers).toBeUndefined();
+    });
+  });
 });

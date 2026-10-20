@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { sql, type SQL } from "drizzle-orm";
-import { collectionTableName, ident } from "./registry";
+import { collectionTableName, ident, readRegistry } from "./registry";
 
 /**
  * Row operations on a collection's hc_<id> table. Result rows are the
@@ -332,4 +332,40 @@ export async function recordCounts(collectionIds: number[]): Promise<Map<number,
     counts.set(row.id, { count: row.count, lastAt: toDate(row.last_at) });
   }
   return counts;
+}
+
+/**
+ * Exact distinct-value counts of top-level keys over every live record
+ * (JSON equality: 1 and "1" differ; a missing key is not a value).
+ */
+export async function exactDistinctCounts(collectionId: number, keys: string[]): Promise<Record<string, number>> {
+  if (keys.length === 0) return {};
+  const cols = keys.map((k, i) => sql`count(DISTINCT t.data->${k}::text)::int AS ${sql.raw(`"d${i}"`)}`);
+  const result = await db.execute(sql`SELECT ${sql.join(cols, sql`, `)} FROM ${table(collectionId)} t WHERE t.deleted_at IS NULL`);
+  const row = result.rows[0] as Record<string, number>;
+  return Object.fromEntries(keys.map((k, i) => [k, Number(row[`d${i}`])]));
+}
+
+/**
+ * Postgres's estimate of distinct values for top-level keys that have a
+ * projection column, from pg_stats (n_distinct, a fraction of reltuples
+ * when negative). Keys without a column or without statistics yet are
+ * left out.
+ */
+export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[]): Promise<Record<string, number>> {
+  const registry = readRegistry(storage);
+  const columns = new Map(registry.projections.filter((p) => !p.path && keys.includes(p.field)).map((p) => [p.column, p.field]));
+  if (columns.size === 0) return {};
+  const name = collectionTableName(collectionId);
+  const result = await db.execute(sql`
+    SELECT s.attname, s.n_distinct, c.reltuples
+    FROM pg_stats s JOIN pg_class c ON c.relname = s.tablename AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname)
+    WHERE s.schemaname = current_schema() AND s.tablename = ${name} AND s.attname = ANY(${`{${[...columns.keys()].join(",")}}`}::text[])`);
+  const out: Record<string, number> = {};
+  for (const row of result.rows as { attname: string; n_distinct: number; reltuples: number }[]) {
+    const nd = Number(row.n_distinct);
+    const estimate = nd >= 0 ? nd : Math.round(-nd * Number(row.reltuples));
+    if (Number.isFinite(estimate) && estimate > 0) out[columns.get(row.attname)!] = Math.round(estimate);
+  }
+  return out;
 }

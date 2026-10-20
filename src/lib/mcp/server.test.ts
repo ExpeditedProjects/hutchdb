@@ -424,6 +424,8 @@ describe('storage-aware descriptions', () => {
     expect(query).toMatch(/include total/)
     expect(query).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
     expect(descriptionOf('hutch_describe_collection')).toMatch(/projected into indexed columns/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/distinctCount is an exact count/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/distinctCountEstimate instead/)
     expect(descriptionOf('hutch_store_records')).toMatch(/made queryable automatically/)
     expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
     expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')

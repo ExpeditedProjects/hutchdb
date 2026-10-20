@@ -202,7 +202,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_describe_collection",
     {
       title: "Describe Collection",
-      description: "Describe a collection's field names, types, and sample values, plus its storage: which fields (top-level or nested object paths) are projected into indexed columns and which nested arrays of objects have been made queryable (unwound), each with the reason. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.",
+      description: "Describe a collection's field names, types, and sample values, plus its storage: which fields (top-level or nested object paths) are projected into indexed columns and which nested arrays of objects have been made queryable (unwound), each with the reason. Field types, frequency and sample values come from a sample of up to 500 records; distinctCount is an exact count of distinct values over all records (collections up to 20,000 records; scalar fields), and larger collections give distinctCountEstimate instead — Postgres's statistics estimate, for indexed fields only. Example: call before hutch_query_records when you don't know what fields exist or whether to filter vs search.",
       inputSchema: z.object({ slug: z.string().describe(slugDescription) }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },

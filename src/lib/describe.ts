@@ -8,7 +8,10 @@ type FieldInfo = {
   conflict?: boolean;
   frequency: number;
   sampleValues?: unknown[];
+  /** Exact number of distinct values over every live record (collections up to EXACT_DISTINCT_MAX_RECORDS). */
   distinctCount?: number;
+  /** Larger collections, indexed fields only: Postgres's planner estimate (pg_stats), not a count. */
+  distinctCountEstimate?: number;
   min?: unknown;
   max?: unknown;
   avg?: number;
@@ -17,7 +20,10 @@ type FieldInfo = {
   latest?: string;
 };
 
-export async function describeCollection(collectionId: number, totalRecords: number): Promise<FieldInfo[]> {
+/** Collections up to this many records get exact distinct counts; larger ones an estimate for indexed fields. */
+export const EXACT_DISTINCT_MAX_RECORDS = 20_000;
+
+export async function describeCollection(collectionId: number, totalRecords: number, storage?: unknown): Promise<FieldInfo[]> {
   if (totalRecords === 0) return [];
 
   const sampleSize = Math.min(totalRecords, 500);
@@ -94,9 +100,6 @@ export async function describeCollection(collectionId: number, totalRecords: num
       field.conflict = true;
     }
 
-    const uniqueValues = new Set(stat.values.map(v => JSON.stringify(v)));
-    field.distinctCount = uniqueValues.size;
-
     if (stat.numericValues.length > 0) {
       field.min = Math.min(...stat.numericValues);
       field.max = Math.max(...stat.numericValues);
@@ -114,6 +117,19 @@ export async function describeCollection(collectionId: number, totalRecords: num
     }
 
     fields.push(field);
+  }
+
+  // Distinct counts for scalar fields (arrays and objects have none).
+  const scalarKeys = Object.entries(fieldStats)
+    .filter(([, stat]) => ![...stat.types].some((t) => t === "array" || t === "object"))
+    .map(([name]) => name);
+  const { exactDistinctCounts, estimatedDistinctCounts } = await import("./storage/rows");
+  if (totalRecords <= EXACT_DISTINCT_MAX_RECORDS) {
+    const counts = await exactDistinctCounts(collectionId, scalarKeys);
+    for (const field of fields) if (counts[field.name] !== undefined) field.distinctCount = counts[field.name];
+  } else {
+    const counts = await estimatedDistinctCounts(collectionId, storage, scalarKeys);
+    for (const field of fields) if (counts[field.name] !== undefined) field.distinctCountEstimate = counts[field.name];
   }
 
   fields.sort((a, b) => b.frequency - a.frequency || a.name.localeCompare(b.name));

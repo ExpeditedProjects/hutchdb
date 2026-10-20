@@ -525,7 +525,7 @@ export async function describeCollection(slug: string, userId: string) {
   const collection = access.collection;
 
   const recordCount = await tableRows.countRecords(collection.id);
-  const fields = await describeCollectionFields(collection.id, recordCount);
+  const fields = await describeCollectionFields(collection.id, recordCount, collection.storage);
 
   return {
     name: collection.name,
