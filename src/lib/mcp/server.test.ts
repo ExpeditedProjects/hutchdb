@@ -382,6 +382,26 @@ describe('response size budgets', () => {
   })
 })
 
+describe('compact JSON responses', () => {
+  it('serializes read results without indentation', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const payload = { records: [{ id: 1, data: { title: 'a', nested: { x: [1, 2] } } }], total: 1 }
+    vi.mocked(recordService.queryRecords).mockResolvedValue(payload as never)
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'notes' }) as { content: { text: string }[] }
+    expect(result.content[0].text).toBe(JSON.stringify(payload))
+  })
+
+  it('keeps the human summary line above compact JSON on write tools', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.createRecords).mockResolvedValue({ summary: 'Saved 1 record to Notes', count: 1, collection: { slug: 'notes' } } as never)
+    const result = await registeredTools.get('hutch_store_records')!({ collection: 'notes', data: { a: 1 } }) as { content: { text: string }[] }
+    const [human, json] = result.content[0].text.split('\n\n')
+    expect(human).toBe('Saved 1 record to Notes')
+    expect(json).not.toMatch(/\n/)
+    expect(JSON.parse(json)).toEqual(expect.objectContaining({ count: 1, url: 'https://example.test/c/notes' }))
+  })
+})
+
 describe('tool input schemas and descriptions', () => {
   it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')

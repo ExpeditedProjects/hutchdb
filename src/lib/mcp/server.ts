@@ -62,8 +62,13 @@ function errorResponse(text: string): McpToolResponse {
   return { content: [{ type: "text", text }], isError: true };
 }
 
+/**
+ * Tool results are compact JSON: the reader is an agent, and indentation
+ * made responses 2.2x larger (finding 7 of the stress test). Humans read
+ * them through a client or `jq`.
+ */
 function jsonResponse(value: unknown): McpToolResponse {
-  return textResponse(JSON.stringify(value, null, 2));
+  return textResponse(JSON.stringify(value));
 }
 
 /**
@@ -73,7 +78,7 @@ function jsonResponse(value: unknown): McpToolResponse {
 function summarizedWriteResponse(result: object, collectionUrl: (slug: string) => string): McpToolResponse {
   const slug = (result as { collection?: { slug?: string } }).collection?.slug;
   const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
-  const json = JSON.stringify(enriched, null, 2);
+  const json = JSON.stringify(enriched);
   const summary = (result as { summary?: string }).summary;
   return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
@@ -477,7 +482,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await recordService.deleteRecord(slug, userId, record_id);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      const json = JSON.stringify({ deleted: true, record_id, url: collectionUrl(result.slug) }, null, 2);
+      const json = JSON.stringify({ deleted: true, record_id, url: collectionUrl(result.slug) });
       return textResponse(`Record ${record_id} deleted.\n\n${json}`);
     }
   );
