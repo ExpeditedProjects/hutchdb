@@ -104,6 +104,10 @@ async function main() {
       console.error(`rows copied and verified; ${failedBuilds.length} index builds failed; re-run or \`npm run storage:build-indexes\` to retry`);
       process.exitCode = 1;
     }
+    if (report.skipped_builds.length > 0) {
+      console.error(`rows copied and verified; builds for ${report.skipped_builds.join(", ")} were skipped because another builder holds them and are still pending; run \`npm run storage:build-indexes\` once it is done`);
+      process.exitCode = 1;
+    }
   } catch (err) {
     if (err instanceof CutoverError) {
       console.error(`cutover stopped: ${err.message}`);

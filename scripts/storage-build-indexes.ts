@@ -6,8 +6,9 @@
 //
 // Without --collection, every collection with build work. Failed builds are
 // retried right away (their backoff only applies to automatic retries).
-// A collection another builder is working on is skipped. Exits 1 when a
-// build failed.
+// A collection another builder is working on is skipped and reported.
+// Exits 1 when a build failed or a collection was skipped (its work is
+// still pending).
 //
 // Env: HUTCH_DATABASE_URL (or DATABASE_URL); .env.local is read if present.
 // HUTCH_INDEX_BUILD_TIMEOUT_MS bounds each build statement (default 10 min).
@@ -63,7 +64,7 @@ async function main() {
     const outcomes = report.collections.flatMap((c) => c.outcomes);
     const skipped = report.collections.filter((c) => c.skipped).map((c) => c.collectionId);
     console.log(`done: ${outcomes.filter((o) => o.state === "ready").length} built, ${report.failed} failed${skipped.length ? `, skipped (another builder holds them): ${skipped.join(", ")}` : ""}`);
-    if (report.failed > 0) process.exitCode = 1;
+    if (report.failed > 0 || skipped.length > 0) process.exitCode = 1;
   } finally {
     await pool.end();
   }

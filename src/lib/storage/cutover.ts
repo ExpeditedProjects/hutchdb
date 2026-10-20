@@ -75,6 +75,8 @@ export type CutoverReport = {
   inference: InferenceResult[];
   /** Background builds the cutover ran after inference (every collection with due work). */
   builds: BuildResult[];
+  /** Collections whose builds were skipped because another builder held them: still pending; the script exits 1. */
+  skipped_builds: string[];
   dropped: boolean;
 };
 
@@ -313,7 +315,7 @@ function describeBuilds(report: BuildReport, targets: CollectionRow[]): BuildRes
 export async function runCutover(options: CutoverOptions = {}): Promise<CutoverReport> {
   const log = options.log ?? (() => {});
   const dryRun = options.dryRun === true;
-  const report: CutoverReport = { dryRun, recordsTable: "present", copied: [], copy_ms: 0, inference: [], builds: [], dropped: false };
+  const report: CutoverReport = { dryRun, recordsTable: "present", copied: [], copy_ms: 0, inference: [], builds: [], skipped_builds: [], dropped: false };
 
   if (!(await recordsTableExists())) {
     report.recordsTable = "absent";
@@ -355,6 +357,11 @@ export async function runCutover(options: CutoverOptions = {}): Promise<CutoverR
   log("building queued indexes and unwinds");
   const built = await buildPendingIndexes({ retryFailed: true, log });
   report.builds = describeBuilds(built, targets);
+  const slugs = new Map(targets.map((c) => [c.id, c.slug]));
+  report.skipped_builds = built.collections.filter((c) => c.skipped).map((c) => slugs.get(c.collectionId) ?? String(c.collectionId));
+  if (report.skipped_builds.length > 0) {
+    log(`builds skipped (another builder holds them, so they are still pending): ${report.skipped_builds.join(", ")}; run \`npm run storage:build-indexes\` once it is done`);
+  }
   for (const r of report.inference) {
     if (r.unwinds.length === 0) continue;
     const registry = readRegistry((await db.execute(sql`SELECT storage FROM collections WHERE id = ${r.id}`)).rows[0]?.storage);

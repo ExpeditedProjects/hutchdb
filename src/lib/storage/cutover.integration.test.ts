@@ -329,6 +329,31 @@ describe.skipIf(!TEST_DB_URL)("storage cutover against real Postgres", () => {
     expect(page.total).toBe(1);
   });
 
+  it("a collection whose builds another builder holds is reported as skipped, not as done", async () => {
+    const id = await legacyCollection("heldbuild", Array.from({ length: 6 }, (_, i) => ({ data: { name: `n${i}`, n: i } })));
+    const { INDEX_BUILD_LOCK_CLASS } = await import("./builder");
+    const holder = await testPool.connect();
+    const log: string[] = [];
+    let report;
+    try {
+      await holder.query("SELECT pg_advisory_lock($1::int, $2::int)", [INDEX_BUILD_LOCK_CLASS, id]);
+      report = await cutover.runCutover({ log: (l) => log.push(l) });
+    } finally {
+      await holder.query("SELECT pg_advisory_unlock_all()");
+      holder.release();
+    }
+    expect(report.skipped_builds).toEqual(["heldbuild"]);
+    expect(report.builds).toEqual([]);
+    expect(log.some((l) => /builds skipped \(another builder holds them, so they are still pending\): heldbuild/.test(l))).toBe(true);
+    const projections = (await storageOf(id)).projections as { build?: { state: string } }[];
+    expect(projections.length).toBeGreaterThan(0);
+    expect(projections.every((p) => p.build?.state === "pending")).toBe(true);
+    // Once the other builder is done, a re-run builds them and reports nothing skipped.
+    const again = await cutover.runCutover();
+    expect(again.skipped_builds).toEqual([]);
+    expect(((await storageOf(id)).projections as { build?: { state: string } }[]).every((p) => p.build?.state === "ready")).toBe(true);
+  });
+
   it("a unique_key whose only duplicate is soft-deleted gets its index without a warning", async () => {
     const id = await legacyCollection("ukdeleted", [{ data: { k: "x" } }, { data: { k: "x" }, deleted: true }, { data: { k: "y" } }], ["k"]);
     const report = await cutover.runCutover();
