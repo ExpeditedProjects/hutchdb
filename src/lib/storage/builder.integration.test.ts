@@ -63,7 +63,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
   let recordsSvc: RecordsService;
   let collectionsSvc: CollectionsService;
   let builder: Builder;
-  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD", "HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", "HUTCH_INDEX_BUILD_TIMEOUT_MS", "HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS"] as const;
+  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD", "HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", "HUTCH_INDEX_BUILD_TIMEOUT_MS", "HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS", "HUTCH_INDEX_BUILD_WAIT_MS"] as const;
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
   const dialect = new PgDialect();
 
@@ -90,6 +90,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
     delete process.env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES;
     delete process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS;
     delete process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
+    delete process.env.HUTCH_INDEX_BUILD_WAIT_MS;
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
     for (const row of tables.rows as { tablename: string }[]) {

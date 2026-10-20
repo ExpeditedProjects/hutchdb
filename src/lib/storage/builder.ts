@@ -50,6 +50,13 @@ export const INDEX_BUILD_LOCK_CLASS = 0x48430001;
 export const DEFAULT_INDEX_BUILD_TIMEOUT_MS = 10 * 60 * 1000;
 /** How long a build waits for a table lock (CREATE INDEX CONCURRENTLY's own, the trigger DDL's) before it fails and backs off. */
 export const DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS = 5000;
+/**
+ * lock_timeout for CREATE/DROP INDEX CONCURRENTLY. Besides the table lock,
+ * they wait for every transaction with an older snapshot — another
+ * collection's build running at the same time, a slow query — and that wait
+ * counts against lock_timeout too, so it gets longer than the trigger DDL's.
+ */
+export const DEFAULT_INDEX_BUILD_WAIT_MS = 60 * 1000;
 /** First retry delay after a failed build; each further failure multiplies it by 4, up to MAX_RETRY_DELAY_MS. */
 export const RETRY_BASE_MS = 60 * 1000;
 export const MAX_RETRY_DELAY_MS = 60 * 60 * 1000;
@@ -64,6 +71,11 @@ const BACKFILL_LOCKED_WAIT_MS = 100;
 export function buildLockTimeoutMs(env: Record<string, string | undefined> = process.env): number {
   const n = Number(env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS);
   return env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS && Number.isInteger(n) && n > 0 ? n : DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS;
+}
+
+export function buildWaitMs(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.HUTCH_INDEX_BUILD_WAIT_MS);
+  return env.HUTCH_INDEX_BUILD_WAIT_MS && Number.isInteger(n) && n > 0 ? n : DEFAULT_INDEX_BUILD_WAIT_MS;
 }
 
 export function buildTimeoutMs(env: Record<string, string | undefined> = process.env): number {
@@ -210,7 +222,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
     if (item.kind === "projection") {
       index = indexName(table, item.projection.column);
       const ddl = await projectionIndexDdl(db, collectionId, item.projection);
-      await withoutLockTimeout(client, async () => {
+      await withIndexWait(client, async () => {
         await dropInvalidIndex(client, index!);
         await client.query(ddl);
       });
@@ -218,7 +230,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
       mixed = await hasMisfits(ex, collectionId, item.projection);
     } else if (item.kind === "search") {
       index = searchIndexName(table);
-      await withoutLockTimeout(client, async () => {
+      await withIndexWait(client, async () => {
         await dropInvalidIndex(client, index!);
         await ex.execute(searchIndexDdl(collectionId));
       });
@@ -234,7 +246,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
       try {
         // Cleanup gets at least a minute even when the build's limit was tiny.
         await client.query(`SET statement_timeout = ${Math.max(buildTimeoutMs(), CLEANUP_TIMEOUT_MS)}`);
-        await withoutLockTimeout(client, () => dropInvalidIndex(client, index!));
+        await withIndexWait(client, () => dropInvalidIndex(client, index!));
         await client.query(`SET statement_timeout = ${Math.trunc(buildTimeoutMs())}`);
       } catch (dropErr) {
         // The next attempt drops it first.
@@ -324,17 +336,16 @@ async function indexValidity(client: PoolClient, index: string): Promise<boolean
 }
 
 /**
- * Run CREATE/DROP INDEX CONCURRENTLY with no lock_timeout, bounded by the
- * build's statement_timeout instead. Both wait for every transaction with an
- * older snapshot — including another collection's concurrent build and any
- * slow query — and that wait is subject to lock_timeout; with the short
- * builder lock_timeout, two collections building at once failed each other.
- * Waiting is harmless here: the SHARE UPDATE EXCLUSIVE lock they queue for
- * conflicts with no read or write, so nothing queues behind them. The short
- * lock_timeout still applies to the unwind trigger DDL, which does block writes.
+ * Run CREATE/DROP INDEX CONCURRENTLY under the longer buildWaitMs()
+ * lock_timeout (see DEFAULT_INDEX_BUILD_WAIT_MS): with the short builder
+ * lock_timeout, two collections building at once failed each other while
+ * each waited for the other's snapshot. Waiting is cheap: the SHARE UPDATE
+ * EXCLUSIVE lock they queue for conflicts with no read or write, so nothing
+ * queues behind them. The trigger DDL of an unwind, which does block
+ * writes, keeps the short lock_timeout.
  */
-async function withoutLockTimeout<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
-  await client.query("SET lock_timeout = 0");
+async function withIndexWait<T>(client: PoolClient, fn: () => Promise<T>): Promise<T> {
+  await client.query(`SET lock_timeout = ${Math.trunc(buildWaitMs())}`);
   try {
     return await fn();
   } finally {

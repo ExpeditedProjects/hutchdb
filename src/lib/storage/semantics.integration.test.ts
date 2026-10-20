@@ -556,8 +556,8 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
       const slug = await store("locked", [{ seed: 1 }]);
       const id = (await collectionRow(slug)).id;
       const blocker = await testPool.connect();
-      const saved = process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
-      process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = "500";
+      const saved = process.env.HUTCH_INDEX_BUILD_WAIT_MS;
+      process.env.HUTCH_INDEX_BUILD_WAIT_MS = "500";
       let elapsed = 0;
       try {
         // SHARE UPDATE EXCLUSIVE conflicts with CREATE INDEX CONCURRENTLY, not with inserts.
@@ -573,10 +573,10 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
       } finally {
         await blocker.query("ROLLBACK");
         blocker.release();
-        if (saved === undefined) delete process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
-        else process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = saved;
+        if (saved === undefined) delete process.env.HUTCH_INDEX_BUILD_WAIT_MS;
+        else process.env.HUTCH_INDEX_BUILD_WAIT_MS = saved;
       }
-      // lock_timeout, not the build's statement timeout, ended the wait.
+      // The index wait (HUTCH_INDEX_BUILD_WAIT_MS), not the build's statement timeout, ended the wait.
       expect(elapsed).toBeLessThan(4500);
       const failed = (await registry(slug)).projections.find((p) => p.field === "n")!;
       expect(failed.build).toMatchObject({ state: "failed", attempts: 1, error: "the build could not get a lock on the collection's table in time" });
