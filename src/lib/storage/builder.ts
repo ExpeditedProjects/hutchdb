@@ -36,7 +36,10 @@ import {
  * One builder per collection at a time: each takes a session-level
  * pg_try_advisory_lock on (INDEX_BUILD_LOCK_CLASS, collection id) and skips
  * the collection when another holds it, so "building" seen while holding
- * the lock means a builder died mid-build and the work is picked up again.
+ * the lock means a builder died mid-build: that attempt (counted when the
+ * entry moved to building) is recorded as failed and retried after the
+ * backoff. One builder loop per process (build-queue.ts) runs the builds
+ * requests queue.
  * A failed build is recorded with a generic reason and retried after a
  * growing backoff; a CREATE INDEX CONCURRENTLY that fails leaves an INVALID
  * index behind, which is dropped before the entry is marked failed (and
@@ -96,6 +99,15 @@ export type BuildOptions = {
   collectionId?: number;
   /** Start no new build after this long (one in flight finishes, bounded by its statement timeout). */
   budgetMs?: number;
+  /**
+   * A hard limit on the whole run, for builds in after() that the platform
+   * stops at its function duration: no build starts after it, and each
+   * build statement's timeout is the smaller of HUTCH_INDEX_BUILD_TIMEOUT_MS
+   * and what is left of it. A build it cuts off fails with a reason that
+   * says to run `npm run storage:build-indexes`. The CLI and the cutover
+   * pass none and get the full build timeout.
+   */
+  platformBudgetMs?: number;
   /** Retry failed builds now, ignoring their backoff (CLI, cutover). */
   retryFailed?: boolean;
   log?: (line: string) => void;
@@ -128,12 +140,14 @@ function clientExecutor(client: PoolClient): Executor {
  * throws only when the builder itself can't run (no connection).
  */
 export async function buildPendingIndexes(options: BuildOptions = {}): Promise<BuildReport> {
-  const deadline = Date.now() + (options.budgetMs ?? Number.POSITIVE_INFINITY);
+  const started = Date.now();
+  const hardDeadline = options.platformBudgetMs !== undefined ? started + options.platformBudgetMs : undefined;
+  const deadline = Math.min(started + (options.budgetMs ?? Number.POSITIVE_INFINITY), hardDeadline ?? Number.POSITIVE_INFINITY);
   const ids = options.collectionId !== undefined ? [options.collectionId] : await collectionsWithDueBuilds(options.retryFailed === true);
   const report: BuildReport = { collections: [], failed: 0 };
   for (const id of ids) {
-    if (Date.now() >= deadline) break;
-    const result = await buildCollection(id, deadline, options);
+    if (!timeToStart(deadline, hardDeadline)) break;
+    const result = await buildCollection(id, deadline, hardDeadline, options);
     report.collections.push(result);
     report.failed += result.outcomes.filter((o) => o.state === "failed").length;
   }
@@ -167,28 +181,42 @@ function dueItems(registry: StorageRegistry, retryFailed: boolean): Item[] {
   return items;
 }
 
-async function buildCollection(collectionId: number, deadline: number, options: BuildOptions): Promise<CollectionBuildReport> {
+async function buildCollection(collectionId: number, deadline: number, hardDeadline: number | undefined, options: BuildOptions): Promise<CollectionBuildReport> {
   const report: CollectionBuildReport = { collectionId, outcomes: [] };
   const log = options.log ?? (() => {});
   const client = await pool.connect();
+  // Whether this session holds the lock or changed its settings: then the
+  // connection is destroyed on release instead of going back to the pool.
+  let dirty = false;
   try {
+    // The lock first, before any other work on the connection: a
+    // collection another builder holds costs one round trip.
     const lock = await client.query("SELECT pg_try_advisory_lock($1::int, $2::int) AS ok", [INDEX_BUILD_LOCK_CLASS, collectionId]);
     if (lock.rows[0]?.ok !== true) {
       report.skipped = "locked";
       return report;
     }
+    dirty = true;
     // Session settings for this builder only: the connection is destroyed
     // on release, so they never reach a pooled request connection.
-    await client.query(`SET statement_timeout = ${Math.trunc(buildTimeoutMs())}`);
+    await client.query(`SET statement_timeout = ${statementLimit(hardDeadline).ms}`);
     await client.query(`SET lock_timeout = ${Math.trunc(buildLockTimeoutMs())}`);
-    const registry = await loadRegistry(collectionId);
+    let registry = await loadRegistry(collectionId);
     if (!registry) return report;
+    // Holding the lock, no one else is building: an entry left "building"
+    // is a build that was interrupted (a restart, or the platform stopping
+    // background work). It counts as a failed attempt and backs off.
+    if (buildEntries(registry).some((e) => e.build?.state === "building")) {
+      const { next, failed } = await failInterruptedBuilds(collectionId);
+      registry = next;
+      for (const e of failed) log(`  ${collectionTableName(collectionId)}: ${e.kind === "search" ? "search index" : `${e.kind} ${e.key}`} was left building by an interrupted build; failed, retry after ${e.retryAfter}`);
+    }
     const ex = clientExecutor(client);
     let analyze = false;
     for (const item of dueItems(registry, options.retryFailed === true)) {
-      if (Date.now() >= deadline) break;
+      if (!timeToStart(deadline, hardDeadline)) break;
       const started = Date.now();
-      const outcome = await buildItem(ex, client, collectionId, item);
+      const outcome = await buildItem(ex, client, collectionId, item, hardDeadline);
       const ms = Date.now() - started;
       report.outcomes.push({ kind: item.kind, key: item.key, ms, ...outcome });
       log(`  ${collectionTableName(collectionId)}: ${item.kind === "search" ? "search index" : `${item.kind} ${item.key}`} ${outcome.state} in ${ms} ms${outcome.error ? ` (${outcome.error})` : ""}`);
@@ -198,6 +226,7 @@ async function buildCollection(collectionId: number, deadline: number, options: 
       // Statistics for the new expressions, so the planner can estimate
       // (and choose) the new indexes before autovacuum gets to the table.
       try {
+        await client.query(`SET statement_timeout = ${statementLimit(hardDeadline).ms}`);
         await client.query(`ANALYZE ${dialect.sqlToQuery(ident(collectionTableName(collectionId))).sql}`);
       } catch (err) {
         console.error(`[storage] ANALYZE after index builds failed for collection ${collectionId}`, err);
@@ -206,17 +235,72 @@ async function buildCollection(collectionId: number, deadline: number, options: 
     return report;
   } finally {
     // Destroying the connection also releases the advisory lock and drops
-    // the session settings.
-    client.release(true);
+    // the session settings; a session that never got the lock changed
+    // nothing and goes back to the pool.
+    client.release(dirty);
   }
 }
 
-async function buildItem(ex: Executor, client: PoolClient, collectionId: number, item: Item): Promise<{ state: "ready" | "failed"; error?: string }> {
-  const startedBuilding = await setBuild(collectionId, item, (prev) => ({ state: "building", at: new Date().toISOString(), ...(prev.attempts ? { attempts: prev.attempts } : {}) }));
+/** Don't start a build with less than this left of a platform budget: it could only fail. */
+const MIN_BUDGET_SLICE_MS = 1000;
+
+function timeToStart(deadline: number, hardDeadline: number | undefined): boolean {
+  const now = Date.now();
+  return now < deadline && (hardDeadline === undefined || hardDeadline - now >= MIN_BUDGET_SLICE_MS);
+}
+
+/**
+ * The statement timeout for the next build statement: the build timeout,
+ * or what is left of the platform budget when that is less (`budget`).
+ */
+function statementLimit(hardDeadline: number | undefined): { ms: number; budget: boolean } {
+  const full = Math.trunc(buildTimeoutMs());
+  if (hardDeadline === undefined) return { ms: full, budget: false };
+  const left = Math.max(1, Math.floor(hardDeadline - Date.now()));
+  return left < full ? { ms: left, budget: true } : { ms: full, budget: false };
+}
+
+/** Reason recorded for an entry a builder found left "building" (see failInterruptedBuilds). */
+export const INTERRUPTED_REASON = "the previous build was interrupted before it finished (a restart, or the platform stopping background work); if this repeats, run `npm run storage:build-indexes`";
+
+/**
+ * Turn every "building" entry into a failed attempt with backoff: called
+ * while holding the collection's lock, when no builder can be at work on
+ * it. The attempt was already counted when the entry moved to building.
+ */
+async function failInterruptedBuilds(collectionId: number): Promise<{ next: StorageRegistry; failed: { kind: string; key: string; retryAfter: string }[] }> {
+  const now = Date.now();
+  const at = new Date(now).toISOString();
+  const fail = <E extends { build?: IndexBuild }>(entry: E): E => {
+    if (entry.build?.state !== "building") return entry;
+    const attempts = entry.build.attempts ?? 1;
+    return { ...entry, build: { state: "failed", at, attempts, error: INTERRUPTED_REASON, retry_after: new Date(now + retryDelayMs(attempts)).toISOString() } };
+  };
+  let failed: { kind: string; key: string; retryAfter: string }[] = [];
+  const next = await updateRegistry(collectionId, async (current) => {
+    failed = buildEntries(current).filter((e) => e.build?.state === "building").map((e) => ({ kind: e.kind, key: e.key, retryAfter: new Date(now + retryDelayMs(e.build!.attempts ?? 1)).toISOString() }));
+    if (failed.length === 0) return null;
+    return {
+      ...current,
+      projections: current.projections.map(fail),
+      unwinds: current.unwinds.map(fail),
+      ...(current.search_index ? { search_index: fail(current.search_index) } : {}),
+    };
+  });
+  return { next, failed };
+}
+
+async function buildItem(ex: Executor, client: PoolClient, collectionId: number, item: Item, hardDeadline: number | undefined): Promise<{ state: "ready" | "failed"; error?: string }> {
+  // The attempt counts as soon as the entry is building: a build the
+  // platform kills mid-way never reaches the failure path below, and the
+  // next builder fails it (failInterruptedBuilds) with this count.
+  const startedBuilding = await setBuild(collectionId, item, (prev) => ({ state: "building", at: new Date().toISOString(), attempts: (prev.attempts ?? 0) + 1 }));
   if (!startedBuilding) return { state: "failed", error: "the entry is gone from the registry" };
   const table = collectionTableName(collectionId);
   let index: string | null = null;
+  const limits: StatementLimits = { hardDeadline, budgetBound: false };
   try {
+    await applyStatementLimit(client, limits);
     let mixed = false;
     if (item.kind === "projection") {
       index = indexName(table, item.projection.column);
@@ -235,7 +319,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
       });
       await assertValidIndex(client, index);
     } else {
-      await buildUnwind(ex, client, collectionId, item.unwind);
+      await buildUnwind(ex, client, collectionId, item.unwind, limits);
     }
     await setBuild(collectionId, item, () => ({ state: "ready", at: new Date().toISOString() }), mixed);
     return { state: "ready" };
@@ -246,15 +330,15 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
         // Cleanup gets at least a minute even when the build's limit was tiny.
         await client.query(`SET statement_timeout = ${Math.max(buildTimeoutMs(), CLEANUP_TIMEOUT_MS)}`);
         await withIndexWait(client, () => dropInvalidIndex(client, index!));
-        await client.query(`SET statement_timeout = ${Math.trunc(buildTimeoutMs())}`);
       } catch (dropErr) {
         // The next attempt drops it first.
         console.error(`[storage] dropping invalid index ${index} failed`, dropErr);
       }
     }
-    const error = genericReason(err);
+    const error = genericReason(err, limits.budgetBound);
     await setBuild(collectionId, item, (prev) => {
-      const attempts = (prev.attempts ?? 0) + 1;
+      // Counted when the entry moved to building.
+      const attempts = prev.state === "building" ? (prev.attempts ?? 1) : (prev.attempts ?? 0) + 1;
       const at = Date.now();
       return { state: "failed", at: new Date(at).toISOString(), attempts, error, retry_after: new Date(at + retryDelayMs(attempts)).toISOString() };
     });
@@ -267,7 +351,7 @@ async function buildItem(ex: Executor, client: PoolClient, collectionId: number,
  * batches up to the highest id that existed once the triggers did: every
  * later row was inserted by a statement that fired the insert trigger.
  */
-async function buildUnwind(ex: Executor, client: PoolClient, collectionId: number, unwind: Unwind): Promise<void> {
+async function buildUnwind(ex: Executor, client: PoolClient, collectionId: number, unwind: Unwind, limits: StatementLimits): Promise<void> {
   await client.query("BEGIN");
   try {
     await createUnwindTable(ex, collectionId, unwind);
@@ -280,12 +364,33 @@ async function buildUnwind(ex: Executor, client: PoolClient, collectionId: numbe
   const [{ max }] = (await ex.execute(sql`SELECT coalesce(max(id), 0)::int AS max FROM ${table}`)).rows as { max: number }[];
   for (let lo = 0; lo < max; lo += BACKFILL_BATCH) {
     const hi = Math.min(lo + BACKFILL_BATCH, max);
+    // Each batch gets what is left of the platform budget, if less than the build timeout.
+    await applyStatementLimit(client, limits);
     let skipped = await backfillUnwindRows(ex, collectionId, unwind, lo, hi, null);
     for (let round = 0; skipped.length > 0; round++) {
       if (round >= BACKFILL_LOCKED_ROUNDS) throw new BackfillLockedError();
       await new Promise((resolve) => setTimeout(resolve, BACKFILL_LOCKED_WAIT_MS));
       skipped = await backfillUnwindRows(ex, collectionId, unwind, lo, hi, skipped);
     }
+  }
+}
+
+type StatementLimits = { hardDeadline: number | undefined; budgetBound: boolean };
+
+/** SET statement_timeout for the next statement(s); throws BudgetSpentError once the platform budget is gone. */
+async function applyStatementLimit(client: PoolClient, limits: StatementLimits): Promise<void> {
+  if (limits.hardDeadline !== undefined && Date.now() >= limits.hardDeadline) {
+    limits.budgetBound = true;
+    throw new BudgetSpentError();
+  }
+  const limit = statementLimit(limits.hardDeadline);
+  limits.budgetBound = limit.budget;
+  await client.query(`SET statement_timeout = ${limit.ms}`);
+}
+
+class BudgetSpentError extends Error {
+  constructor() {
+    super("the platform budget for builds after a request ran out");
   }
 }
 
@@ -364,8 +469,11 @@ async function assertValidIndex(client: PoolClient, index: string): Promise<void
 }
 
 /** What describe shows for a failed build: never driver or SQL text. */
-function genericReason(err: unknown): string {
+function genericReason(err: unknown, budgetBound = false): string {
   if (err instanceof BackfillLockedError) return "writes kept some records locked through every backfill retry";
+  if (err instanceof BudgetSpentError || (budgetBound && findPgError(err)?.code === "57014")) {
+    return "the build needed longer than background builds after a request may run (HUTCH_AFTER_BUILD_BUDGET_MS); run `npm run storage:build-indexes` to build it without that limit";
+  }
   switch (findPgError(err)?.code) {
     case "57014": return `the build ran past its ${formatTimeout(buildTimeoutMs())} limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)`;
     case "55P03": return "the build could not get a lock on the collection's table in time";

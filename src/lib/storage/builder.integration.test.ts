@@ -63,7 +63,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
   let recordsSvc: RecordsService;
   let collectionsSvc: CollectionsService;
   let builder: Builder;
-  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD", "HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", "HUTCH_INDEX_BUILD_TIMEOUT_MS", "HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS", "HUTCH_INDEX_BUILD_WAIT_MS"] as const;
+  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD", "HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", "HUTCH_INDEX_BUILD_TIMEOUT_MS", "HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS", "HUTCH_INDEX_BUILD_WAIT_MS", "HUTCH_AFTER_BUILD_BUDGET_MS", "VERCEL"] as const;
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
   const dialect = new PgDialect();
 
@@ -91,6 +91,8 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
     delete process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS;
     delete process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
     delete process.env.HUTCH_INDEX_BUILD_WAIT_MS;
+    delete process.env.HUTCH_AFTER_BUILD_BUDGET_MS;
+    delete process.env.VERCEL;
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);
     for (const row of tables.rows as { tablename: string }[]) {
@@ -318,6 +320,55 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       expect((await registry(slug)).projections.every((p) => p.build?.state === "ready")).toBe(true);
     });
 
+    it("a skipped collection's connection goes back to the pool instead of being destroyed", async () => {
+      const slug = await store("pooled", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      const holder = await testPool.connect();
+      try {
+        await holder.query("SELECT pg_advisory_lock($1::int, $2::int)", [builder.INDEX_BUILD_LOCK_CLASS, id]);
+        await appPool!.query("SELECT 1");
+        const before = appPool!.totalCount;
+        expect(before).toBeGreaterThan(0);
+        expect((await builder.buildPendingIndexes({ collectionId: id })).collections[0].skipped).toBe("locked");
+        expect(appPool!.totalCount).toBe(before);
+      } finally {
+        await holder.query("SELECT pg_advisory_unlock_all()");
+        holder.release();
+      }
+    });
+
+    it("concurrent request drains never run two builders at once in one process, and every collection gets built", async () => {
+      const slugs = [await store("drain-a", makeDocs(0, 150)), await store("drain-b", makeDocs(0, 150)), await store("drain-c", makeDocs(0, 150))];
+      const ids = await Promise.all(slugs.map(async (s) => (await collectionRow(s)).id));
+      const { withIndexBuildQueue, queueIndexBuild } = await import("./build-queue");
+      // How many sessions hold a builder lock at once, sampled while the drains run.
+      let maxHolders = 0;
+      let polling = true;
+      const poller = (async () => {
+        while (polling) {
+          const r = await testDb.execute(sql`SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND granted AND classid::bigint = ${builder.INDEX_BUILD_LOCK_CLASS} AND objsubid = 2`);
+          maxHolders = Math.max(maxHolders, (r.rows[0] as { n: number }).n);
+          await new Promise((res) => setTimeout(res, 5));
+        }
+      })();
+      const drains = ids.map((id) => withIndexBuildQueue((drain) => {
+        queueIndexBuild(id);
+        return drain;
+      }));
+      // All three requests finish and run their after() drains at once.
+      await Promise.all(drains.map((d) => d()));
+      // A drain that found the builder busy returned before its collection was built: wait for the builder to finish them all.
+      for (let i = 0; i < 600; i++) {
+        const regs = await Promise.all(slugs.map(registry));
+        if (regs.every((r) => r.projections.every((p) => p.build?.state === "ready"))) break;
+        await new Promise((res) => setTimeout(res, 50));
+      }
+      polling = false;
+      await poller;
+      for (const s of slugs) expect((await registry(s)).projections.every((p) => p.build?.state === "ready")).toBe(true);
+      expect(maxHolders).toBe(1);
+    }, 30_000);
+
     it("concurrent builders build each index once", async () => {
       const slug = await storeMany("racing", makeDocs(0, 2000));
       const id = (await collectionRow(slug)).id;
@@ -467,14 +518,96 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       // Not stale yet for a request (a builder might still be at work)...
       const row = rowRef(await collectionRow(slug));
       expect(withIndexBuildQueue(() => queueDueIndexBuild(row))).toBe(false);
-      // ...but a builder that gets the lock knows no one else is building.
-      const report = await builder.buildPendingIndexes();
+      // ...but a builder that gets the lock knows no one else is building:
+      // the interrupted attempt counts as failed and backs off.
+      const takeover = await builder.buildPendingIndexes();
+      expect(takeover.collections.map((c) => c.outcomes)).toEqual([[]]);
+      for (const p of (await registry(slug)).projections) {
+        expect(p.build).toMatchObject({ state: "failed", attempts: 1, error: builder.INTERRUPTED_REASON });
+        expect(Date.parse(p.build!.retry_after!) - Date.parse(p.build!.at)).toBe(builder.RETRY_BASE_MS);
+      }
+      // Within the backoff an automatic build leaves them alone; an explicit retry builds both.
+      expect((await builder.buildPendingIndexes()).collections).toEqual([]);
+      const report = await builder.buildPendingIndexes({ retryFailed: true });
       expect(report.failed).toBe(0);
       for (const p of [done, undone]) {
         expect((await registry(slug)).projections.find((x) => x.column === p.column)!.build!.state).toBe("ready");
         expect(await indexState(`hc_${id}_${p.column}_idx`)).toBe("valid");
       }
     });
+  });
+
+  describe("interrupted builds back off", () => {
+    it("the attempt is counted when an entry moves to building, so a build killed mid-way keeps its count, and the takeover backs off longer each time", async () => {
+      const slug = await store("killed", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      // A builder killed after marking the entry building (attempt 2, after one earlier failure).
+      const at = new Date(Date.now() - 1000).toISOString();
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{projections}', (SELECT jsonb_agg(jsonb_set(p, '{build}', jsonb_build_object('state', 'building', 'at', ${at}::text, 'attempts', 2))) FROM jsonb_array_elements(storage->'projections') p)) WHERE id = ${id}`);
+      await builder.buildPendingIndexes({ collectionId: id });
+      for (const p of (await registry(slug)).projections) {
+        expect(p.build).toMatchObject({ state: "failed", attempts: 2, error: builder.INTERRUPTED_REASON });
+        expect(Date.parse(p.build!.retry_after!) - Date.parse(p.build!.at)).toBe(4 * builder.RETRY_BASE_MS);
+      }
+      // A build that starts records its attempt before it runs; success clears it.
+      process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS = "1";
+      await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
+      expect((await registry(slug)).projections[0].build).toMatchObject({ state: "failed", attempts: 3 });
+      delete process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS;
+      await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
+      for (const p of (await registry(slug)).projections) expect(p.build).toEqual({ state: "ready", at: expect.any(String) });
+    });
+
+    it("a request queues a 'building' entry once it is older than staleBuildingMs", async () => {
+      const slug = await store("stale", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      const at = new Date(Date.now() - builder.staleBuildingMs() - 1000).toISOString();
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{projections}', (SELECT jsonb_agg(jsonb_set(p, '{build}', jsonb_build_object('state', 'building', 'at', ${at}::text, 'attempts', 1))) FROM jsonb_array_elements(storage->'projections') p)) WHERE id = ${id}`);
+      const { queueDueIndexBuild, withIndexBuildQueue } = await import("./build-queue");
+      const row = rowRef(await collectionRow(slug));
+      expect(withIndexBuildQueue(() => queueDueIndexBuild(row))).toBe(true);
+    });
+  });
+
+  describe("after() build budget", () => {
+    it("caps each build statement at what is left of the platform budget, fails it with a reason that points at the CLI, and starts nothing more", async () => {
+      const slug = await store("budget", makeDocs(0, 150));
+      const id = (await collectionRow(slug)).id;
+      process.env.HUTCH_AFTER_BUILD_BUDGET_MS = "1500";
+      // An older open snapshot makes CREATE INDEX CONCURRENTLY wait (up to
+      // HUTCH_INDEX_BUILD_WAIT_MS, 60 s, under a 10 min build timeout): only
+      // the budget can stop it this soon.
+      const blocker = await testPool.connect();
+      const started = Date.now();
+      try {
+        await blocker.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+        await blocker.query("SELECT 1");
+        const { withIndexBuildQueue, queueIndexBuild } = await import("./build-queue");
+        await withIndexBuildQueue((drain) => {
+          queueIndexBuild(id);
+          return drain;
+        })();
+      } finally {
+        await blocker.query("ROLLBACK");
+        blocker.release();
+      }
+      const elapsed = Date.now() - started;
+      expect(elapsed).toBeLessThan(5000);
+      const builds = (await registry(slug)).projections.map((p) => p.build!);
+      const failed = builds.filter((b) => b.state === "failed");
+      expect(failed.length).toBeGreaterThanOrEqual(1);
+      for (const b of failed) {
+        expect(b.error).toMatch(/HUTCH_AFTER_BUILD_BUDGET_MS/);
+        expect(b.error).toMatch(/npm run storage:build-indexes/);
+        expect(b).toMatchObject({ attempts: 1, retry_after: expect.any(String) });
+      }
+      // Once the budget is spent nothing else starts: the rest stay pending.
+      expect(builds.filter((b) => b.state === "pending").length).toBe(builds.length - failed.length);
+      expect(await testDb.execute(sql`SELECT 1 FROM pg_index WHERE indrelid = to_regclass(${`hc_${id}`}) AND NOT indisvalid`).then((r) => r.rows)).toEqual([]);
+      // The CLI path (no platform budget) builds them all.
+      const report = await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
+      expect(report.failed).toBe(0);
+    }, 20_000);
   });
 
   describe("requests queue due builds", () => {
