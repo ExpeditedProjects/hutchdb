@@ -173,6 +173,19 @@ describe.skipIf(!TEST_DB_URL)("describe and stats, real Postgres", () => {
       expect(Math.abs(half.estimated_count! - 3000)).toBeLessThan(600);
     });
 
+    it("fieldFillRates with a sample reads about that many records, not the whole table", async () => {
+      const { id } = await seed("big_direct", docs(6000));
+      const { fieldFillRates } = await import("@/lib/storage/rows");
+      const fill = await fieldFillRates(id, 50, { rows: 200, liveRows: 6000 });
+      expect(fill.sampledRows).toBeGreaterThan(0);
+      expect(fill.sampledRows).toBeLessThanOrEqual(200);
+      const count = (key: string) => fill.fields.find((f) => f.key === key)!.count;
+      // Every record has name; about half have half: counts are over the sample, not the 6000 records.
+      expect(count("name")).toBe(fill.sampledRows);
+      expect(count("half")).toBeGreaterThan(fill.sampledRows! * 0.3);
+      expect(count("half")).toBeLessThan(fill.sampledRows! * 0.7);
+    });
+
     it("collection_stats counts every record exactly when the collection fits a scan", async () => {
       const { slug } = await seed("big_exact", docs(6000));
       const stats = await statsOf(slug);
