@@ -327,6 +327,16 @@ describe('tool input schemas and descriptions', () => {
       expect(filter.description, `expected filter description to mention ${op}`).toContain(op)
     }
   })
+
+  it('describes top-level $or / $and and what they do with array elements', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const filter = (registeredConfigs.get('hutch_query_records')!.inputSchema as {
+      shape: { filter: { description?: string } }
+    }).shape.filter
+    expect(filter.description).toContain('{"$or": [{"status": "open"}, {"score": {"$gt": 10}}]}')
+    expect(filter.description).toMatch(/does not restrict which elements are aggregated/)
+    expect(filter.description).toMatch(/Any other top-level key starting with \$ is an error/)
+  })
 })
 
 describe('query, store and import descriptions', () => {

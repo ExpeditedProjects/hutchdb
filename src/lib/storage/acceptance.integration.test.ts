@@ -79,6 +79,83 @@ function makeQuestions(n: number): Question[] {
   }));
 }
 
+type Vote = { bill_id: string; vote: string; points: Record<string, number>; possible: Record<string, number> };
+type Legislator = { bioguide_id: string; name: string; party: string; state: string; chamber: string; votes: Vote[] };
+
+const CATEGORIES = ["veterans", "small_business", "energy"];
+
+/** Legislators with votes; each vote scores in one or two categories, some in none. */
+function makeLegislators(n: number): Legislator[] {
+  return Array.from({ length: n }, (_, i) => ({
+    bioguide_id: `B${String(i).padStart(5, "0")}`,
+    name: `Member ${String.fromCharCode(65 + (i % 26))}${i}`,
+    party: ["D", "R", "I"][i % 3],
+    state: ["CA", "TX", "NY", "OH"][i % 4],
+    chamber: i % 5 === 0 ? "senate" : "house",
+    votes: Array.from({ length: 2 + (i % 7) }, (_, k) => {
+      const points: Record<string, number> = {};
+      const possible: Record<string, number> = {};
+      const c1 = CATEGORIES[(i + k) % 3];
+      if ((i + k) % 4 !== 0) {
+        points[c1] = (i * k) % 3;
+        possible[c1] = 2;
+      }
+      if (k % 3 === 1) {
+        const c2 = CATEGORIES[(i + k + 1) % 3];
+        points[c2] = (i + k) % 2;
+        possible[c2] = 1;
+      }
+      return { bill_id: `HR${100 + ((i * 3 + k) % 40)}`, vote: k % 2 === 0 ? "yea" : "nay", points, possible };
+    }),
+  }));
+}
+
+/** Mongo-style oracle for the filters these tests use (top-level and one level into an array of objects). */
+function valueAt(doc: unknown, path: string): unknown {
+  let cur: unknown = doc;
+  for (const k of path.split(".")) {
+    if (cur === null || typeof cur !== "object" || Array.isArray(cur)) return undefined;
+    cur = (cur as Record<string, unknown>)[k];
+  }
+  return cur;
+}
+function fieldMatches(v: unknown, spec: unknown): boolean {
+  const ops = spec !== null && typeof spec === "object" && !Array.isArray(spec) ? (spec as Record<string, unknown>) : { $eq: spec };
+  return Object.entries(ops).every(([op, x]) => {
+    switch (op) {
+      case "$eq": return v === x;
+      case "$gt": return typeof v === typeof x && (v as number) > (x as number);
+      case "$lte": return typeof v === typeof x && (v as number) <= (x as number);
+      case "$in": return (x as unknown[]).includes(v);
+      case "$exists": return (v !== undefined) === x;
+      default: throw new Error(`oracle: ${op}`);
+    }
+  });
+}
+/** Conditions on one array of objects in the same filter object must hold for the same element. */
+function oracle(doc: Record<string, unknown>, filter: Record<string, unknown>): boolean {
+  const perArray = new Map<string, [string, unknown][]>();
+  const ok = Object.entries(filter).every(([key, spec]) => {
+    if (key === "$or") return (spec as Record<string, unknown>[]).some((b) => oracle(doc, b));
+    if (key === "$and") return (spec as Record<string, unknown>[]).every((b) => oracle(doc, b));
+    const [head, ...rest] = key.split(".");
+    if (Array.isArray(doc[head]) && rest.length > 0) {
+      perArray.set(head, [...(perArray.get(head) ?? []), [rest.join("."), spec]]);
+      return true;
+    }
+    return fieldMatches(valueAt(doc, key), spec);
+  });
+  // Positive conditions hold for one element together; {$exists: false} means no element has the path.
+  const negative = (spec: unknown) => JSON.stringify(spec) === '{"$exists":false}';
+  return ok && [...perArray].every(([head, conds]) => {
+    const els = doc[head] as unknown[];
+    const pos = conds.filter(([, spec]) => !negative(spec));
+    const neg = conds.filter(([, spec]) => negative(spec));
+    return neg.every(([path]) => els.every((el) => valueAt(el, path) === undefined))
+      && (pos.length === 0 || els.some((el) => pos.every(([path, spec]) => fieldMatches(valueAt(el, path), spec))));
+  });
+}
+
 describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () => {
   let testPool: Pool;
   let testDb: NodePgDatabase<typeof schema>;
@@ -256,6 +333,74 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       expect(strip(a)).toEqual(strip(b));
       const rec = a.results!.find((x) => (x.record as { data: Question }).data.title === "Question 5")!.record as { data: Record<string, unknown> };
       expect(rec.data).toEqual({ title: "Question 5", answers: [{ answer_id: 54 }] });
+    });
+  });
+
+  // ── 2. $or / $and ─────────────────────────────────────────────────────────
+
+  describe("$or / $and", () => {
+    const docs = makeQuestions(300);
+    const FILTERS: Record<string, unknown>[] = [
+      { $or: [{ owner_user_id: 4 }, { owner_user_id: 9 }] },
+      { $or: [{ closed: true }, { score: { $gt: 15 } }] },
+      { $or: [{ "answers.score": { $gt: 8 } }, { owner_user_id: 3 }] },
+      { owner_user_id: { $lte: 8 }, $or: [{ "answers.is_accepted": true, "answers.score": { $gt: 5 } }, { closed: true }] },
+      { $and: [{ $or: [{ owner_user_id: 1 }, { owner_user_id: 2 }] }, { $or: [{ closed: true }, { "meta.site": "so" }] }] },
+      { $or: [{ "answers.owner.user_id": 3 }, { "answers.answer_id": { $in: [11, 12] } }] },
+      { $or: [{ "answers.owner": { $exists: false }, closed: true }, { question_id: 1001 }] },
+    ];
+
+    it("matches the Mongo answer, projected/unwound or not", async () => {
+      const { projected, plain } = await twin(docs);
+      for (const filter of FILTERS) {
+        const expected = docs.filter((d) => oracle(d as unknown as Record<string, unknown>, filter)).map((d) => d.question_id).sort((a, b) => a - b);
+        expect(expected.length, JSON.stringify(filter)).toBeGreaterThan(0);
+        for (const slug of [projected, plain]) {
+          const r = await query(slug, { filter, fields: ["question_id"], limit: 1000 });
+          expect(r.records!.map((x) => (x.data as Question).question_id).sort((a, b) => a - b), `${slug} ${JSON.stringify(filter)}`).toEqual(expected);
+          expect(r.total).toBe(expected.length);
+        }
+      }
+    });
+
+    it("an indexed $or of equalities can be served by the index", async () => {
+      const many = makeQuestions(3000);
+      const slug = await store("many", many);
+      await analyze(slug);
+      const r = await query(slug, { filter: { $or: [{ owner_user_id: 4 }, { question_id: 1003 }] }, limit: 5 });
+      expect(r.total).toBe(many.filter((d) => d.owner_user_id === 4 || d.question_id === 1003).length);
+      expect(r.indexed).toBe(true);
+    });
+
+    it("rejects unsupported top-level operators instead of matching nothing", async () => {
+      const { projected } = await twin(docs);
+      await expect(query(projected, { filter: { $nor: [{ owner_user_id: 4 }] } })).rejects.toThrow(/Supported: \$and, \$or/);
+      await expect(query(projected, { filter: { $or: [] } })).rejects.toThrow(/non-empty array/);
+    });
+
+    it("the dollarvote board: $or of $exists on two nested paths, grouped per legislator", async () => {
+      const legs = makeLegislators(150);
+      const { projected, plain } = await twin(legs as unknown as Record<string, unknown>[]);
+      const filter = { $or: [{ "votes.points.veterans": { $exists: true } }, { "votes.points.small_business": { $exists: true } }] };
+      const params: QueryParams = {
+        filter,
+        groupBy: "bioguide_id",
+        aggregate: { p_vet: { sum: "votes.points.veterans" }, p_sb: { sum: "votes.points.small_business" }, n: { count: "votes.bill_id" } },
+        sort: "-p_vet,bioguide_id",
+        limit: 1000,
+      };
+      // $or selects legislators; every vote of a selected legislator is aggregated.
+      // A sum over no values is null, and nulls sort last.
+      const sum = (l: Legislator, c: string) => (l.votes.some((v) => c in v.points) ? l.votes.reduce((s, v) => s + (v.points[c] ?? 0), 0) : null);
+      const expected = legs
+        .filter((l) => l.votes.some((v) => "veterans" in v.points || "small_business" in v.points))
+        .map((l) => ({ bioguide_id: l.bioguide_id, p_vet: sum(l, "veterans"), p_sb: sum(l, "small_business"), n: l.votes.length }))
+        .sort((a, b) => (a.p_vet === null ? 1 : 0) - (b.p_vet === null ? 1 : 0) || (b.p_vet ?? 0) - (a.p_vet ?? 0) || (a.bioguide_id < b.bioguide_id ? -1 : 1));
+      for (const slug of [projected, plain]) {
+        const r = await query(slug, params);
+        expect(r.total).toBe(expected.length);
+        expect(r.results!.map((x) => ({ ...x, p_vet: x.p_vet === null ? null : Number(x.p_vet), p_sb: x.p_sb === null ? null : Number(x.p_sb) }))).toEqual(expected);
+      }
     });
   });
 });

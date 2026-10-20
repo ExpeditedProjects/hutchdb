@@ -654,3 +654,30 @@ describe('filter operator validation', () => {
     expect(compile({ filter: { f: { $nin: [] } } }).sql).toContain('true')
   })
 })
+
+describe('compileQuery: $or / $and', () => {
+  it('joins branches with OR, each branch self-contained, and keeps branch clauses for indexed reporting', () => {
+    const { sql, compiled } = compile({ filter: { $or: [{ price: 10 }, { status: 'open', 'votes.points': { $gt: 3 } }] } })
+    expect(sql).toContain('((t."p_price" = $1::float8) OR (t."p_status" = $2::text AND EXISTS (SELECT 1 FROM "hc_12__votes" c WHERE c.parent_id = t.id AND c."p_points" > $3::float8)))')
+    expect(compiled.clauses.map((c) => c.label)).toEqual(['filter on price', 'filter on status', 'filter on votes.points'])
+  })
+
+  it('nests $and inside $or alongside plain keys', () => {
+    const { sql } = compile({ filter: { active: true, $or: [{ $and: [{ price: { $gte: 1 } }, { price: { $lt: 5 } }] }, { status: 'x' }] } })
+    expect(sql).toContain('t."p_active" = $1::boolean AND ((((t."p_price" >= $2::float8) AND (t."p_price" < $3::float8))) OR (t."p_status" = $4::text))')
+  })
+
+  it('keeps conditions on one array inside a branch on the same element', () => {
+    const { sql } = compile({ filter: { $or: [{ 'votes.x.y': 1, 'votes.z': 2 }, { price: 1 }] } })
+    expect(sql).toMatch(/OR/)
+    expect(sql).toContain('@? $')
+  })
+
+  it('rejects other top-level $ keys and malformed branches', () => {
+    expect(() => compile({ filter: { $nor: [{ price: 1 }] } })).toThrow(/Unsupported top-level filter operator '\$nor'. Supported: \$and, \$or/)
+    expect(() => compile({ filter: { $gt: 1 } })).toThrow(/Unsupported top-level filter operator '\$gt'/)
+    expect(() => compile({ filter: { $or: [] } })).toThrow(/non-empty array of filters/)
+    expect(() => compile({ filter: { $or: { price: 1 } } })).toThrow(/non-empty array of filters/)
+    expect(() => compile({ filter: { $and: [1] } })).toThrow(/non-empty array of filters/)
+  })
+})

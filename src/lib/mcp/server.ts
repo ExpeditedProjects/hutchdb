@@ -26,7 +26,7 @@ Workflow for answering questions about stored data:
 
 Collections auto-create on the first hutch_store_records. No setup step.
 
-Use filter for exact/numeric/enum matches, search for free-text across string fields, or combine both. Run hutch_describe_collection first when you don't know a field's type. Filters also accept Mongo-style operator objects per field: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains (e.g. {"price": {"$gte": 10}}).
+Use filter for exact/numeric/enum matches, search for free-text across string fields, or combine both. Run hutch_describe_collection first when you don't know a field's type. Filters also accept Mongo-style operator objects per field: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains (e.g. {"price": {"$gte": 10}}), and $or / $and at the top level (e.g. {"$or": [{"status": "open"}, {"price": {"$lt": 5}}]}).
 
 Use hutch_collection_stats for a quick overview of a collection's size and field coverage, and hutch_export_records / hutch_import_records to move data in and out as CSV or JSON.
 
@@ -49,6 +49,9 @@ const FILTER_DESCRIPTION =
   "On a field holding an array of scalars (e.g. tags), a plain value, $in, $gt/$gte/$lt/$lte and $contains match when some element matches " +
   "({\"tags\": \"hiking\"}, {\"tags\": {\"$in\": [\"hiking\", \"snow\"]}}); $ne/$nin match when no element does; an array value " +
   "({\"tags\": [\"hiking\", \"snow\"]}) needs every listed element. " +
+  "Combine conditions with $or / $and at the top of the filter, each taking an array of filters, nestable: " +
+  "{\"$or\": [{\"status\": \"open\"}, {\"score\": {\"$gt\": 10}}]}. A $or/$and branch selects records; with group_by over an array of objects it does not restrict which elements are aggregated (a plain array-path condition does). " +
+  "Any other top-level key starting with $ is an error. " +
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
 
 function textResponse(text: string): McpToolResponse {

@@ -511,6 +511,10 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
   const uniqueKey = registry.unique_key ?? [];
 
   for (const [key, value] of Object.entries(filter)) {
+    if (key.startsWith("$")) {
+      parent.push(logicalCondition(ctx, key, value, clauses));
+      continue;
+    }
     const parsed = parsePath(registry, ctx.arrayPaths, key);
 
     if (parsed.kind === "object") {
@@ -563,6 +567,32 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
     }
   }
   return { parent, child, nestedRaw, unrouted: new Set(leftovers.keys()), clauses };
+}
+
+export const LOGICAL_OPERATORS = ["$and", "$or"] as const;
+
+/**
+ * `$or` / `$and` at the top of a filter (or nested inside one another):
+ * a non-empty array of filters, each compiled like a whole filter into one
+ * self-contained condition on the record (array conditions inside a branch
+ * become that branch's EXISTS or jsonpath test), then joined with OR / AND.
+ * Branch conditions select records; they do not restrict which elements
+ * of an array an aggregate runs over.
+ */
+function logicalCondition(ctx: Ctx, key: string, value: unknown, clauses: Clause[]): SQL {
+  if (!(LOGICAL_OPERATORS as readonly string[]).includes(key)) {
+    throw new Error(`Unsupported top-level filter operator '${key}'. Supported: ${LOGICAL_OPERATORS.join(", ")} (each takes an array of filters, e.g. {"$or": [{"status": "open"}, {"score": {"$gt": 10}}]}); field operators ($gt, $in, ...) go inside a field: {"score": {"$gt": 10}}`);
+  }
+  if (!Array.isArray(value) || value.length === 0 || !value.every((b) => isPlainObject(b))) {
+    throw new Error(`${key} takes a non-empty array of filters, e.g. {"${key}": [{"status": "open"}, {"score": {"$gt": 10}}]}`);
+  }
+  const branches = value.map((branch) => {
+    const sub = compileFilter(ctx, branch as Record<string, unknown>);
+    clauses.push(...sub.clauses);
+    const conds = [...sub.parent, ...existsConditions(sub)];
+    return conds.length === 0 ? sql`true` : sql`(${sql.join(conds, sql` AND `)})`;
+  });
+  return sql`(${sql.join(branches, key === "$or" ? sql` OR ` : sql` AND `)})`;
 }
 
 /** {a: {b: {c: value}}} for path [a, b, c]: the containment shape of a nested equality. */
@@ -1197,7 +1227,16 @@ function dottedHeads(params: TableQueryParams): string[] {
     const dot = name.indexOf(".");
     if (dot > 0) heads.add(name.slice(0, dot));
   };
-  for (const k of Object.keys(params.filter ?? {})) take(k);
+  const filterKeys = (filter: Record<string, unknown>) => {
+    for (const [k, v] of Object.entries(filter)) {
+      if (k.startsWith("$")) {
+        if (Array.isArray(v)) for (const branch of v) if (isPlainObject(branch)) filterKeys(branch);
+      } else {
+        take(k);
+      }
+    }
+  };
+  filterKeys(params.filter ?? {});
   for (const k of normalizeGroupBy(params.groupBy)) take(k);
   for (const spec of Object.values(params.aggregate ?? {})) {
     if (isPlainObject(spec)) for (const f of Object.values(spec)) if (typeof f === "string") take(f);
