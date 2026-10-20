@@ -68,6 +68,8 @@ const collectionRow = {
   publishedAt: null,
   visibility: 'private',
   orgDefaultRole: 'viewer',
+  layout: 'shared',
+  storage: {},
   createdAt: new Date(),
   updatedAt: new Date(),
 }

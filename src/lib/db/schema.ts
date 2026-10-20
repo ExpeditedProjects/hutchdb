@@ -142,6 +142,12 @@ export const collections = pgTable("collections", {
   publishedAt: timestamp("published_at", { withTimezone: true }),
   visibility: text("visibility").notNull().default("private"),
   orgDefaultRole: text("org_default_role").notNull().default("viewer"),
+  // Storage layout: 'shared' = rows live in the shared `records` table;
+  // 'table' = rows live in a per-collection table (hc_<id>) managed by
+  // src/lib/storage. `storage` is the registry of what inference created
+  // there (projections, unwinds); see src/lib/storage/registry.ts.
+  layout: text("layout").notNull().default("shared"),
+  storage: jsonb("storage").notNull().default({}),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [

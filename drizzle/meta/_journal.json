@@ -148,6 +148,13 @@
       "when": 1780531200000,
       "tag": "0020_drop_collections_submissions",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1792368000000,
+      "tag": "0021_collection_storage_layout",
+      "breakpoints": true
     }
   ]
 }
