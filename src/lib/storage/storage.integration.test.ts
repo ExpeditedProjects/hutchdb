@@ -105,7 +105,13 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
   /** What the MCP route runs after a response: build every queued index and unwind. */
   async function settle() {
     const { buildPendingIndexes } = await import("./builder");
-    await buildPendingIndexes();
+    const report = await buildPendingIndexes();
+    // Every build must succeed, or a "projected vs plain" comparison could have both sides reading documents.
+    expect(report.failed, JSON.stringify(report)).toBe(0);
+    expect(report.collections.filter((c) => c.skipped)).toEqual([]);
+    const { buildEntries, readRegistry } = await import("./registry");
+    const rows = (await testDb.execute(sql`SELECT id, storage FROM collections`)).rows as { id: number; storage: unknown }[];
+    expect(rows.flatMap((r) => buildEntries(readRegistry(r.storage)).filter((e) => e.build && e.build.state !== "ready").map((e) => `${r.id} ${e.kind} ${e.key}: ${e.build!.state}`))).toEqual([]);
   }
 
   async function collectionRow(slug: string) {
