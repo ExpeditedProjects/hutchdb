@@ -34,6 +34,7 @@ type Described = {
   storage?: { indexes: IndexEntry[]; unwinds: { path: string; rows?: number; state: string }[]; not_unwound: { path: string }[] } & Record<string, unknown>;
   storage_omitted?: string;
   fields_next_offset: number | null;
+  fields_total: number;
 };
 type Stats = {
   record_count: number;
@@ -192,6 +193,35 @@ describe.skipIf(!TEST_DB_URL)("describe and stats, real Postgres", () => {
       expect(name.distinctCount).toBeUndefined();
       expect(d.fields.find((f) => f.name === "half")!.frequency).toBeGreaterThan(0.35);
     });
+  });
+
+  describe("describe pages come from one sample", () => {
+    // ~200 sparse fields with close fill rates: their order depends on which records are sampled.
+    const sparse = (n: number) => Array.from({ length: n }, (_, i) => {
+      const doc: Record<string, unknown> = { n: i };
+      for (let f = 0; f < 200; f++) if ((i * 7919 + f * 104729) % 97 < (f % 40) + 5) doc[`s_${String(f).padStart(3, "0")}`] = f;
+      return doc;
+    });
+
+    for (const [label, n] of [["a table sorted whole", 600], ["a TABLESAMPLE table", 2600]] as const) {
+      it(`fields_offset pages over ${label} neither skip nor repeat fields, and fields_total holds`, async () => {
+        const { slug, id } = await seed(`pages_${n}`, sparse(n));
+        const first = await describeOf(slug);
+        const again = await describeOf(slug);
+        const second = await describeOf(slug, { fields_offset: 60 });
+        const names = (d: Described) => d.fields.map((f) => f.name);
+        expect(names(again)).toEqual(names(first));
+        expect(second.fields_total).toBe(first.fields_total);
+        const union = [...names(first), ...names(second)];
+        expect(new Set(union).size).toBe(120);
+        // No gaps: the two pages are the first 120 fields of the one list.
+        const { describeFields } = await import("@/lib/describe");
+        const whole = await describeFields(id, n, null, { limit: 120 });
+        expect(whole.fields.map((f) => f.name)).toEqual(union);
+        // Frequencies are over the records actually sampled: a field every record has is at 1.
+        expect(first.fields.find((f) => f.name === "n")?.frequency).toBe(1);
+      }, 30_000);
+    }
   });
 
   describe("compact storage section", () => {

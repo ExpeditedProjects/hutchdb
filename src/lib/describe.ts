@@ -123,7 +123,8 @@ export async function describeFields(collectionId: number, totalRecords: number,
   for (const [name, stat] of Object.entries(fieldStats)) {
     const types = Array.from(stat.types);
     const primaryType = types.length === 1 ? types[0] : getMostCommonType(types);
-    const frequency = stat.count / sampleSize;
+    // Over the records actually sampled: a BERNOULLI sample can hold fewer than sampleSize.
+    const frequency = stat.count / Math.max(1, sampleRecords.length);
 
     // Use the schema-inference engine for richer type detection. When
     // records disagree on the type, infer from the values of the most

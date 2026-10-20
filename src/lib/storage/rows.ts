@@ -499,15 +499,19 @@ export async function sampleFieldNames(collectionId: number, limit: number): Pro
 
 /**
  * Sample documents for schema inference / describe. With `random`, a
- * uniform random sample; on a table with many more live rows than `limit`
- * (`liveRows`, when the caller knows it) the candidates come from
- * TABLESAMPLE BERNOULLI instead of sorting every row, so a 1M-row table is
+ * pseudo-random sample spread over the whole table that is the same on
+ * every call while the data is unchanged (describe pages through one
+ * sample's field list with fields_offset, so each page must see the same
+ * sample): rows ordered by a hash of their id, and on a table with many
+ * more live rows than `limit` (`liveRows`, when the caller knows it) the
+ * candidates come from TABLESAMPLE BERNOULLI ... REPEATABLE (seeded with
+ * the collection id) instead of sorting every row, so a 1M-row table is
  * not read in full.
  */
 export async function sampleDocuments(collectionId: number, limit: number, random = false, liveRows?: number): Promise<Record<string, unknown>[]> {
   const sample = random && liveRows !== undefined ? bernoulliPercent(limit, liveRows) : null;
-  const from = sample !== null ? sql`${table(collectionId)} TABLESAMPLE BERNOULLI (${sample})` : table(collectionId);
-  const order = random ? sql`ORDER BY random()` : sql``;
+  const from = sample !== null ? sql`${table(collectionId)} TABLESAMPLE BERNOULLI (${sample}) REPEATABLE (${collectionId})` : table(collectionId);
+  const order = random ? sql`ORDER BY hashint4(id), id` : sql``;
   const result = await db.execute(sql`
     SELECT data FROM ${from} WHERE deleted_at IS NULL ${order} LIMIT ${limit}`);
   return (result.rows as { data: Record<string, unknown> }[]).map((r) => r.data);
