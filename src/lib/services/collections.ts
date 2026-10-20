@@ -11,7 +11,7 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { readRegistry } from "@/lib/storage/registry";
+import { queryIndexes, readRegistry } from "@/lib/storage/registry";
 import { dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
 
@@ -556,5 +556,7 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
     })),
     // Arrays of objects that are not unwound yet, and why.
     not_unwound: registry.pending_unwinds ?? [],
+    // Every index that can serve a query, including the GIN on the documents.
+    indexes: queryIndexes(collection.id, registry),
   };
 }

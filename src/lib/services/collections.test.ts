@@ -291,7 +291,7 @@ describe('describeCollection', () => {
       name: 'Bookmarks',
       slug: 'bookmarks',
       recordCount: 7,
-      storage: { evaluated_rows: 0, projections: [], unwinds: [], not_unwound: [] },
+      storage: { evaluated_rows: 0, projections: [], unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
     }))
   })
 })

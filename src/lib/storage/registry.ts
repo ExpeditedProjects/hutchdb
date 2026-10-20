@@ -245,3 +245,39 @@ export function projectionSegments(p: Pick<Projection, "field" | "path">): strin
 export function findUnwind(registry: StorageRegistry, path: string): Unwind | undefined {
   return registry.unwinds.find((u) => u.path === path);
 }
+
+export type IndexDescription = { index: string; on: string; serves: string };
+
+/**
+ * Every index on a collection's tables that can serve a query, in the
+ * words of what it serves: the GIN on the documents, created_at, the
+ * unique key, each projection and each unwound element column. Derived
+ * from the registry (the same names the compiler matches against EXPLAIN).
+ */
+export function queryIndexes(collectionId: number, registry: StorageRegistry): IndexDescription[] {
+  const table = collectionTableName(collectionId);
+  const out: IndexDescription[] = [
+    {
+      index: indexName(table, "data_gin"),
+      on: "data (every document, GIN jsonb_path_ops)",
+      serves: "equality on any field or path, including elements of arrays of scalars ({\"tags\": \"hiking\"}) and keys inside arrays of objects ({\"answers.author.user_id\": 4148}), containment ({\"tags\": [\"a\", \"b\"]}) and $in; not ranges, $ne/$nin, $exists or $contains",
+    },
+    { index: indexName(table, "created_at"), on: "created_at", serves: "created_after / created_before and sort on created_at" },
+  ];
+  if ((registry.unique_key ?? []).length > 0) {
+    out.push({ index: uniqueIndexName(table), on: `unique key (${registry.unique_key!.join(", ")})`, serves: "equality on the unique key fields and on_conflict upserts" });
+  }
+  for (const p of registry.projections) {
+    out.push({
+      index: indexName(table, p.column),
+      on: `${projectionKey(p)} (${p.type}), then created_at DESC, id DESC`,
+      serves: `equality, $in, $ne${p.mixed ? "" : ", ranges and sort"} on ${projectionKey(p)}, returned newest first without a separate sort`,
+    });
+  }
+  for (const u of registry.unwinds) {
+    for (const f of u.fields) {
+      out.push({ index: indexName(u.table, f.column), on: `${u.path}[].${f.field} (${f.type})`, serves: `filters on ${u.path}.${f.field}, and group_by/aggregate over ${u.path} elements` });
+    }
+  }
+  return out;
+}
