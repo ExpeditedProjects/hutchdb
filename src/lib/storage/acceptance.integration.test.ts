@@ -587,7 +587,7 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
     it("lists every index that can serve a query, including the GIN on the documents, and each exists", async () => {
       const docs = makeQuestions(300);
       const slug = await store("questions", docs);
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; on: string; serves: string }[] } };
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; field: string; kind: string; serves?: string }[] } };
       const names = described.storage.indexes.map((i) => i.index);
       const id = (await collectionRow(slug)).id;
       expect(names[0]).toBe(`hc_${id}_data_gin_idx`);

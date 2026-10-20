@@ -489,16 +489,74 @@ export async function sampleFieldNames(collectionId: number, limit: number): Pro
   return (result.rows as { key: string }[]).map((r) => r.key);
 }
 
-/** Sample documents for schema inference / describe. */
-export async function sampleDocuments(collectionId: number, limit: number, random = false): Promise<Record<string, unknown>[]> {
+/**
+ * Sample documents for schema inference / describe. With `random`, a
+ * uniform random sample; on a table with many more live rows than `limit`
+ * (`liveRows`, when the caller knows it) the candidates come from
+ * TABLESAMPLE BERNOULLI instead of sorting every row, so a 1M-row table is
+ * not read in full.
+ */
+export async function sampleDocuments(collectionId: number, limit: number, random = false, liveRows?: number): Promise<Record<string, unknown>[]> {
+  const sample = random && liveRows !== undefined ? bernoulliPercent(limit, liveRows) : null;
+  const from = sample !== null ? sql`${table(collectionId)} TABLESAMPLE BERNOULLI (${sample})` : table(collectionId);
   const order = random ? sql`ORDER BY random()` : sql``;
   const result = await db.execute(sql`
-    SELECT data FROM ${table(collectionId)} WHERE deleted_at IS NULL ${order} LIMIT ${limit}`);
+    SELECT data FROM ${from} WHERE deleted_at IS NULL ${order} LIMIT ${limit}`);
   return (result.rows as { data: Record<string, unknown> }[]).map((r) => r.data);
 }
 
-/** The three result sets getCollectionStats needs. */
-export async function collectionStats(collectionId: number, maxFields: number) {
+/**
+ * The BERNOULLI percentage that yields about 1.5x `rows` of `liveRows`
+ * (the margin covers sampling variance and soft-deleted rows, which the
+ * sample also visits), or null when the table is small enough that
+ * sorting every row is as cheap.
+ */
+function bernoulliPercent(rows: number, liveRows: number): number | null {
+  if (liveRows <= rows * 4) return null;
+  return Math.min(100, (150 * rows) / liveRows);
+}
+
+/**
+ * Stored size of a collection's table: heap plus TOAST (the documents),
+ * without indexes. A catalog lookup, no scan. What a full pass over the
+ * documents costs follows this, not the row count: 10k long articles
+ * (330 MB) take seconds to read where 1M small events take less.
+ */
+export async function tableBytes(collectionId: number): Promise<number> {
+  const result = await db.execute(sql`SELECT pg_table_size(${collectionTableName(collectionId)}::regclass)::float8 AS bytes`);
+  return Number((result.rows[0] as { bytes: number } | undefined)?.bytes ?? 0);
+}
+
+/**
+ * Collections whose table (tableBytes) is at most this large get exact
+ * figures that read every document — field fill rates in
+ * hutch_collection_stats, distinct counts in describe; larger ones get
+ * sampled or estimated figures, labelled as such. One pass over 100 MB
+ * of documents takes well under a second warm (product-catalog, 70 MB:
+ * fill rates in ~0.3 s), where the 5 s statement timeout cut off 330 MB of
+ * articles. HUTCH_FULL_SCAN_MAX_BYTES overrides it.
+ */
+export const DEFAULT_FULL_SCAN_MAX_BYTES = 100 * 1024 * 1024;
+
+export function fullScanMaxBytes(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.HUTCH_FULL_SCAN_MAX_BYTES);
+  return env.HUTCH_FULL_SCAN_MAX_BYTES !== undefined && env.HUTCH_FULL_SCAN_MAX_BYTES !== "" && Number.isFinite(n) && n >= 0
+    ? n
+    : DEFAULT_FULL_SCAN_MAX_BYTES;
+}
+
+/**
+ * Each live row's document, read (detoasted) once: an OFFSET 0 subquery
+ * the planner keeps, whose output the outer query reads as often as it
+ * likes. Without it every data->key re-reads the whole TOASTed document,
+ * once per key.
+ */
+function documentsOnce(collectionId: number): SQL {
+  return sql`(SELECT t.data || '{}'::jsonb AS d FROM ${table(collectionId)} t WHERE t.deleted_at IS NULL OFFSET 0)`;
+}
+
+/** The summary and by-status result sets getCollectionStats needs; field fill rates come from fieldFillRates. */
+export async function collectionStats(collectionId: number) {
   const t = table(collectionId);
   return Promise.all([
     db.execute(sql`
@@ -515,22 +573,65 @@ export async function collectionStats(collectionId: number, maxFields: number) {
       FROM ${t}
       WHERE deleted_at IS NULL
       GROUP BY status`),
-    db.execute(sql`
-      SELECT key, count(*)::int AS count
-      FROM ${t}, LATERAL jsonb_object_keys(data) AS key
-      WHERE deleted_at IS NULL AND jsonb_typeof(data) = 'object'
-      GROUP BY key
-      ORDER BY count DESC, key ASC
-      LIMIT ${maxFields}`),
   ]);
 }
 
-/** Live row counts of each child table, for describe. */
-export async function childTableCounts(tables: string[]): Promise<Record<string, number>> {
+export type FieldFillRates = {
+  /** Top-level keys, most common first, with how many (sampled) records have each. */
+  fields: { key: string; count: number }[];
+  /** Null for an exact count over every live record; else how many records the sample held. */
+  sampledRows: number | null;
+};
+
+/**
+ * How many live records have each top-level key (most common first, at
+ * most `maxFields`). With `sampleRows`, counted over a random sample of
+ * about that many records (TABLESAMPLE BERNOULLI over `liveRows`) instead
+ * of every record.
+ */
+export async function fieldFillRates(collectionId: number, maxFields: number, sample?: { rows: number; liveRows: number }): Promise<FieldFillRates> {
+  const keysOf = (doc: SQL) => sql`LATERAL jsonb_object_keys(CASE WHEN jsonb_typeof(${doc}) = 'object' THEN ${doc} ELSE '{}'::jsonb END) AS key`;
+  if (!sample) {
+    const result = await db.execute(sql`
+      SELECT key, count(*)::int AS count
+      FROM ${documentsOnce(collectionId)} s, ${keysOf(sql`s.d`)}
+      GROUP BY key
+      ORDER BY count DESC, key ASC
+      LIMIT ${maxFields}`);
+    return { fields: result.rows as { key: string; count: number }[], sampledRows: null };
+  }
+  const percent = Math.min(100, (150 * sample.rows) / Math.max(1, sample.liveRows));
+  const result = await db.execute(sql`
+    WITH s AS MATERIALIZED (
+      SELECT t.data FROM ${table(collectionId)} t TABLESAMPLE BERNOULLI (${percent})
+      WHERE t.deleted_at IS NULL ORDER BY random() LIMIT ${sample.rows})
+    SELECT k.key, k.count, (SELECT count(*)::int FROM s) AS sampled
+    FROM (SELECT key, count(*)::int AS count FROM s, ${keysOf(sql`s.data`)} GROUP BY key) k
+    RIGHT JOIN (SELECT 1) one ON true
+    ORDER BY k.count DESC, k.key ASC
+    LIMIT ${maxFields}`);
+  const rows = result.rows as { key: string | null; count: number | null; sampled: number }[];
+  return {
+    fields: rows.filter((r) => r.key !== null).map((r) => ({ key: r.key!, count: Number(r.count) })),
+    sampledRows: Number(rows[0]?.sampled ?? 0),
+  };
+}
+
+/**
+ * Row counts of each child table for describe, counting only elements of
+ * live records: the child rows of a soft-deleted record stay in the table
+ * (the triggers only follow inserts and updates), so they are subtracted —
+ * one lookup by parent_id (the primary key's first column) per deleted
+ * record.
+ */
+export async function childTableCounts(collectionId: number, tables: string[]): Promise<Record<string, number>> {
   const counts: Record<string, number> = {};
   for (const name of tables) {
-    const result = await db.execute(sql`SELECT count(*)::int AS count FROM ${ident(name)}`);
-    counts[name] = (result.rows[0] as { count: number } | undefined)?.count ?? 0;
+    const child = ident(name);
+    const result = await db.execute(sql`
+      SELECT (SELECT count(*) FROM ${child})
+           - (SELECT count(*) FROM ${child} c WHERE c.parent_id IN (SELECT p.id FROM ${table(collectionId)} p WHERE p.deleted_at IS NOT NULL)) AS count`);
+    counts[name] = Number((result.rows[0] as { count: number | string } | undefined)?.count ?? 0);
   }
   return counts;
 }
@@ -559,12 +660,13 @@ export async function recordCounts(collectionIds: number[]): Promise<Map<number,
 
 /**
  * Exact distinct-value counts of top-level keys over every live record
- * (JSON equality: 1 and "1" differ; a missing key is not a value).
+ * (JSON equality: 1 and "1" differ; a missing key is not a value). Each
+ * document is read once however many keys are counted (documentsOnce).
  */
 export async function exactDistinctCounts(collectionId: number, keys: string[]): Promise<Record<string, number>> {
   if (keys.length === 0) return {};
-  const cols = keys.map((k, i) => sql`count(DISTINCT t.data->${k}::text)::int AS ${sql.raw(`"d${i}"`)}`);
-  const result = await db.execute(sql`SELECT ${sql.join(cols, sql`, `)} FROM ${table(collectionId)} t WHERE t.deleted_at IS NULL`);
+  const cols = keys.map((k, i) => sql`count(DISTINCT s.d->${k}::text)::int AS ${sql.raw(`"d${i}"`)}`);
+  const result = await db.execute(sql`SELECT ${sql.join(cols, sql`, `)} FROM ${documentsOnce(collectionId)} s`);
   const row = result.rows[0] as Record<string, number>;
   return Object.fromEntries(keys.map((k, i) => [k, Number(row[`d${i}`])]));
 }
@@ -576,9 +678,11 @@ export async function exactDistinctCounts(collectionId: number, keys: string[]):
  * the projection index's own statistics (its first column) for an
  * expression projection. Keys without a ready projection or without
  * statistics yet (ANALYZE has not run since the index was built) are left
- * out.
+ * out. reltuples counts soft-deleted rows too, so with `liveRows` (the
+ * live record count) a fractional n_distinct scales by that instead, and
+ * no estimate exceeds it.
  */
-export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[]): Promise<Record<string, number>> {
+export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[], liveRows?: number): Promise<Record<string, number>> {
   const registry = readQueryRegistry(storage);
   const name = collectionTableName(collectionId);
   // pg_stats relation name and column -> field.
@@ -599,7 +703,9 @@ export async function estimatedDistinctCounts(collectionId: number, storage: unk
   const out: Record<string, number> = {};
   for (const row of result.rows as { tablename: string; attname: string; n_distinct: number; reltuples: number }[]) {
     const nd = Number(row.n_distinct);
-    const estimate = nd >= 0 ? nd : Math.round(-nd * Number(row.reltuples));
+    const rows = liveRows ?? Number(row.reltuples);
+    const raw = nd >= 0 ? nd : Math.round(-nd * rows);
+    const estimate = liveRows !== undefined ? Math.min(raw, liveRows) : raw;
     const field = sources.get(JSON.stringify([row.tablename, row.attname]));
     if (field !== undefined && Number.isFinite(estimate) && estimate > 0) out[field] = Math.round(estimate);
   }

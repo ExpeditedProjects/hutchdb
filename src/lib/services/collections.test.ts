@@ -51,6 +51,7 @@ vi.mock('@/lib/storage/rows', async (importOriginal) => ({
   countRecords: vi.fn().mockResolvedValue(7),
   lastRecordAt: vi.fn().mockResolvedValue(new Date('2026-01-01T00:00:00.000Z')),
   childTableCounts: vi.fn().mockResolvedValue({}),
+  tableBytes: vi.fn().mockResolvedValue(0),
 }))
 
 vi.mock('@/lib/storage/ddl', () => ({
@@ -292,7 +293,7 @@ describe('describeCollection', () => {
       name: 'Bookmarks',
       slug: 'bookmarks',
       recordCount: 7,
-      storage: { evaluated_rows: 0, projections: [], unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
+      storage: { unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
     }))
   })
 })

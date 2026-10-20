@@ -359,7 +359,7 @@ export async function runCutover(options: CutoverOptions = {}): Promise<CutoverR
     if (r.unwinds.length === 0) continue;
     const registry = readRegistry((await db.execute(sql`SELECT storage FROM collections WHERE id = ${r.id}`)).rows[0]?.storage);
     const ready = registry.unwinds.filter((u) => r.unwinds.some((x) => x.path === u.path) && (!u.build || u.build.state === "ready"));
-    const counts = await childTableCounts(ready.map((u) => u.table));
+    const counts = await childTableCounts(r.id, ready.map((u) => u.table));
     r.unwinds = r.unwinds.map((u) => ({ ...u, rows: counts[ready.find((x) => x.path === u.path)?.table ?? ""] ?? 0 }));
   }
 

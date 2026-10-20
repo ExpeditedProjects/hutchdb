@@ -363,8 +363,8 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
 
     it("describe reports storage and deleting the collection drops its tables", async () => {
       const described = (await collectionsSvc.describeCollection(slug, USER_ID)) as Record<string, unknown>;
-      const storage = described.storage as { projections: { field: string }[]; unwinds: { path: string; rows: number; reason: string }[] };
-      expect(storage.projections.map((p) => p.field)).toEqual(["id", "name", "score"]);
+      const storage = described.storage as { indexes: { index: string; field: string; kind: string }[]; unwinds: { path: string; rows: number }[] };
+      expect(storage.indexes.filter((i) => i.index.includes("_p_") && !i.kind.includes("unwound")).map((i) => i.field)).toEqual(["id", "name", "score"]);
       expect(storage.unwinds[0]).toMatchObject({ path: "votes", rows: 180 });
 
       ok(await collectionsSvc.deleteCollection(slug, USER_ID));

@@ -366,8 +366,14 @@ export function findUnwind(registry: StorageRegistry, path: string): Unwind | un
 
 export type IndexDescription = {
   index: string;
-  on: string;
-  serves: string;
+  /** The field or dotted path it covers; "*" for the indexes over whole documents. */
+  field: string;
+  /** What kind of index: the projected type ("number", "text", ...), "documents (GIN)", "full-text search", ... */
+  kind: string;
+  /** Only where the kind does not say it: the documents GIN and mixed-type projections. */
+  serves?: string;
+  /** A projection some records now hold another type for: equality only. */
+  mixed?: true;
   /** Background build state: queries use the index only once it is "ready". */
   state: BuildState;
   /** failed: generic reason and when it is retried. */
@@ -390,40 +396,44 @@ function stateOf(build: IndexBuild | undefined): Pick<IndexDescription, "state" 
 }
 
 /**
- * Every index on a collection's tables that can serve a query, in the
- * words of what it serves, with its build state: the GIN on the documents,
+ * Every index on a collection's tables that can serve a query, one short
+ * entry each — name, the field it covers, its kind and build state, plus
+ * the failure reason when failed — for describe: the GIN on the documents,
  * created_at, the unique key, each projection, the search index and each
  * unwound element column. Derived from the registry (the same names the
- * compiler matches against EXPLAIN). Only "ready" ones serve queries.
+ * compiler matches against EXPLAIN and reports in `plan`). Only "ready"
+ * ones serve queries.
  */
 export function queryIndexes(collectionId: number, registry: StorageRegistry): IndexDescription[] {
   const table = collectionTableName(collectionId);
   const out: IndexDescription[] = [
     {
       index: indexName(table, "data_gin"),
-      on: "data (every document, GIN jsonb_path_ops)",
-      serves: "equality on any field or path, including elements of arrays of scalars ({\"tags\": \"hiking\"}) and keys inside arrays of objects ({\"answers.author.user_id\": 4148}), containment ({\"tags\": [\"a\", \"b\"]}) and $in; not ranges, $ne/$nin, $exists or $contains",
+      field: "*",
+      kind: "documents (GIN)",
+      serves: "equality on any field or path, including array elements ({\"tags\": \"hiking\"}) and keys inside arrays of objects, containment and $in; not ranges, $ne/$nin, $exists or $contains",
       state: "ready",
     },
-    { index: indexName(table, "created_at"), on: "created_at", serves: "created_after / created_before and sort on created_at", state: "ready" },
+    { index: indexName(table, "created_at"), field: "created_at", kind: "record timestamp", state: "ready" },
   ];
   if ((registry.unique_key ?? []).length > 0) {
-    out.push({ index: uniqueIndexName(table), on: `unique key (${registry.unique_key!.join(", ")})`, serves: "equality on the unique key fields and on_conflict upserts", state: "ready" });
+    out.push({ index: uniqueIndexName(table), field: registry.unique_key!.join(", "), kind: "unique key", state: "ready" });
   }
   for (const p of registry.projections) {
     out.push({
       index: indexName(table, p.column),
-      on: `${projectionKey(p)} (${p.type}), then created_at DESC, id DESC`,
-      serves: `equality, $in, $ne${p.mixed ? "" : ", ranges and sort"} on ${projectionKey(p)}, returned newest first without a separate sort`,
+      field: p.path ? p.path.join(".") : p.field,
+      kind: p.type,
+      ...(p.mixed ? { mixed: true as const, serves: "equality, $in and $ne only: some records now hold other types here, so ranges and sort read the documents" } : {}),
       ...stateOf(p.build),
     });
   }
   if (registry.search_index) {
-    out.push({ index: searchIndexName(table), on: "to_tsvector('english', data::text) (GIN)", serves: "search (full-text) in hutch_query_records and hutch_search", ...stateOf(registry.search_index.build) });
+    out.push({ index: searchIndexName(table), field: "*", kind: "full-text search", ...stateOf(registry.search_index.build) });
   }
   for (const u of registry.unwinds) {
     for (const f of u.fields) {
-      out.push({ index: indexName(u.table, f.column), on: `${u.path}[].${f.field} (${f.type})`, serves: `filters on ${u.path}.${f.field}, and group_by/aggregate over ${u.path} elements`, ...stateOf(u.build) });
+      out.push({ index: indexName(u.table, f.column), field: `${u.path}.${f.field}`, kind: `${f.type}, unwound array element`, ...stateOf(u.build) });
     }
   }
   return out;

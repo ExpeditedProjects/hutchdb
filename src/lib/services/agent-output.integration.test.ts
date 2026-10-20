@@ -74,7 +74,7 @@ describe.skipIf(!TEST_DB_URL)("bounded tool output, real Postgres", () => {
     fields: { name: string; type: string; conflict?: boolean; types?: string[]; typeCounts?: Record<string, number> }[];
     fields_total: number; fields_offset: number; fields_returned: number; fields_omitted: number; fields_next_offset: number | null;
     fields_matching_prefix?: number; fields_hint?: string;
-    storage: { projections: { field: string; type: string; mixed?: boolean; reason: string }[] };
+    storage: { indexes: { field: string; kind: string; mixed?: boolean; serves?: string }[] };
   };
 
   /** 100 records: 4 fields in every record, plus 2 sparse fields each (attr_000 ... attr_199). */
@@ -143,18 +143,18 @@ describe.skipIf(!TEST_DB_URL)("bounded tool output, real Postgres", () => {
     it("types the field by its most common type, counts each type, and marks the projection mixed", async () => {
       const { slug } = await seed("drift", Array.from({ length: 12 }, (_, i) => ({ name: `item-${i}`, score: 1000 + i })));
       const before = (await collectionsSvc.describeCollection(slug, USER_ID)) as unknown as Described;
-      const projection = before.storage.projections.find((p) => p.field === "score");
-      expect(projection).toMatchObject({ type: "number" });
+      const projection = before.storage.indexes.find((p) => p.field === "score");
+      expect(projection).toMatchObject({ kind: "number" });
       expect(projection?.mixed).toBeUndefined();
 
       await seed("drift", [{ name: "s1", score: "5000" }, { name: "s2", score: "6000" }]);
       const after = (await collectionsSvc.describeCollection(slug, USER_ID)) as unknown as Described;
       const field = after.fields.find((f) => f.name === "score")!;
       expect(field).toMatchObject({ type: "number", conflict: true, typeCounts: { number: 12, string: 2 } });
-      const mixed = after.storage.projections.find((p) => p.field === "score")!;
+      const mixed = after.storage.indexes.find((p) => p.field === "score")!;
       expect(mixed.mixed).toBe(true);
-      expect(mixed.reason).toMatch(/now hold other types/);
-      expect(mixed.reason).not.toMatch(/100%/);
+      expect(mixed.serves).toMatch(/now hold other types/);
+      expect(mixed.serves).not.toMatch(/100%/);
     });
   });
 

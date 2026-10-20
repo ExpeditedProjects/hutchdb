@@ -198,8 +198,9 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       const expected = docs.filter((d) => d.score >= 90).sort((a, b) => a.score - b.score || a.n - b.n).map((d) => d.n);
       expect(ids(before)).toEqual(expected);
       expect(before.indexed).toBe(false);
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { projections: { field: string; state: string }[]; indexes: { index: string; state: string }[] } };
-      expect(new Set(described.storage.projections.map((p) => p.state))).toEqual(new Set(["pending"]));
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; field: string; state: string }[] } };
+      const projectionStates = (d: typeof described) => new Set(d.storage.indexes.filter((i) => i.index.includes("_p_")).map((i) => i.state));
+      expect(projectionStates(described)).toEqual(new Set(["pending"]));
       expect(described.storage.indexes.find((i) => i.index === `hc_${id}_p_score_idx`)?.state).toBe("pending");
 
       const report = await builder.buildPendingIndexes();
@@ -215,7 +216,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       // Nothing left to do.
       expect((await builder.buildPendingIndexes()).collections).toEqual([]);
       const after = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as typeof described;
-      expect(new Set(after.storage.projections.map((p) => p.state))).toEqual(new Set(["ready"]));
+      expect(projectionStates(after)).toEqual(new Set(["ready"]));
     });
 
     it("the compiler emits the indexed expression for every type and nested paths, so the planner can use each index", async () => {
@@ -294,8 +295,8 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       await vacuumAnalyze(slug);
       const both = await query(slug, { filter: { score: 96, name: { $in: ["name-1", "name-2"] } }, sort: "n", limit: 100 });
       expect(ids(both)).toEqual([...docs, ...makeDocs(3000, 10)].filter((d) => d.score === 96 && ["name-1", "name-2"].includes(d.name)).map((d) => d.n));
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { projections: { field: string; state: string }[] } };
-      expect(described.storage.projections.find((p) => p.field === "score")?.state).toBe("ready");
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { field: string; state: string }[] } };
+      expect(described.storage.indexes.find((i) => i.field === "score")?.state).toBe("ready");
     });
   });
 
@@ -547,8 +548,8 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       expect(global.results.reduce((n, g) => n + g.records.length, 0)).toBe(50);
       expect(global.results.some((g) => g.collection.slug === slug)).toBe(true);
 
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { search_index: { state: string }; indexes: { index: string; state: string }[] } };
-      expect(described.storage.search_index.state).toBe("ready");
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; kind: string; state: string }[] } };
+      expect(described.storage.indexes.find((i) => i.kind === "full-text search")?.state).toBe("ready");
       expect(described.storage.indexes.find((i) => i.index === `hc_${id}_search_idx`)?.state).toBe("ready");
     });
   });

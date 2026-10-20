@@ -485,9 +485,23 @@ export async function addFieldOption(
 const STATS_MAX_FIELDS = 50;
 
 /**
+ * Records sampled for fill rates on a collection too large to scan
+ * (rows.fullScanMaxBytes): STATS_SAMPLE_BYTES of documents, between
+ * STATS_SAMPLE_MIN_ROWS and STATS_SAMPLE_MAX_ROWS records — 10k long
+ * articles give 500, 1M small events 5,000.
+ */
+const STATS_SAMPLE_BYTES = 16 * 1024 * 1024;
+const STATS_SAMPLE_MIN_ROWS = 500;
+const STATS_SAMPLE_MAX_ROWS = 5000;
+
+/**
  * Collection statistics: record count, counts by status, first/last
  * created/updated timestamps, approximate storage bytes, and per-field
- * fill rates for top-level keys (most common first, capped at 50).
+ * fill rates for top-level keys (most common first, capped at 50). The
+ * counts, timestamps and bytes are exact (they read no documents); fill
+ * rates are exact when the collection's documents fit a full scan
+ * (rows.fullScanMaxBytes) and otherwise come from a random sample, with
+ * fields_sampled saying so and estimated_count in place of count.
  */
 export async function getCollectionStats(slug: string, userId: string) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
@@ -496,7 +510,7 @@ export async function getCollectionStats(slug: string, userId: string) {
   slug = access.collection.slug;
   const collection = access.collection;
 
-  const [summaryResult, statusResult, fieldResult] = await tableRows.collectionStats(collection.id, STATS_MAX_FIELDS);
+  const [summaryResult, statusResult] = await tableRows.collectionStats(collection.id);
 
   const summary = (summaryResult.rows[0] ?? {}) as {
     record_count?: number;
@@ -513,11 +527,21 @@ export async function getCollectionStats(slug: string, userId: string) {
     byStatus[row.status ?? DEFAULT_RECORD_STATUS] = row.count;
   }
 
-  const fields = (fieldResult.rows as { key: string; count: number }[]).map((row) => ({
-    name: row.key,
-    count: row.count,
-    percent: recordCount > 0 ? Math.round((row.count / recordCount) * 1000) / 10 : 0,
-  }));
+  const bytes = recordCount > 0 ? await tableRows.tableBytes(collection.id) : 0;
+  const sampleRows = Math.min(STATS_SAMPLE_MAX_ROWS, Math.max(STATS_SAMPLE_MIN_ROWS, Math.floor(STATS_SAMPLE_BYTES / Math.max(1, bytes / Math.max(1, recordCount)))));
+  const sampled = recordCount > 0 && bytes > tableRows.fullScanMaxBytes() && recordCount > sampleRows;
+  const fill = recordCount > 0
+    ? await tableRows.fieldFillRates(collection.id, STATS_MAX_FIELDS, sampled ? { rows: sampleRows, liveRows: recordCount } : undefined)
+    : { fields: [], sampledRows: null };
+
+  const percentOf = (count: number, of: number) => (of > 0 ? Math.round((count / of) * 1000) / 10 : 0);
+  const fields = fill.sampledRows === null
+    ? fill.fields.map((row) => ({ name: row.key, count: row.count, percent: percentOf(row.count, recordCount) }))
+    : fill.fields.map((row) => ({
+      name: row.key,
+      percent: percentOf(row.count, fill.sampledRows!),
+      estimated_count: fill.sampledRows! > 0 ? Math.round((row.count / fill.sampledRows!) * recordCount) : 0,
+    }));
 
   return {
     name: collection.name,
@@ -530,6 +554,12 @@ export async function getCollectionStats(slug: string, userId: string) {
     last_updated_at: summary.last_updated_at ?? null,
     approx_storage_bytes: Number(summary.approx_storage_bytes ?? 0),
     fields,
+    ...(fill.sampledRows !== null
+      ? {
+        fields_sampled: { rows: fill.sampledRows, of: recordCount },
+        fields_note: `Fill rates are estimated from a random sample of ${fill.sampledRows} of ${recordCount} records (percent of the sample; estimated_count scales it to the collection): this collection's documents are too large to count every key within the request time limit. record_count, by_status, the timestamps and approx_storage_bytes are exact.`,
+      }
+      : {}),
   };
 }
 
@@ -568,6 +598,10 @@ export async function describeCollection(slug: string, userId: string, page: Fie
   const describePage: DescribePage = { offset: page.fields_offset, prefix: page.field_prefix };
   const described = await describeFields(collection.id, recordCount, collection.storage, describePage);
 
+  // The storage section is the same on every page: shown on the first
+  // page, narrowed to the matching fields on a field_prefix lookup, and
+  // left out of later fields_offset pages, which only continue the list.
+  const laterPage = !page.field_prefix && (page.fields_offset ?? 0) > 0;
   return {
     name: collection.name,
     slug: collection.slug,
@@ -576,7 +610,9 @@ export async function describeCollection(slug: string, userId: string, page: Fie
     uniqueKey: collection.uniqueKey,
     fields: described.fields,
     ...fieldPageInfo(page, described.matched, described.total, described.fields.length, described.offset, "most common first, from a sample of up to 500 records; hutch_collection_stats has exact fill rates"),
-    storage: await describeStorage(collection),
+    ...(laterPage
+      ? { storage_omitted: "storage (indexes, unwound arrays) is listed on the first page (no fields_offset) and is the same on every page." }
+      : { storage: await describeStorage(collection, page.field_prefix) }),
   };
 }
 
@@ -590,33 +626,30 @@ function buildState(build: IndexBuild | undefined) {
 }
 
 /**
- * What inference has created for a collection: projected fields and
- * unwound arrays with their reasons, build states and child row counts.
+ * What inference has created for a collection, compactly: every index
+ * that can serve a query (one short entry each), unwound arrays with their
+ * live element counts and build states, and arrays not unwound yet with
+ * the reason. With `prefix` (a field_prefix lookup), only entries for
+ * fields starting with it.
  */
-async function describeStorage(collection: { id: number; storage: unknown }) {
+async function describeStorage(collection: { id: number; storage: unknown }, prefix?: string) {
   queueDueIndexBuild(collection);
   const registry = readRegistry(collection.storage);
-  const ready = registry.unwinds.filter((u) => !u.build || u.build.state === "ready");
-  const counts = await tableRows.childTableCounts(ready.map((u) => u.table));
+  const matches = (field: string) => !prefix || field.startsWith(prefix);
+  const unwinds = registry.unwinds.filter((u) => matches(u.path));
+  const ready = unwinds.filter((u) => !u.build || u.build.state === "ready");
+  const counts = await tableRows.childTableCounts(collection.id, ready.map((u) => u.table));
   return {
-    evaluated_rows: registry.evaluated_rows,
-    projections: registry.projections.map((p) => p.mixed
-      // The stored reason describes the data when the column was made;
-      // since then some record held another type there.
-      ? { field: p.field, type: p.type, mixed: true, ...buildState(p.build), reason: `Projected as ${p.type} when '${p.field}' held only ${p.type} values; some records now hold other types there (mixed), so this column serves equality, $in and $ne, while ranges and sort read the documents.` }
-      : { field: p.field, type: p.type, reason: p.reason, ...buildState(p.build) }),
-    unwinds: registry.unwinds.map((u) => ({
+    // Every index that can serve a query, including the GIN on the documents.
+    indexes: queryIndexes(collection.id, registry).filter((i) => matches(i.field) && (!prefix || i.field !== "*")),
+    // Arrays of objects made queryable; rows = elements across live records.
+    unwinds: unwinds.map((u) => ({
       path: u.path,
-      fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
-      rows: counts[u.table] ?? 0,
-      reason: u.reason,
+      ...(ready.includes(u) ? { rows: counts[u.table] ?? 0 } : {}),
       ...buildState(u.build),
     })),
-    ...(registry.search_index ? { search_index: { reason: registry.search_index.reason, ...buildState(registry.search_index.build) } } : {}),
     // Arrays of objects that are not unwound yet, and why.
-    not_unwound: registry.pending_unwinds ?? [],
-    // Every index that can serve a query, including the GIN on the documents.
-    indexes: queryIndexes(collection.id, registry),
+    not_unwound: (registry.pending_unwinds ?? []).filter((p) => matches(p.path)),
   };
 }
 

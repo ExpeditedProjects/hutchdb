@@ -341,7 +341,8 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
       expect(found.results.map((r) => r.collection.slug).sort()).toEqual([alpha, beta].sort());
 
       const describedBeta = ok(await collectionsSvc.describeCollection(beta, USER_ID));
-      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { projections: [], unwinds: [] } });
+      expect(describedBeta).toMatchObject({ recordCount: 3, storage: { unwinds: [] } });
+      expect((describedBeta as { storage: { indexes: { field: string }[] } }).storage.indexes.map((i) => i.field)).toEqual(["*", "created_at"]);
 
       ok(await collectionsSvc.deleteCollection(beta, USER_ID));
       const gone = await testDb.execute(sql`SELECT to_regclass(${`hc_${betaRow.id}`}) IS NULL AS gone`);

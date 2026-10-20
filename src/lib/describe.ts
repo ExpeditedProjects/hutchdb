@@ -8,9 +8,9 @@ type FieldInfo = {
   conflict?: boolean;
   frequency: number;
   sampleValues?: unknown[];
-  /** Exact number of distinct values over every live record (collections up to EXACT_DISTINCT_MAX_RECORDS). */
+  /** Exact number of distinct values over every live record (collections up to EXACT_DISTINCT_MAX_RECORDS records and rows.fullScanMaxBytes of documents). */
   distinctCount?: number;
-  /** Larger collections, indexed fields only: Postgres's planner estimate (pg_stats), not a count. */
+  /** Larger collections, indexed fields only: Postgres's planner estimate (pg_stats, scaled to live records), not a count. */
   distinctCountEstimate?: number;
   /** With conflict: how many sampled records hold each JSON type at this field. */
   typeCounts?: Record<string, number>;
@@ -22,7 +22,11 @@ type FieldInfo = {
   latest?: string;
 };
 
-/** Collections up to this many records get exact distinct counts; larger ones an estimate for indexed fields. */
+/**
+ * Collections up to this many records (and up to rows.fullScanMaxBytes of
+ * documents: counting reads every document) get exact distinct counts;
+ * larger ones an estimate for indexed fields.
+ */
 export const EXACT_DISTINCT_MAX_RECORDS = 20_000;
 
 /** Fields one describe call lists by default (most common first); the rest page with fields_offset. */
@@ -58,7 +62,7 @@ export async function describeFields(collectionId: number, totalRecords: number,
 
   const sampleSize = Math.min(totalRecords, 500);
   const { sampleDocuments } = await import("./storage/rows");
-  const sampleRecords = (await sampleDocuments(collectionId, sampleSize, true)).map((data) => ({ data }));
+  const sampleRecords = (await sampleDocuments(collectionId, sampleSize, true, totalRecords)).map((data) => ({ data }));
 
   const fieldStats: Record<string, {
     count: number;
@@ -173,12 +177,12 @@ export async function describeFields(collectionId: number, totalRecords: number,
   const scalarKeys = Object.entries(fieldStats)
     .filter(([name, stat]) => pageNames.has(name) && ![...stat.types].some((t) => t === "array" || t === "object"))
     .map(([name]) => name);
-  const { exactDistinctCounts, estimatedDistinctCounts } = await import("./storage/rows");
-  if (totalRecords <= EXACT_DISTINCT_MAX_RECORDS) {
+  const { exactDistinctCounts, estimatedDistinctCounts, tableBytes, fullScanMaxBytes } = await import("./storage/rows");
+  if (totalRecords <= EXACT_DISTINCT_MAX_RECORDS && scalarKeys.length > 0 && await tableBytes(collectionId) <= fullScanMaxBytes()) {
     const counts = await exactDistinctCounts(collectionId, scalarKeys);
     for (const field of pageFields) if (counts[field.name] !== undefined) field.distinctCount = counts[field.name];
   } else {
-    const counts = await estimatedDistinctCounts(collectionId, storage, scalarKeys);
+    const counts = await estimatedDistinctCounts(collectionId, storage, scalarKeys, totalRecords);
     for (const field of pageFields) if (counts[field.name] !== undefined) field.distinctCountEstimate = counts[field.name];
   }
 
