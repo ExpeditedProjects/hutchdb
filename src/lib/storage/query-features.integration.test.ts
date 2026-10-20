@@ -236,6 +236,9 @@ describe.skipIf(!TEST_DB_URL)("query features against real Postgres", () => {
 
   async function store(collection: string, recs: Record<string, unknown>[]): Promise<string> {
     const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, return: "summary" }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    const { buildPendingIndexes } = await import("./builder");
+    await buildPendingIndexes();
     return (result as { collection: { slug: string } }).collection.slug;
   }
 
