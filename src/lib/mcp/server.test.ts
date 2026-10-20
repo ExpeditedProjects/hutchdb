@@ -432,10 +432,30 @@ describe('descriptions follow HUTCH_STORAGE_LAYOUT', () => {
     expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
     expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
     const shape = shapeOf('hutch_query_records')
-    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'record', 'search', 'slug', 'sort', 'time_bucket'])
+    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
     expect(shape.record.description).toMatch(/omits the embedded parent record/)
+    // Arrays of scalars, per-element groups, totals across records, multi-key sort, typed keys.
+    expect(query).toMatch(/array of scalars \(tags\) matches when some element matches/)
+    expect(query).toMatch(/groups per element/)
+    expect(query).toMatch(/totals across records/)
+    expect(query).toMatch(/per_record: true/)
+    expect(query).toMatch(/up to 3 keys, as "-points,name"/)
+    expect(query).toMatch(/numbers come back as numbers/)
+    expect(shape.per_record.description).toMatch(/one row per record and group value/)
+    expect(shape.filter.description).toMatch(/\$ne\/\$nin match when no element does/)
+    expect(shape.aggregate.description).toMatch(/count booleans as 1 \(true\) and 0 \(false\)/)
+    expect(shape.slug.description).toMatch(/exact name/)
+    expect(descriptionOf('hutch_transform_records')).toMatch(/same filter syntax as hutch_query_records/)
     expect(shape.fields.description).toMatch(/embedded in nested aggregates/)
     expect(shape.limit.description).toMatch(/max 1000/)
+  })
+
+  it('forwards per_record and a sort array with the table layout', async () => {
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    vi.stubEnv('HUTCH_STORAGE_LAYOUT', 'table')
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', per_record: true, sort: ['-n', 'votes.vote'] })
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ perRecord: true, sort: ['-n', 'votes.vote'] }))
   })
 
   it('forwards record only with the table layout', async () => {

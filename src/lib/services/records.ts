@@ -1,11 +1,12 @@
 import { db } from "@/lib/db";
 import { collections, records, collectionMembers } from "@/lib/db/schema";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, QueryParams, notDeleted } from "@/lib/db/queries";
+import { createCollectionWithOwner, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, getCollectionRecordCount, queryRecords as queryRecordsEngine, notDeleted } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
 import { eq, and, sql, desc } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, CollectionSchema } from "@/lib/schema-inference";
 import { seedAutoViews } from "./views";
+import { findAccessibleCollection } from "./resolve";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
@@ -14,7 +15,7 @@ import { collectionTableName, ident, isTableLayout, readRegistry } from "@/lib/s
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
-import { queryTable } from "@/lib/storage/compiler";
+import { queryTable, sortKeys, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null, layout: string | null = "shared") {
   try {
@@ -125,11 +126,15 @@ export async function createRecords(userId: string, organizationId: string, para
 
   const uniqueKey = (collection.uniqueKey as string[]) || [];
   const results: { action: string; record: Record<string, unknown> }[] = [];
+  // Table layout: the documents as stored (merged documents after an
+  // on_conflict merge), which inference evaluates.
+  let storedDocs: Record<string, unknown>[] = recordsToInsert;
 
   if (isTableLayout(collection)) {
     const stored = await storeInTable(collection, recordsToInsert, onConflict, collectionWasCreated);
     if ("error" in stored) return stored;
     results.push(...stored.results);
+    storedDocs = stored.results.map((r) => r.record.data).filter(isPlainObject);
   } else if (uniqueKey.length === 0) {
     // Fast path: batch insert all records in a single query
     const created = await db
@@ -215,8 +220,8 @@ export async function createRecords(userId: string, organizationId: string, para
   // write to a table-layout collection. It must never fail the write.
   if (isTableLayout(collection)) {
     try {
-      await markMixedProjections(collection.id, recordsToInsert);
-      await applyInference(collection, recordsToInsert);
+      await markMixedProjections(collection.id, storedDocs);
+      await applyInference(collection, storedDocs);
     } catch (err) {
       console.error(`[storage] inference failed for collection ${collection.id}`, err);
     }
@@ -366,7 +371,7 @@ function buildSaveSummary(
 }
 
 export async function listRecords(slug: string, userId: string, limit: number = 50, offset: number = 0) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
 
@@ -393,14 +398,19 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-/** Route a query to the engine that owns the collection's rows. */
-function runQuery(collection: CollectionRow, params: Omit<QueryParams, "collectionId">) {
+/**
+ * Route a query to the engine that owns the collection's rows. The table
+ * layout takes several sort keys and perRecord; the shared engine gets the
+ * keys back as one string (and rejects more than one, as it always has).
+ */
+function runQuery(collection: CollectionRow, params: TableQueryParams) {
   if (isTableLayout(collection)) return queryTable(collection, params);
-  return queryRecordsEngine({ ...params, collectionId: collection.id });
+  const { sort, perRecord: _perRecord, ...rest } = params;
+  return queryRecordsEngine({ ...rest, ...(sort !== undefined ? { sort: Array.isArray(sort) ? sortKeys(sort).join(",") : sort } : {}), collectionId: collection.id });
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
   return runQuery(access.collection, params);
@@ -424,12 +434,14 @@ export async function exportRecords(slug: string, userId: string, params: {
   format?: "json" | "csv";
   filter?: Record<string, unknown>;
   search?: string;
-  sort?: string;
+  sort?: string | string[];
   fields?: string[];
   limit?: number;
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
 
   const format = params.format ?? "json";
   const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
@@ -638,8 +650,10 @@ export async function searchGlobal(userId: string, search: string, limit: number
 }
 
 export async function truncateRecords(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   if (isTableLayout(collection)) {
@@ -652,8 +666,10 @@ export async function truncateRecords(slug: string, userId: string) {
 }
 
 export async function updateRecord(slug: string, userId: string, recordId: number, data: Record<string, unknown>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const updated = isTableLayout(collection)
@@ -691,8 +707,10 @@ export async function transformRecords(slug: string, userId: string, params: {
   rename_fields?: Record<string, string>;
   set_field?: { field: string; value: unknown; filter?: Record<string, unknown> };
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const { remove_fields, rename_fields, set_field } = params;
@@ -786,7 +804,18 @@ export async function transformRecords(slug: string, userId: string, params: {
     const overlay = JSON.stringify({ [field]: value });
     try {
       let result;
-      if (filter && Object.keys(filter).length > 0) {
+      if (filter && Object.keys(filter).length > 0 && isTableLayout(collection)) {
+        // The table layout applies the full query filter language
+        // (operators, dotted paths, array elements), as in hutch_query_records.
+        const where = await tableFilterWhere(collection, filter);
+        result = await db.execute(
+          sql`UPDATE ${target} AS t
+              SET data = t.data || ${overlay}::jsonb,
+                  updated_at = now()
+              WHERE ${where}
+              RETURNING t.id`
+        );
+      } else if (filter && Object.keys(filter).length > 0) {
         result = await db.execute(
           sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
@@ -846,8 +875,10 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
     return { error: `Invalid status. Must be one of: ${RECORD_STATUSES.join(", ")}`, status: 400 };
   }
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const updated = isTableLayout(collection)
@@ -865,8 +896,10 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
 }
 
 export async function deleteRecord(slug: string, userId: string, recordId: number) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   if (isTableLayout(collection)) {

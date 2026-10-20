@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest'
 vi.mock('@/lib/db', () => ({ db: { execute: vi.fn() } }))
 
 import { PgDialect } from 'drizzle-orm/pg-core'
-import { compileQuery, summarizePlan, embeddedRecord } from './compiler'
+import { compileQuery, summarizePlan, embeddedRecord, sortKeys, typeCheckWarnings } from './compiler'
 import type { StorageRegistry } from './registry'
 
 const dialect = new PgDialect()
@@ -73,9 +73,10 @@ describe('compileQuery: records', () => {
     expect(sql).not.toContain('p_price')
   })
 
-  it('falls back to the jsonb path for $exists, $contains, null and undeclared fields', () => {
+  it('serves $exists from an unmixed projection; falls back to the jsonb path for $contains, null and undeclared fields', () => {
     const { sql } = compile({ filter: { price: { $exists: true }, status: { $contains: 'x' }, active: null, other: 1 } })
-    expect(sql).toContain('t.data ? $')
+    expect(sql).toContain('t."p_price" IS NOT NULL')
+    expect(compile({ filter: { other: { $exists: true } } }).sql).toContain('t.data ? $')
     expect(sql).toContain('ILIKE')
     expect(sql).toContain('t.data @> $')
     expect(sql).not.toContain('p_active')
@@ -110,9 +111,10 @@ describe('compileQuery: records', () => {
 
   it('compiles a dotted path into nested objects like the shared layout, without the literal-key fallback', () => {
     const { sql, params } = compile({ filter: { 'address.city': 'Oslo', 'address.zip': { $gte: '0100' } } })
-    expect(sql).toContain('t.data @> $1::jsonb')
-    expect(params[0]).toBe('{"address":{"city":"Oslo"}}')
-    expect(sql).toContain("(jsonb_typeof(t.data #> $2::text[]) = 'string' AND (t.data #>> $3::text[]) >= $4)")
+    // Equality also matches an array holding the value (Mongo semantics).
+    expect(sql).toContain('(t.data @> $1::jsonb OR t.data @> $2::jsonb)')
+    expect(params.slice(0, 2)).toEqual(['{"address":{"city":"Oslo"}}', '{"address":{"city":["Oslo"]}}'])
+    expect(sql).toContain("(jsonb_typeof(t.data #> $3::text[]) = 'string' AND (t.data #>> $4::text[]) >= $5)")
     expect(sql).not.toContain('jsonpath')
     expect(sql).not.toContain('coalesce')
   })
@@ -152,20 +154,23 @@ describe('compileQuery: aggregation', () => {
     expect(sql).toContain('to_jsonb(sum(t."p_price"::text::numeric)) AS "total"')
     expect(sql).toContain('count(*)::int AS "n"')
     expect(sql).toContain('to_jsonb(max(CASE WHEN jsonb_typeof(t.data->$')
-    expect(sql).toContain('t.data->>$1::text AS "status"')
+    expect(sql).toContain('to_jsonb(bool_or(CASE WHEN jsonb_typeof(t.data->$')
+    // Group keys keep their JSON type; the unmixed projection serves them.
+    expect(sql).toContain(`NULLIF(to_jsonb(t."p_status"), 'null'::jsonb) AS "status"`)
     expect(sql).toContain('GROUP BY 1 ORDER BY 1 ASC')
     expect(sql).toContain('FROM "hc_12" t WHERE')
     expect(sql).not.toContain('parent_id')
   })
 
-  it('runs nested aggregates against the child table, grouped by parent', () => {
+  it('runs nested aggregates against the child table, grouped by parent with perRecord', () => {
     const { compiled, sql } = compile({
       filter: { status: 'open', 'votes.points': { $gt: 1 } },
       groupBy: 'votes.category_id',
       aggregate: { pts: { sum: 'votes.points' }, n: 'count' },
+      perRecord: true,
     })
     expect(compiled.kind === 'aggregate' && compiled.nested).toEqual({ path: 'votes', route: 'child' })
-    expect(sql).toContain('SELECT t.id AS parent_id, to_jsonb(c."p_category_id") AS "votes.category_id", to_jsonb(sum(c."p_points"::text::numeric)) AS "pts", count(*)::int AS "n"')
+    expect(sql).toContain(`SELECT t.id AS parent_id, NULLIF(to_jsonb(c."p_category_id"), 'null'::jsonb) AS "votes.category_id", to_jsonb(sum(c."p_points"::text::numeric)) AS "pts"`)
     expect(sql).toContain('FROM "hc_12__votes" c JOIN "hc_12" t ON t.id = c.parent_id')
     expect(sql).toContain('t."p_status" = $1::text')
     expect(sql).toContain('c."p_points" > $2::float8')
@@ -173,8 +178,16 @@ describe('compileQuery: aggregation', () => {
     expect(sql).not.toContain('EXISTS')
   })
 
+  it('totals a nested aggregate across parents unless perRecord asks for parent rows', () => {
+    const { compiled, sql } = compile({ groupBy: 'votes.category_id', aggregate: { pts: { sum: 'votes.points' }, n: 'count' } })
+    expect(compiled.kind === 'aggregate' && compiled.nested).toBeNull()
+    expect(sql).not.toContain('AS parent_id')
+    expect(sql).toContain('FROM "hc_12__votes" c JOIN "hc_12" t ON t.id = c.parent_id')
+    expect(sql).toContain('GROUP BY 1 ORDER BY 1 ASC')
+  })
+
   it('unnests the array when the path is not unwound yet', () => {
-    const compiled = compileQuery(collection, { groupBy: 'items.sku', aggregate: { q: { sum: 'items.qty' } } }, { arrayPaths: ['items'] })
+    const compiled = compileQuery(collection, { groupBy: 'items.sku', aggregate: { q: { sum: 'items.qty' } }, perRecord: true }, { arrayPaths: ['items'] })
     const sql = dialect.sqlToQuery(compiled.query).sql
     expect(compiled.kind === 'aggregate' && compiled.nested).toEqual({ path: 'items', route: 'lateral' })
     expect(sql).toContain('jsonb_array_elements(')
@@ -182,9 +195,11 @@ describe('compileQuery: aggregation', () => {
     expect(sql).toContain('e.val #> $')
   })
 
-  it('rejects aggregates spanning two nested arrays or mixing levels', () => {
+  it('rejects aggregates spanning two nested arrays; parent fields aggregate per element', () => {
     expect(() => compileQuery(collection, { groupBy: 'votes.category_id', aggregate: { q: { sum: 'items.qty' } } }, { arrayPaths: ['items'] })).toThrow(/one nested array/)
-    expect(() => compile({ groupBy: 'votes.category_id', aggregate: { q: { sum: 'price' } } })).toThrow(/one level at a time/)
+    const { sql } = compile({ groupBy: 'votes.category_id', aggregate: { q: { sum: 'price' } } })
+    expect(sql).toContain('to_jsonb(sum(t."p_price"::text::numeric)) AS "q"')
+    expect(sql).toContain('FROM "hc_12__votes" c JOIN "hc_12" t ON t.id = c.parent_id')
   })
 
   it('validates field names and aggregation ops', () => {
@@ -288,7 +303,9 @@ describe('compileQuery: sort', () => {
 
   it('in aggregate queries sorts by an alias or group key by ordinal, then limits', () => {
     const { sql } = compile({ groupBy: 'votes.category_id', aggregate: { points: { sum: 'votes.points' } }, sort: '-points', limit: 10 })
-    expect(sql).toMatch(/ORDER BY 3 DESC NULLS LAST, 1 ASC, 2 ASC LIMIT \$\d+$/)
+    expect(sql).toMatch(/ORDER BY 2 DESC NULLS LAST, 1 ASC LIMIT \$\d+$/)
+    expect(compile({ groupBy: 'votes.category_id', aggregate: { points: { sum: 'votes.points' } }, sort: '-points', perRecord: true }).sql)
+      .toMatch(/ORDER BY 3 DESC NULLS LAST, 1 ASC, 2 ASC LIMIT \$\d+$/)
     expect(sql).toContain('count(*) OVER () AS __total')
     const byKey = compile({ groupBy: 'status', aggregate: { n: 'count' }, sort: 'status' }).sql
     expect(byKey).toMatch(/ORDER BY 1 ASC NULLS LAST LIMIT/)
@@ -313,11 +330,11 @@ describe('compileQuery: deeper paths', () => {
   })
 
   it('aggregates below an array element by unnesting the array (lateral), one level deep uses the child table', () => {
-    const deep = compile({ groupBy: 'votes.category_id', aggregate: { v: { sum: 'votes.points.veterans' } } })
+    const deep = compile({ groupBy: 'votes.category_id', aggregate: { v: { sum: 'votes.points.veterans' } }, perRecord: true })
     expect(deep.compiled.kind === 'aggregate' && deep.compiled.nested).toEqual({ path: 'votes', route: 'lateral' })
     expect(deep.sql).toContain('e.val #> $')
     expect(deep.params).toContain('{"points","veterans"}')
-    const shallow = compile({ groupBy: 'votes.category_id', aggregate: { v: { sum: 'votes.points' } } })
+    const shallow = compile({ groupBy: 'votes.category_id', aggregate: { v: { sum: 'votes.points' } }, perRecord: true })
     expect(shallow.compiled.kind === 'aggregate' && shallow.compiled.nested).toEqual({ path: 'votes', route: 'child' })
   })
 
@@ -330,13 +347,12 @@ describe('compileQuery: deeper paths', () => {
   })
 
   it('a detected (not yet unwound) array head aggregates per parent via lateral', () => {
-    const c = compileQuery(collection, { groupBy: 'items.sku', aggregate: { q: { sum: 'items.qty' } } }, { arrayPaths: ['items'] })
+    const c = compileQuery(collection, { groupBy: 'items.sku', aggregate: { q: { sum: 'items.qty' } }, perRecord: true }, { arrayPaths: ['items'] })
     expect(c.kind === 'aggregate' && c.nested).toEqual({ path: 'items', route: 'lateral' })
   })
 
-  it('rejects two different arrays or mixing levels', () => {
+  it('rejects two different arrays', () => {
     expect(() => compileQuery(collection, { groupBy: 'votes.category_id', aggregate: { q: { sum: 'items.qty' } } }, { arrayPaths: ['items'] })).toThrow(/one nested array/)
-    expect(() => compile({ groupBy: 'votes.category_id', aggregate: { q: { sum: 'price' } } })).toThrow(/one level at a time/)
   })
 })
 
@@ -345,10 +361,10 @@ describe('compileQuery: group_by with several keys', () => {
     const { sql } = compile({ groupBy: ['votes.chamber', 'votes.label'], aggregate: { n: 'count' } })
     expect(sql).toContain('AS "votes.chamber"')
     expect(sql).toContain('AS "votes.label"')
-    expect(sql).toContain('GROUP BY 1, 2, 3')
+    expect(sql).toContain('GROUP BY 1, 2 ')
     const mixed = compile({ groupBy: ['status', 'votes.label'], aggregate: { n: 'count' } }).sql
-    expect(mixed).toContain('t.data->>$')
-    expect(mixed).toContain('to_jsonb(c."p_label") AS "votes.label"')
+    expect(mixed).toContain(`NULLIF(to_jsonb(t."p_status"), 'null'::jsonb) AS "status"`)
+    expect(mixed).toContain(`NULLIF(to_jsonb(c."p_label"), 'null'::jsonb) AS "votes.label"`)
   })
 
   it('rejects more than three keys and keys on different arrays', () => {
@@ -405,14 +421,16 @@ describe('compileQuery: projected nested object paths', () => {
     ])
   })
 
-  it('falls back to the document for literals of another type, $exists, $contains and boolean ranges', () => {
-    const { sql, params } = run({ filter: { 'totals.veterans.points': '7', 'owner.name': { $exists: true, $contains: 'x' } } })
-    expect(sql).toContain('t.data @> $1::jsonb')
+  it('falls back to the document for literals of another type, $contains, mixed $exists and boolean ranges', () => {
+    const { sql, params } = run({ filter: { 'totals.veterans.points': '7', 'owner.name': { $contains: 'x' } } })
+    expect(sql).toContain('(t.data @> $1::jsonb OR t.data @> $2::jsonb)')
     expect(params[0]).toBe('{"totals":{"veterans":{"points":"7"}}}')
-    expect(sql).toContain('t.data #> $2::text[] IS NOT NULL')
     expect(sql).toContain('ILIKE')
     expect(sql).not.toContain('p_totals_veterans_points')
     expect(sql).not.toContain('p_owner_name')
+    // $exists uses the column only while every stored value fits it.
+    expect(run({ filter: { 'owner.name': { $exists: true } } }).sql).toContain('t."p_owner_name" IS NOT NULL')
+    expect(run({ filter: { 'owner.name': { $exists: true } } }, withMixed('owner.name')).sql).toContain('t.data #> $1::text[] IS NOT NULL')
     // The document route rejects a boolean range; the column must not accept it either.
     expect(() => run({ filter: { 'owner.active': { $gt: true } } })).toThrow(/requires a number or string operand/)
   })
@@ -453,11 +471,13 @@ describe('compileQuery: projected nested object paths', () => {
     }
   })
 
-  it('aggregates numbers from the column exactly and groups by the document text', () => {
+  it('aggregates numbers from the column exactly and groups by the typed key', () => {
     const { sql } = run({ groupBy: 'owner.name', aggregate: { pts: { sum: 'totals.veterans.points' }, hi: { max: 'totals.veterans.points' } } })
     expect(sql).toContain('to_jsonb(sum(t."p_totals_veterans_points"::text::numeric)) AS "pts"')
-    expect(sql).toContain('coalesce(to_jsonb(max(t."p_totals_veterans_points"::text::numeric)), to_jsonb(max(t.data #>> $')
-    expect(sql).toContain('t.data #>> $1::text[] AS "owner.name"')
+    expect(sql).toContain('coalesce(to_jsonb(max(t."p_totals_veterans_points"::text::numeric)), to_jsonb(bool_or(')
+    expect(sql).toContain(`NULLIF(to_jsonb(t."p_owner_name"), 'null'::jsonb) AS "owner.name"`)
+    // A mixed projection groups by the document value instead.
+    expect(run({ groupBy: 'owner.name', aggregate: { n: 'count' } }, withMixed('owner.name')).sql).toContain(`NULLIF(t.data #> $1::text[], 'null'::jsonb) AS "owner.name"`)
   })
 
   it('explains an unprojected nested path in the clause note', () => {
@@ -472,7 +492,143 @@ describe('compileQuery: projected nested object paths', () => {
 
   it('treats a key that is not a valid dotted path as a literal top-level key', () => {
     const { sql, params } = run({ filter: { 'a b.c': 1, 'x..y': 2 } })
+    expect(sql).toContain('(t.data @> $1::jsonb OR t.data @> $2::jsonb)')
+    expect(params.slice(0, 4)).toEqual(['{"a b.c":1}', '{"a b.c":[1]}', '{"x..y":2}', '{"x..y":[2]}'])
+  })
+})
+
+describe('compileQuery: arrays of scalars in filters', () => {
+  it('equality matches the value or an array holding it, both through the GIN', () => {
+    const { sql, params, compiled } = compile({ filter: { tags: 'hiking' } })
+    expect(sql).toContain('(t.data @> $1::jsonb OR t.data @> $2::jsonb)')
+    expect(params.slice(0, 2)).toEqual(['{"tags":"hiking"}', '{"tags":["hiking"]}'])
+    expect(compiled.clauses).toEqual([{ label: 'filter on tags', indexes: ['hc_12_data_gin_idx'] }])
+  })
+
+  it('an array value keeps containment: every listed element must be present', () => {
+    const { sql, params } = compile({ filter: { tags: ['hiking', 'snow'] } })
     expect(sql).toContain('t.data @> $1::jsonb')
-    expect(params[0]).toBe('{"a b.c":1,"x..y":2}')
+    expect(sql).not.toContain(' OR ')
+    expect(params[0]).toBe('{"tags":["hiking","snow"]}')
+  })
+
+  it('$in is one lax jsonpath predicate (scalar or any element), served by the GIN; $nin negates it', () => {
+    const inList = compile({ filter: { tags: { $in: ['hiking', 'snow'] } } })
+    expect(inList.sql).toContain('t.data @? $1::jsonpath')
+    expect(inList.params[0]).toBe('$."tags" ? (@ == "hiking" || @ == "snow")')
+    expect(inList.compiled.clauses[0].indexes).toEqual(['hc_12_data_gin_idx'])
+    const nin = compile({ filter: { tags: { $nin: ['hiking'] } } })
+    expect(nin.sql).toContain('NOT t.data @? $1::jsonpath')
+    expect(nin.compiled.clauses[0].indexes).toEqual([])
+  })
+
+  it('$contains, comparisons and $ne look inside arrays too, and are never reported as indexed', () => {
+    const c = compile({ filter: { tags: { $contains: 'hik' } } })
+    expect(c.sql).toContain('jsonb_array_elements(t.data->$')
+    expect(c.sql).toContain('ILIKE')
+    expect(c.compiled.clauses[0].indexes).toEqual([])
+    const gt = compile({ filter: { nums: { $gt: 3 } } })
+    expect(gt.sql).toContain("jsonb_typeof(arr_el.v) = 'number' AND (arr_el.v #>> '{}')::numeric > $")
+    const ne = compile({ filter: { tags: { $ne: 'x' } } })
+    expect(ne.sql).toContain('NOT (t.data @> $1::jsonb OR t.data @> $2::jsonb)')
+    expect(ne.compiled.clauses[0].indexes).toEqual([])
+  })
+
+  it('explains $contains with an array operand', () => {
+    expect(() => compile({ filter: { tags: { $contains: ['hiking'] } } })).toThrow(/\$contains requires a string operand.*\$in/)
+  })
+
+  it('a mixed projection answers from the column plus the array elements it cannot hold', () => {
+    const mixed: StorageRegistry = { ...registry, projections: registry.projections.map((p) => (p.field === 'price' ? { ...p, mixed: true } : p)) }
+    const run = (filter: Record<string, unknown>) => {
+      const c = compileQuery({ id: 12, storage: mixed }, { filter })
+      return { sql: dialect.sqlToQuery(c.query).sql, clauses: c.clauses }
+    }
+    const eq = run({ price: 5 })
+    expect(eq.sql).toContain('(t."p_price" = $1::float8 OR t.data @> $2::jsonb)')
+    expect(eq.clauses[0].indexes).toEqual(['hc_12_p_price_idx', 'hc_12_data_gin_idx'])
+    expect(run({ price: { $ne: 5 } }).sql).toContain('(t."p_price" IS DISTINCT FROM $1::float8 AND NOT (jsonb_typeof(t.data->$2::text) = \'array\'')
+    expect(run({ price: { $in: [5, 6] } }).sql).toContain('(t."p_price" IN ($1::float8, $2::float8) OR (jsonb_typeof(')
+    expect(run({ price: { $exists: true } }).sql).toContain('t.data ? $1::text')
+    // Unmixed: the column alone is exact.
+    expect(compile({ filter: { price: 5 } }).sql).not.toContain('@>')
+  })
+
+  it('the lateral route filters elements with the same semantics', () => {
+    const c = compileQuery(collection, { filter: { 'items.sku': 'a' }, groupBy: 'items.sku' }, { arrayPaths: ['items'] })
+    expect(dialect.sqlToQuery(c.query).sql).toContain('(e.val @> $')
+  })
+})
+
+describe('sortKeys and multi-key sort', () => {
+  it('splits a comma list or an array, at most three keys', () => {
+    expect(sortKeys('-points, name')).toEqual(['-points', 'name'])
+    expect(sortKeys(['-points', 'name'])).toEqual(['-points', 'name'])
+    expect(sortKeys(undefined)).toEqual([])
+    expect(sortKeys('')).toEqual([])
+    expect(() => sortKeys('a,b,c,d')).toThrow(/at most 3 keys/)
+    expect(() => sortKeys('a,,b')).toThrow(/Invalid sort field ''/)
+  })
+
+  it('orders records by each key in turn, then the row id', () => {
+    const { sql, compiled } = compile({ sort: '-price,status' })
+    expect(sql).toContain('ORDER BY t."p_price" DESC NULLS LAST, t."p_status" ASC NULLS LAST, t.id ASC LIMIT')
+    expect(compiled.clauses.map((c) => c.label)).toEqual(['sort on price', 'sort on status'])
+    if (compiled.kind !== 'records') throw new Error('expected records')
+    expect(compiled.nullsLast).toBeUndefined()
+  })
+
+  it('orders aggregate rows by several aliases and keys', () => {
+    const { sql } = compile({ groupBy: ['status', 'day'], aggregate: { n: 'count', s: { sum: 'price' } }, sort: ['-n', '-s', 'day'] })
+    expect(sql).toMatch(/ORDER BY 3 DESC NULLS LAST, 4 DESC NULLS LAST, 2 ASC NULLS LAST, 1 ASC LIMIT/)
+    expect(() => compile({ groupBy: 'status', aggregate: { n: 'count' }, sort: '-n,nope' })).toThrow(/Invalid sort field 'nope' for an aggregate query/)
+  })
+})
+
+describe('compileQuery: aggregates over booleans and arrays of scalars', () => {
+  it('sums booleans as 1/0 and takes min/max of booleans as booleans', () => {
+    const { sql } = compile({ aggregate: { yes: { sum: 'active' }, share: { avg: 'flag' }, lo: { min: 'flag' } } })
+    // active is an unmixed boolean projection: its column, as an integer.
+    expect(sql).toContain('to_jsonb(sum(t."p_active"::int::numeric)) AS "yes"')
+    expect(sql).toContain("WHEN 'boolean' THEN CASE WHEN (t.data->$")
+    expect(sql).toContain('to_jsonb(bool_and(CASE WHEN jsonb_typeof(t.data->$')
+    // Untyped fields carry a hidden type check; typed columns do not.
+    expect(sql).toContain('AS "__type_0"')
+    expect(sql).not.toContain('"__type_1"')
+  })
+
+  it('groups a key that holds arrays per element (lateral unnest), keeping the JSON type', () => {
+    const c = compileQuery(collection, { groupBy: 'tags', aggregate: { n: 'count', s: { sum: 'price' } } }, { scalarArrayKeys: ['tags'] })
+    const sql = dialect.sqlToQuery(c.query).sql
+    expect(sql).toContain('FROM "hc_12" t, LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(t.data->$')
+    expect(sql).toContain(`AS g0(val)`)
+    expect(sql).toContain(`NULLIF(g0.val, 'null'::jsonb) AS "tags"`)
+  })
+})
+
+describe('typeCheckWarnings', () => {
+  const checks = [{ alias: 's', op: 'sum', field: 'name', column: '__type_0' }]
+  it('fails when every group met only unsupported types, naming them', () => {
+    expect(() => typeCheckWarnings(checks, [{ s: null, __type_0: 'string' }])).toThrow(/sum 's' over 'name' found string values.*booleans count as 1/)
+  })
+  it('warns when only some groups did, and is silent otherwise', () => {
+    expect(typeCheckWarnings(checks, [{ s: null, __type_0: 'string' }, { s: 3, __type_0: 'string' }])).toEqual([
+      "sum 's' over 'name' is null in 1 of 2 groups, whose values are string: sum and avg take numbers and booleans only.",
+    ])
+    expect(typeCheckWarnings(checks, [{ s: null, __type_0: null }])).toEqual([])
+  })
+})
+
+describe('summarizePlan: plan text agrees with indexed', () => {
+  it('names an index that serves none of the clauses as such', () => {
+    const report = summarizePlan(
+      { 'Node Type': 'Limit', Plans: [{ 'Node Type': 'Index Scan', 'Index Name': 'hc_12_created_at_idx', 'Relation Name': 'hc_12' }] },
+      'hc_12',
+      [{ label: 'filter on asker.user_id', indexes: ['hc_12_data_gin_idx'], note: "'asker.user_id' is a nested object path with no projection" }],
+    )
+    expect(report.indexed).toBe(false)
+    expect(report.plan).toBe("Index Scan using hc_12_created_at_idx on hc_12, serving none of the query's clauses")
+    expect(report.reason).toMatch(/hc_12_created_at_idx only supplied row order or the live-row check/)
+    expect(report.reason!.match(/evaluated over the stored documents/g)).toHaveLength(1)
   })
 })

@@ -3,8 +3,6 @@ import { sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import {
   AGGREGATION_OPS,
-  buildFilterConditions,
-  buildOperatorCondition,
   escapeBucket,
   isOperatorSpec,
   MAX_GROUP_BY_KEYS,
@@ -72,11 +70,26 @@ const EXPLAIN_TTL_MS = 60_000;
 const IN_LIST_LIMIT = 1000;
 const PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
 
+/** Most sort keys one query takes ("-points,name" or ["-points", "name"]). */
+export const MAX_SORT_KEYS = 3;
+
 export const SORT_HELP =
   "sort accepts a top-level field, a dotted path into nested objects (a.b.c), created_at or updated_at — " +
-  "and with group_by/aggregate, an aggregate alias or a group_by key — optionally prefixed with - for descending";
+  "and with group_by/aggregate, an aggregate alias or a group_by key — optionally prefixed with - for descending; " +
+  `up to ${MAX_SORT_KEYS} keys as a comma-separated list or an array, the first deciding first`;
 
 type Collection = { id: number; storage: unknown };
+
+/**
+ * QueryParams as the table layout takes them: `sort` may also be an array
+ * of keys, and `perRecord` keeps one row per parent record in aggregates
+ * over a nested array.
+ */
+export type TableQueryParams = Omit<QueryParams, "collectionId" | "sort"> & {
+  sort?: string | string[];
+  /** Aggregates over an array of objects: one row per parent record and group (with `record` attached) instead of totals across parents. */
+  perRecord?: boolean;
+};
 
 export type IndexReport = { indexed: boolean; plan: string; reason?: string };
 
@@ -95,6 +108,8 @@ export type TableAggregateResult = {
   total: number;
   count: number;
   limit: number;
+  /** Aggregates that came back null for some groups because of the field's value types. */
+  warnings?: string[];
 } & IndexReport;
 
 /**
@@ -125,14 +140,19 @@ export type CompiledQuery =
       kind: "aggregate";
       query: SQL;
       limit: number;
+      /** Set when rows are per parent record (perRecord), so the parent can be attached. */
       nested: { path: string; route: "child" | "lateral" } | null;
       stripPaths: string[];
       clauses: Clause[];
+      /** sum/avg aggregates and the hidden column naming an unsupported value type they met. */
+      typeChecks: { alias: string; op: string; field: string; column: string }[];
     };
 
 export type CompileOptions = {
   /** First segments of dotted fields that hold arrays of objects but are not unwound. */
   arrayPaths?: Iterable<string>;
+  /** group_by keys (top-level or object paths) that hold arrays of scalars in some document: grouped per element. */
+  scalarArrayKeys?: Iterable<string>;
 };
 
 // ── Paths ────────────────────────────────────────────────────────────────────
@@ -291,13 +311,167 @@ function jsonpathIndexable(conds: PathCondition[]): boolean {
   return conds.every((c) => c.op === null || c.op === "$in");
 }
 
+// ── Document conditions (scalars and arrays of scalars) ──────────────────────
+
+/**
+ * Where a field's value sits in a document: a top-level key or a nested
+ * object path, below the parent document (`t.data`) or an unnested array
+ * element (`e.val`).
+ */
+type DocTarget = {
+  /** The jsonb value at the field; SQL NULL when absent. */
+  json: SQL;
+  /** Its text form (`->>` / `#>>`). */
+  text: SQL;
+  /** Containment of `value` at the field: what the GIN serves. */
+  contains: (value: unknown) => SQL;
+  /** The document column and the field's jsonpath, for `@?` predicates. */
+  data: SQL;
+  jsonpath: string;
+  /** Set for a top-level key: `$exists` tests the key with `?`. */
+  key?: string;
+};
+
+function keyTarget(data: SQL, key: string): DocTarget {
+  return {
+    json: sql`${data}->${key}::text`,
+    text: sql`${data}->>${key}::text`,
+    contains: (value) => sql`${data} @> ${JSON.stringify({ [key]: value })}::jsonb`,
+    data,
+    jsonpath: `$${jsonpathKey(key)}`,
+    key,
+  };
+}
+
+function pathTarget(data: SQL, segments: string[]): DocTarget {
+  return {
+    json: sql`${data} #> ${pathArray(segments)}`,
+    text: sql`${data} #>> ${pathArray(segments)}`,
+    contains: (value) => sql`${data} @> ${JSON.stringify(nestValue(segments, value))}::jsonb`,
+    data,
+    jsonpath: `$${segments.map(jsonpathKey).join("")}`,
+  };
+}
+
+function isScalar(value: unknown): value is string | number | boolean {
+  return typeof value === "string" || typeof value === "boolean" || (typeof value === "number" && Number.isFinite(value));
+}
+
+function likePattern(operand: string): string {
+  return `%${operand.replace(/[\\%_]/g, (m) => `\\${m}`)}%`;
+}
+
+function assertOperand(op: string, operand: unknown): void {
+  if (Object.hasOwn(COMPARISONS, op)) {
+    if (typeof operand !== "number" && typeof operand !== "string") throw new Error(`${op} requires a number or string operand`);
+  } else if (op === "$in" || op === "$nin") {
+    if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
+    if (operand.length > IN_LIST_LIMIT) throw new Error(`$in/$nin arrays are limited to ${IN_LIST_LIMIT} elements`);
+  } else if (op === "$exists") {
+    if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+  } else if (op === "$contains") {
+    if (typeof operand !== "string") {
+      throw new Error("$contains requires a string operand (a case-insensitive substring). To match array elements exactly use {\"field\": \"value\"}, {\"field\": {\"$in\": [...]}}, or {\"field\": [\"a\", \"b\"]} for all of them");
+    }
+  } else if (op !== "$ne") {
+    throw new Error(`Unsupported filter operator '${op}'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains`);
+  }
+}
+
+/**
+ * A positive condition on one jsonb value (a field's value, or one element
+ * of an array held there): equality (op null), comparisons, $in and
+ * $contains. Comparisons and $contains only see values of the operand's
+ * type, as in the shared layout.
+ */
+function valueMatch(json: SQL, text: SQL, op: string | null, operand: unknown): SQL {
+  if (op === null) return sql`${json} = ${JSON.stringify(operand)}::jsonb`;
+  if (Object.hasOwn(COMPARISONS, op)) {
+    const cmp = sql.raw(COMPARISONS[op]);
+    return typeof operand === "number"
+      ? sql`(jsonb_typeof(${json}) = 'number' AND (${text})::numeric ${cmp} ${operand})`
+      : sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ${cmp} ${operand})`;
+  }
+  if (op === "$in") {
+    const list = operand as unknown[];
+    if (list.length === 0) return sql`false`;
+    return sql`${json} = ANY(ARRAY[${sql.join(list.map((v) => sql`${JSON.stringify(v)}::jsonb`), sql`, `)}])`;
+  }
+  if (op === "$contains") return sql`(jsonb_typeof(${json}) = 'string' AND (${text}) ILIKE ${likePattern(operand as string)})`;
+  throw new Error(`valueMatch: unexpected operator ${op}`);
+}
+
+/** Some element of the array held at the target matches (false when it holds no array). */
+function anyElement(t: DocTarget, op: string | null, operand: unknown): SQL {
+  const el = sql`arr_el.v`;
+  return sql`(jsonb_typeof(${t.json}) = 'array' AND EXISTS (SELECT 1 FROM jsonb_array_elements(${t.json}) AS arr_el(v) WHERE ${valueMatch(el, sql`${el} #>> '{}'`, op, operand)}))`;
+}
+
+/** $in as one jsonpath predicate: lax mode tests a scalar and each element of an array alike, and the GIN serves it. */
+function inJsonpath(t: DocTarget, list: unknown[]): SQL | null {
+  const lits = list.map(jsonpathLiteral);
+  if (lits.length === 0 || lits.some((l) => l === null)) return null;
+  return sql`${t.data} @? ${`${t.jsonpath} ? (${lits.map((l) => `@ == ${l}`).join(" || ")})`}::jsonpath`;
+}
+
+type Compiled = { condition: SQL; indexable: boolean };
+
+/**
+ * One filter condition evaluated over the document, with Mongo semantics
+ * for arrays of scalars: a value matches a field holding an array when
+ * some element matches (equality, $in, comparisons, $contains), and $ne /
+ * $nin match when no element does (or the field is absent). An object or
+ * array operand keeps plain containment ({"tags": ["a", "b"]} needs both).
+ */
+function documentCondition(t: DocTarget, op: string | null, operand: unknown): Compiled {
+  if (op !== null) assertOperand(op, operand);
+  if (op === null || op === "$ne") {
+    const match = isScalar(operand) ? sql`(${t.contains(operand)} OR ${t.contains([operand])})` : t.contains(operand);
+    return op === null ? { condition: match, indexable: true } : { condition: sql`NOT ${match}`, indexable: false };
+  }
+  if (op === "$in" || op === "$nin") {
+    const list = operand as unknown[];
+    if (list.length === 0) return { condition: op === "$in" ? sql`false` : sql`true`, indexable: false };
+    const viaPath = inJsonpath(t, list);
+    const match = viaPath ?? sql`coalesce(${valueMatch(t.json, t.text, "$in", list)} OR ${anyElement(t, "$in", list)}, false)`;
+    return op === "$in" ? { condition: match, indexable: viaPath !== null } : { condition: sql`NOT ${match}`, indexable: false };
+  }
+  if (op === "$exists") {
+    const present = t.key !== undefined ? sql`${t.data} ? ${t.key}::text` : sql`${t.json} IS NOT NULL`;
+    return { condition: operand ? present : sql`NOT (${present})`, indexable: false };
+  }
+  // Comparisons and $contains.
+  return { condition: sql`(${valueMatch(t.json, t.text, op, operand)} OR ${anyElement(t, op, operand)})`, indexable: false };
+}
+
+/**
+ * A condition on a field that has a projection column. The column answers
+ * exactly when the literal has the column's type and, for a projection
+ * flagged `mixed` (some document holds another type there, such as an
+ * array), together with the array elements the column cannot see.
+ * Returns null when the column can't help; the caller uses the document.
+ */
+function projectedCondition(t: DocTarget, column: SQL, projection: Projection, op: string | null, operand: unknown): SQL | null {
+  if (op === "$exists") {
+    // Without misfits every present value fits the column, so presence is NOT NULL.
+    if (projection.mixed || typeof operand !== "boolean") return null;
+    return operand ? sql`${column} IS NOT NULL` : sql`${column} IS NULL`;
+  }
+  const routed = columnCondition(column, projection.type, op, operand, projection.mixed);
+  if (!routed || !projection.mixed) return routed;
+  if (op === "$ne" || op === "$nin") {
+    const positive = op === "$ne" ? null : "$in";
+    return sql`(${routed} AND NOT ${anyElement(t, positive, operand)})`;
+  }
+  const elements = op === null && isScalar(operand) ? t.contains([operand]) : anyElement(t, op, operand);
+  return sql`(${routed} OR ${elements})`;
+}
+
 // ── Filter compilation ───────────────────────────────────────────────────────
 
 type ChildGroup = {
   unwind: Unwind;
   conditions: SQL[];
-  /** The same conditions as a plain filter over one element (for the lateral route). */
-  raw: Record<string, unknown>;
 };
 
 type ParsedFilter = {
@@ -305,6 +479,10 @@ type ParsedFilter = {
   parent: SQL[];
   /** Per unwound path: child-column conditions (for EXISTS / child aggregates). */
   child: Map<string, ChildGroup>;
+  /** Per array path: every condition on it as a filter over one element (key = path below the element). */
+  nestedRaw: Map<string, Record<string, unknown>>;
+  /** Array paths with a condition no child column can serve. */
+  unrouted: Set<string>;
   clauses: Clause[];
 };
 
@@ -322,38 +500,36 @@ type Ctx = {
 };
 
 function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter {
-  const { registry, parent: parentTable, gin } = ctx;
+  const { registry, parent: parentTable } = ctx;
   const parent: SQL[] = [];
   const child = new Map<string, ChildGroup>();
   const clauses: Clause[] = [];
-  const plainFallback: Record<string, unknown> = {};
   const data = sql`t.data`;
   // Dotted conditions that could not use a child column, grouped by their
   // first segment so they compile to one jsonpath predicate per path.
   const leftovers = new Map<string, PathCondition[]>();
+  const nestedRaw = new Map<string, Record<string, unknown>>();
   const uniqueKey = registry.unique_key ?? [];
 
   for (const [key, value] of Object.entries(filter)) {
     const parsed = parsePath(registry, ctx.arrayPaths, key);
 
     if (parsed.kind === "object") {
-      parent.push(...objectPathConditions(ctx, key, parsed.segments, value, clauses));
+      parent.push(...fieldConditions(ctx, key, pathTarget(data, parsed.segments), findPathProjection(registry, parsed.segments), value, clauses, unprojectedNote(key)));
       continue;
     }
 
     if (parsed.kind === "nested") {
       const { path, rest, unwind } = parsed;
       const column = rest.length === 1 ? unwind?.fields.find((f) => f.field === rest[0]) : undefined;
+      const raw = nestedRaw.get(path) ?? {};
+      raw[rest.join(".")] = value;
+      nestedRaw.set(path, raw);
       for (const cond of entries(value)) {
         const routed = unwind && column ? columnCondition(sql`c.${ident(column.column)}`, column.type, cond.op, cond.operand) : null;
         if (routed && unwind && column) {
-          const group = child.get(path) ?? { unwind, conditions: [], raw: {} };
+          const group = child.get(path) ?? { unwind, conditions: [] };
           group.conditions.push(routed);
-          if (cond.op === null) group.raw[rest[0]] = cond.operand;
-          else {
-            const prev = group.raw[rest[0]];
-            group.raw[rest[0]] = { ...(isOperatorSpec(prev) ? prev : {}), [cond.op]: cond.operand };
-          }
           child.set(path, group);
           clauses.push({ label: `filter on ${key}`, indexes: [indexName(unwind.table, column.column)] });
         } else {
@@ -365,28 +541,15 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
       continue;
     }
 
+    // Equality on a unique-key field compares the uk_<n> generated column,
+    // which the partial unique index serves.
     const projection = findProjection(registry, key);
-    if (!isOperatorSpec(value)) {
-      const routed = projection ? columnCondition(sql`t.${ident(projection.column)}`, projection.type, null, value) : null;
-      if (routed && projection) {
-        parent.push(routed);
-        clauses.push({ label: `filter on ${key}`, indexes: [indexName(parentTable, projection.column)] });
-      } else if (uniqueKey.includes(key) && value !== undefined) {
-        // Equality on a unique-key field compares the uk_<n> generated
-        // column, which the partial unique index serves.
-        parent.push(sql`t.${ident(`uk_${uniqueKey.indexOf(key)}`)} = ${JSON.stringify(value)}::jsonb`);
-        clauses.push({ label: `filter on ${key}`, indexes: [`${parentTable}_uk`] });
-      } else {
-        plainFallback[key] = value;
-        clauses.push({ label: `filter on ${key}`, indexes: [gin] });
-      }
+    if (!isOperatorSpec(value) && uniqueKey.includes(key) && value !== undefined && !(projection && valueFitsType(projection.type, value))) {
+      parent.push(sql`t.${ident(`uk_${uniqueKey.indexOf(key)}`)} = ${JSON.stringify(value)}::jsonb`);
+      clauses.push({ label: `filter on ${key}`, indexes: [`${parentTable}_uk`] });
       continue;
     }
-    for (const [op, operand] of Object.entries(value)) {
-      const routed = projection ? columnCondition(sql`t.${ident(projection.column)}`, projection.type, op, operand, projection.mixed) : null;
-      parent.push(routed ?? buildOperatorCondition(key, op, operand, null, data));
-      clauses.push({ label: `filter on ${key} (${op})`, indexes: routed && projection ? [indexName(parentTable, projection.column)] : [] });
-    }
+    parent.push(...fieldConditions(ctx, key, keyTarget(data, key), projection, value, clauses));
   }
 
   for (const [path, conds] of leftovers) {
@@ -394,12 +557,11 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
     for (const c of conds) {
       clauses.push({
         label: `filter on ${[path, ...c.segments].join(".")}${c.op ? ` (${c.op})` : ""}`,
-        indexes: jsonpathIndexable([c]) ? [gin] : [],
+        indexes: jsonpathIndexable([c]) ? [ctx.gin] : [],
       });
     }
   }
-  if (Object.keys(plainFallback).length > 0) parent.unshift(...buildFilterConditions(plainFallback, data));
-  return { parent, child, clauses };
+  return { parent, child, nestedRaw, unrouted: new Set(leftovers.keys()), clauses };
 }
 
 /** {a: {b: {c: value}}} for path [a, b, c]: the containment shape of a nested equality. */
@@ -408,7 +570,7 @@ function nestValue(segments: string[], value: unknown): Record<string, unknown> 
 }
 
 function unprojectedNote(field: string): string {
-  return `'${field}' is a nested object path with no projection, so it is evaluated over the stored documents`;
+  return `'${field}' is a nested object path with no projection`;
 }
 
 function mixedNote(field: string): string {
@@ -416,33 +578,39 @@ function mixedNote(field: string): string {
 }
 
 /**
- * Conditions on a dotted path into nested objects. Each condition uses the
- * path's projection column when one exists and the column comparison means
- * the same as the document's; otherwise the document expression, which is
- * the shared layout's (containment for equality, `#>` / `#>>` for
- * operators) minus its literal top-level key fallback.
+ * Conditions on a top-level key or a nested object path. Each condition
+ * uses the field's projection column where the column comparison means
+ * the same as the document's; otherwise the document (documentCondition).
+ * `note` explains an unprojected nested path in the response's reason.
  */
-function objectPathConditions(ctx: Ctx, key: string, segments: string[], value: unknown, clauses: Clause[]): SQL[] {
-  const projection = findPathProjection(ctx.registry, segments);
+function fieldConditions(ctx: Ctx, key: string, target: DocTarget, projection: Projection | undefined, value: unknown, clauses: Clause[], note?: string): SQL[] {
   const out: SQL[] = [];
   for (const cond of entries(value)) {
     const label = `filter on ${key}${cond.op ? ` (${cond.op})` : ""}`;
-    const routed = projection ? columnCondition(sql`t.${ident(projection.column)}`, projection.type, cond.op, cond.operand, projection.mixed) : null;
+    const routed = projection ? projectedCondition(target, sql`t.${ident(projection.column)}`, projection, cond.op, cond.operand) : null;
     if (routed && projection) {
       out.push(routed);
-      clauses.push({ label, indexes: [indexName(ctx.parent, projection.column)] });
+      const indexes = [indexName(ctx.parent, projection.column), ...(projection.mixed && cond.op === null ? [ctx.gin] : [])];
+      clauses.push({ label, indexes });
       continue;
     }
-    const note = projection ? undefined : unprojectedNote(key);
-    if (cond.op === null) {
-      out.push(sql`t.data @> ${JSON.stringify(nestValue(segments, cond.operand))}::jsonb`);
-      clauses.push({ label, indexes: [ctx.gin], ...(note ? { note } : {}) });
-    } else {
-      out.push(buildOperatorCondition(key, cond.op, cond.operand, segments, sql`t.data`, false));
-      clauses.push({ label, indexes: [], ...(note ? { note } : {}) });
-    }
+    const compiled = documentCondition(target, cond.op, cond.operand);
+    out.push(compiled.condition);
+    clauses.push({ label, indexes: compiled.indexable ? [ctx.gin] : [], ...(note && !projection ? { note } : {}) });
   }
   return out;
+}
+
+/**
+ * The lateral route's conditions on one unnested element (`e.val`), same
+ * semantics as on a document; keys are paths below the element.
+ */
+function elementConditions(raw: Record<string, unknown>): SQL[] {
+  return Object.entries(raw).flatMap(([key, value]) => {
+    const segments = key.split(".");
+    const target = segments.length > 1 ? pathTarget(sql`e.val`, segments) : keyTarget(sql`e.val`, key);
+    return entries(value).map((c) => documentCondition(target, c.op, c.operand).condition);
+  });
 }
 
 function existsConditions(parsed: ParsedFilter, except?: string): SQL[] {
@@ -456,6 +624,22 @@ function existsConditions(parsed: ParsedFilter, except?: string): SQL[] {
 
 // ── Sort ─────────────────────────────────────────────────────────────────────
 
+/**
+ * The sort keys of a query: one key, a comma-separated list ("-points,name")
+ * or an array, at most MAX_SORT_KEYS. Field paths never contain commas, so
+ * splitting on them is unambiguous.
+ */
+export function sortKeys(sort: string | string[] | undefined): string[] {
+  if (sort === undefined) return [];
+  const raw = Array.isArray(sort) ? sort.flatMap((s) => s.split(",")) : sort.split(",");
+  const keys = raw.map((k) => k.trim());
+  if (keys.length === 1 && keys[0] === "") return [];
+  const bad = keys.find((k) => k === "" || k === "-");
+  if (bad !== undefined) throw new Error(`Invalid sort field '${bad}' in '${Array.isArray(sort) ? sort.join(",") : sort}' — ${SORT_HELP}`);
+  if (keys.length > MAX_SORT_KEYS) throw new Error(`sort takes at most ${MAX_SORT_KEYS} keys, got ${keys.length}`);
+  return keys;
+}
+
 function parseSort(sort: string): { field: string; dir: SQL; descending: boolean } {
   const descending = sort.startsWith("-");
   const field = descending ? sort.slice(1) : sort;
@@ -465,12 +649,21 @@ function parseSort(sort: string): { field: string; dir: SQL; descending: boolean
 
 type SortKey = { orderBy: SQL; clause?: Clause; tiebreak?: SQL; descendingColumn?: SQL };
 
-function compileRecordSort(ctx: Ctx, sort: string | undefined): { orderBy: SQL; clause?: Clause; descendingColumn?: SQL } {
-  const { tiebreak, ...sorted } = compileRecordSortKey(ctx, sort);
-  // Ties (equal values, same-batch created_at) break on the row id so a
-  // page of top-N results is the same every time; as in the shared layout,
-  // in the sort's direction for created_at, updated_at and id, else ascending.
-  return { ...sorted, orderBy: sql`${sorted.orderBy}, ${tiebreak ?? (sort ? sql`t.id ASC` : sql`t.id DESC`)}` };
+function compileRecordSort(ctx: Ctx, keys: string[]): { orderBy: SQL; clauses: Clause[]; descendingColumn?: SQL } {
+  if (keys.length <= 1) {
+    const { tiebreak, clause, ...sorted } = compileRecordSortKey(ctx, keys[0]);
+    // Ties (equal values, same-batch created_at) break on the row id so a
+    // page of top-N results is the same every time; as in the shared layout,
+    // in the sort's direction for created_at, updated_at and id, else ascending.
+    return { ...sorted, clauses: clause ? [clause] : [], orderBy: sql`${sorted.orderBy}, ${tiebreak ?? (keys[0] ? sql`t.id ASC` : sql`t.id DESC`)}` };
+  }
+  // Several keys: each in turn, then the row id. Only the first key can
+  // use its index, and only for an ascending sort (best effort).
+  const compiled = keys.map((k) => compileRecordSortKey(ctx, k));
+  return {
+    orderBy: sql`${sql.join(compiled.map((c) => c.orderBy), sql`, `)}, t.id ASC`,
+    clauses: compiled.flatMap((c) => (c.clause ? [c.clause] : [])),
+  };
 }
 
 function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
@@ -532,8 +725,17 @@ function aliasIdent(alias: string): SQL {
   return sql.raw(`"${alias}"`);
 }
 
-/** Expressions for one field in a given source (parent columns, child columns or a lateral element). */
-type FieldExprs = { numeric: SQL; text: SQL; jsonb: SQL };
+/**
+ * Expressions for one field in a given source (parent columns, child
+ * columns or a lateral element):
+ * - numeric: numbers only (min/max)
+ * - sumable: numbers, and booleans as 1 (true) / 0 (false) (sum/avg)
+ * - boolean: booleans only (min/max over a boolean field)
+ * - text, jsonb: the value as text and as jsonb
+ * - group: the group_by key, keeping its JSON type
+ * - typed: the source holds only numbers or booleans (a typed column), so sum/avg need no type check
+ */
+type FieldExprs = { numeric: SQL; sumable: SQL; boolean: SQL; text: SQL; jsonb: SQL; group: SQL; typed?: boolean };
 
 /**
  * A float8 projection column as numeric for sum/avg/min/max. Through text,
@@ -545,29 +747,52 @@ function exactNumeric(column: SQL): SQL {
   return sql`${column}::text::numeric`;
 }
 
-function parentExprs(registry: StorageRegistry, field: string): FieldExprs {
-  const projection = findProjection(registry, field);
-  const numeric = projection?.type === "number"
-    ? exactNumeric(sql`t.${ident(projection.column)}`)
-    : sql`CASE WHEN jsonb_typeof(t.data->${field}::text) = 'number' THEN (t.data->>${field}::text)::numeric END`;
-  return { numeric, text: sql`t.data->>${field}::text`, jsonb: sql`t.data->${field}::text` };
+/** Expressions over a jsonb value `json` (with text form `text`) read from a document or element. */
+function documentExprs(json: SQL, text: SQL): FieldExprs {
+  return {
+    numeric: sql`CASE WHEN jsonb_typeof(${json}) = 'number' THEN (${text})::numeric END`,
+    sumable: sql`CASE jsonb_typeof(${json}) WHEN 'number' THEN (${text})::numeric WHEN 'boolean' THEN CASE WHEN (${json})::boolean THEN 1 ELSE 0 END END`,
+    boolean: sql`CASE WHEN jsonb_typeof(${json}) = 'boolean' THEN (${json})::boolean END`,
+    text,
+    jsonb: json,
+    group: json,
+  };
 }
 
-/** A nested object path: numbers from its projection when it has one, everything else from the document. */
+/**
+ * Use a projection column where it reads the same as the document: numbers
+ * always (a column never holds a value the document doesn't, and misfits
+ * aren't numbers); sums of booleans and group keys only while no other
+ * value type is stored at the field.
+ */
+function withProjection(exprs: FieldExprs, projection: Projection | undefined): FieldExprs {
+  if (!projection) return exprs;
+  const col = sql`t.${ident(projection.column)}`;
+  const out = { ...exprs };
+  if (projection.type === "number") out.numeric = exactNumeric(col);
+  if (projection.type === "boolean") out.boolean = col;
+  if (!projection.mixed) {
+    if (projection.type === "number") out.sumable = exactNumeric(col);
+    if (projection.type === "boolean") out.sumable = sql`${col}::int::numeric`;
+    out.group = sql`to_jsonb(${col})`;
+    out.typed = projection.type === "number" || projection.type === "boolean";
+  }
+  return out;
+}
+
+function parentExprs(registry: StorageRegistry, field: string): FieldExprs {
+  return withProjection(documentExprs(sql`t.data->${field}::text`, sql`t.data->>${field}::text`), findProjection(registry, field));
+}
+
+/** A nested object path: from its projection where it has one, else from the document. */
 function objectExprs(registry: StorageRegistry, segments: string[]): FieldExprs {
-  const exprs = pathExprs(sql`t.data`, segments);
-  const projection: Projection | undefined = findPathProjection(registry, segments);
-  return projection?.type === "number" ? { ...exprs, numeric: exactNumeric(sql`t.${ident(projection.column)}`) } : exprs;
+  return withProjection(pathExprs(sql`t.data`, segments), findPathProjection(registry, segments));
 }
 
 /** `src #> '{...}'` expressions for a path below a document or an element. */
 function pathExprs(src: SQL, segments: string[]): FieldExprs {
   const arr = pathArray(segments);
-  return {
-    numeric: sql`CASE WHEN jsonb_typeof(${src} #> ${arr}) = 'number' THEN (${src} #>> ${arr})::numeric END`,
-    text: sql`${src} #>> ${arr}`,
-    jsonb: sql`${src} #> ${arr}`,
-  };
+  return documentExprs(sql`${src} #> ${arr}`, sql`${src} #>> ${arr}`);
 }
 
 function childExprs(unwind: Unwind, key: string): FieldExprs | null {
@@ -576,21 +801,34 @@ function childExprs(unwind: Unwind, key: string): FieldExprs | null {
   const col = sql`c.${ident(f.column)}`;
   return {
     numeric: f.type === "number" ? exactNumeric(col) : sql`NULL::numeric`,
+    sumable: f.type === "number" ? exactNumeric(col) : f.type === "boolean" ? sql`${col}::int::numeric` : sql`NULL::numeric`,
+    boolean: f.type === "boolean" ? col : sql`NULL::boolean`,
     text: f.type === "text" ? col : sql`${col}::text`,
     jsonb: sql`to_jsonb(${col})`,
+    group: sql`to_jsonb(${col})`,
+    typed: f.type === "number" || f.type === "boolean",
   };
 }
 
+/**
+ * min/max take numbers first, then booleans (false < true), then text, so
+ * a boolean field gives a boolean and a numeric field a number. sum/avg
+ * add numbers and count booleans as 1/0 (so sum of a flag is how many are
+ * true and avg the share that are).
+ */
 function aggregateExpr(op: string, f: FieldExprs): SQL {
   switch (op) {
     case "min":
-    case "max":
-      return sql`coalesce(to_jsonb(${sql.raw(op)}(${f.numeric})), to_jsonb(${sql.raw(op)}(${f.text})))`;
+    case "max": {
+      const fn = sql.raw(op);
+      const bool = sql.raw(op === "min" ? "bool_and" : "bool_or");
+      return sql`coalesce(to_jsonb(${fn}(${f.numeric})), to_jsonb(${bool}(${f.boolean})), to_jsonb(${fn}(${f.text})))`;
+    }
     case "distinct":
       return sql`array_agg(distinct ${f.text})`;
     case "sum":
     case "avg":
-      return sql`to_jsonb(${sql.raw(op)}(${f.numeric}))`;
+      return sql`to_jsonb(${sql.raw(op)}(${f.sumable}))`;
     default:
       throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
   }
@@ -613,7 +851,7 @@ function parseAggregate(aggregate: AggregateSpec | undefined): { alias: string; 
 
 // ── compile ──────────────────────────────────────────────────────────────────
 
-export function compileQuery(collection: Collection, params: Omit<QueryParams, "collectionId">, options: CompileOptions = {}): CompiledQuery {
+export function compileQuery(collection: Collection, params: TableQueryParams, options: CompileOptions = {}): CompiledQuery {
   const registry = readRegistry(collection.storage);
   const parentTable = collectionTableName(collection.id);
   const ctx: Ctx = {
@@ -623,7 +861,8 @@ export function compileQuery(collection: Collection, params: Omit<QueryParams, "
     gin: indexName(parentTable, "data_gin"),
   };
   const table = ident(parentTable);
-  const { filter, search, sort, fields, createdAfter, createdBefore, limit = DEFAULT_LIMIT, offset = 0, groupBy, aggregate, timeBucket, limitCap = DEFAULT_LIMIT_CAP } = params;
+  const { filter, search, fields, createdAfter, createdBefore, limit = DEFAULT_LIMIT, offset = 0, groupBy, aggregate, timeBucket, limitCap = DEFAULT_LIMIT_CAP } = params;
+  const keys = sortKeys(params.sort);
 
   const parsed = compileFilter(ctx, filter && Object.keys(filter).length > 0 ? filter : {});
   const clauses = [...parsed.clauses];
@@ -649,14 +888,16 @@ export function compileQuery(collection: Collection, params: Omit<QueryParams, "
       groupKeys,
       aggregate: aggregate as AggregateSpec | undefined,
       timeBucket,
-      sort,
+      sortKeys: keys,
       limit: clampedLimit,
+      perRecord: params.perRecord === true,
+      scalarArrayKeys: new Set(options.scalarArrayKeys ?? []),
     });
   }
 
   const where = sql.join([...parent, ...existsConditions(parsed)], sql` AND `);
-  const sorted = compileRecordSort(ctx, sort);
-  if (sorted.clause) clauses.push(sorted.clause);
+  const sorted = compileRecordSort(ctx, keys);
+  clauses.push(...sorted.clauses);
   const countQuery = sql`SELECT count(*)::int AS count FROM ${table} t WHERE ${where}`;
   const column = sorted.descendingColumn;
   if (column) {
@@ -685,16 +926,39 @@ export function compileQuery(collection: Collection, params: Omit<QueryParams, "
   };
 }
 
+/**
+ * The WHERE conditions (on alias `t`, live rows only) that a filter
+ * compiles to, for statements other than a query: transform's set_field.
+ */
+export function compileFilterWhere(collection: Collection, filter: Record<string, unknown>, options: CompileOptions = {}): SQL {
+  const registry = readRegistry(collection.storage);
+  const parentTable = collectionTableName(collection.id);
+  const ctx: Ctx = { registry, arrayPaths: new Set(options.arrayPaths ?? []), parent: parentTable, gin: indexName(parentTable, "data_gin") };
+  const parsed = compileFilter(ctx, filter);
+  return sql.join([sql`t.deleted_at IS NULL`, ...parsed.parent, ...existsConditions(parsed)], sql` AND `);
+}
+
+/**
+ * Aggregates. Semantics over arrays:
+ * - a group_by key holding an array of scalars (tags) groups per element:
+ *   each record counts once in the group of every element it holds; a
+ *   record without the key, or with an empty array, lands in the null group.
+ * - group_by or aggregate on a path into an array of objects ("votes.vote")
+ *   runs over the elements: one row per group value, totalled across
+ *   parents. Parent fields may be grouped and aggregated alongside; a parent
+ *   value then counts once per element. perRecord keeps one row per parent
+ *   record and group (parent_id, with the parent attached as `record`).
+ */
 function compileAggregate(
   ctx: Ctx,
   table: SQL,
   parsed: ParsedFilter,
   parent: SQL[],
   clauses: Clause[],
-  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sort?: string; limit: number },
+  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; perRecord: boolean; scalarArrayKeys: Set<string> },
 ): CompiledQuery {
   const { registry } = ctx;
-  const { groupKeys, aggregate, timeBucket, sort, limit } = params;
+  const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, perRecord, scalarArrayKeys } = params;
   const aggs = parseAggregate(aggregate);
 
   // Which nested array (if any) this aggregation runs over.
@@ -705,16 +969,15 @@ function compileAggregate(
     throw new Error(`group_by and aggregate can reference one nested array at a time, got: ${[...nestedPaths].join(", ")}`);
   }
   const path = nestedPaths.size === 1 ? [...nestedPaths][0] : null;
-  if (path && aggs.some((a) => a.field && parsePath(registry, ctx.arrayPaths, a.field).kind !== "nested")) {
-    throw new Error(`Cannot aggregate top-level fields together with fields of '${path}' — aggregate one level at a time`);
-  }
 
   const unwind = path ? findUnwind(registry, path) : undefined;
   const childFilter = path ? parsed.child.get(path) : undefined;
   // The child table serves the query only when every nested field it
-  // touches is one of the unwind's columns; otherwise unnest the array.
+  // touches (group, aggregate and filter) is one of the unwind's columns;
+  // otherwise unnest the array. Either way, conditions on the array apply
+  // to each element aggregated, not just to the parent.
   const route: "child" | "lateral" | null = !path ? null
-    : unwind && nested.every((r) => r.parsed.rest.length === 1 && unwind.fields.some((f) => f.field === r.parsed.rest[0])) ? "child"
+    : unwind && !parsed.unrouted.has(path) && nested.every((r) => r.parsed.rest.length === 1 && unwind.fields.some((f) => f.field === r.parsed.rest[0])) ? "child"
     : "lateral";
 
   const exprsFor = (field: string): FieldExprs => {
@@ -722,7 +985,7 @@ function compileAggregate(
     if (p.kind === "parent") return parentExprs(registry, field);
     if (p.kind === "object") return objectExprs(registry, p.segments);
     if (route === "child" && unwind) return childExprs(unwind, p.rest[0])!;
-    return p.rest.length === 1 ? pathExprs(sql`e.val`, p.rest) : pathExprs(sql`e.val`, p.rest);
+    return pathExprs(sql`e.val`, p.rest);
   };
 
   // Grouping keys are referenced by select-list ordinal: the key
@@ -742,7 +1005,10 @@ function compileAggregate(
     }
   };
 
-  if (path) add(sql`t.id AS parent_id`, "parent_id", true);
+  // Scalar arrays grouped per element: one lateral unnest per such key.
+  const unnests: SQL[] = [];
+
+  if (path && perRecord) add(sql`t.id AS parent_id`, "parent_id", true);
   if (timeBucket) {
     const bucket = sql.raw(`'${escapeBucket(timeBucket)}'`);
     add(sql`date_trunc(${bucket}, t.created_at) AS time_bucket`, "time_bucket", true);
@@ -750,29 +1016,53 @@ function compileAggregate(
   }
   for (const key of groupKeys) {
     const p = parsePath(registry, ctx.arrayPaths, key);
-    // Parent fields and nested object paths group as text, like the shared
-    // layout; keys of an array element keep their jsonb type.
-    const expr = p.kind === "nested" ? exprsFor(key).jsonb : exprsFor(key).text;
-    add(sql`${expr} AS ${aliasIdent(key)}`, key, true);
+    let expr: SQL;
+    if (p.kind !== "nested" && scalarArrayKeys.has(key)) {
+      const json = exprsFor(key).jsonb;
+      const alias = sql.raw(`g${unnests.length}`);
+      unnests.push(sql`LATERAL jsonb_array_elements(CASE WHEN jsonb_typeof(${json}) = 'array' AND jsonb_array_length(${json}) > 0 THEN ${json} ELSE jsonb_build_array(CASE WHEN jsonb_typeof(${json}) = 'array' THEN NULL ELSE ${json} END) END) AS ${alias}(val)`);
+      expr = sql`${alias}.val`;
+    } else {
+      expr = exprsFor(key).group;
+    }
+    // Keys keep their JSON type (a number comes back as a number); a JSON
+    // null and a missing key are the same null group.
+    add(sql`NULLIF(${expr}, 'null'::jsonb) AS ${aliasIdent(key)}`, key, true);
   }
   if (aggs.length === 0) add(sql`count(*)::int AS count`, "count", false);
+  const typeChecks: { alias: string; op: string; field: string; column: string }[] = [];
   for (const a of aggs) {
-    if (a.op === "count" || !a.field) add(sql`count(*)::int AS ${aliasIdent(a.alias)}`, a.alias, false);
-    else add(sql`${aggregateExpr(a.op, exprsFor(a.field))} AS ${aliasIdent(a.alias)}`, a.alias, false);
+    if (a.op === "count" || !a.field) {
+      add(sql`count(*)::int AS ${aliasIdent(a.alias)}`, a.alias, false);
+      continue;
+    }
+    const exprs = exprsFor(a.field);
+    add(sql`${aggregateExpr(a.op, exprs)} AS ${aliasIdent(a.alias)}`, a.alias, false);
+    if ((a.op === "sum" || a.op === "avg") && !exprs.typed) {
+      const column = `__type_${typeChecks.length}`;
+      select.push(sql`min(jsonb_typeof(${exprs.jsonb})) FILTER (WHERE jsonb_typeof(${exprs.jsonb}) IN ('string', 'array', 'object')) AS ${sql.raw(`"${column}"`)}`);
+      typeChecks.push({ alias: a.alias, op: a.op, field: a.field, column });
+    }
   }
   // Group count for the response's `total`, computed in the same statement.
   select.push(sql`count(*) OVER () AS __total`);
 
   let order: SQL[] = defaultOrder.map((n) => sql`${sql.raw(String(n))} ASC`);
-  if (sort) {
-    const { field, dir } = parseSort(sort);
-    const ordinal = ordinals.get(field);
-    if (ordinal === undefined || field === "parent_id") {
-      const accepted = [...ordinals.keys()].filter((k) => k !== "parent_id");
-      throw new Error(`Invalid sort field '${field}' for an aggregate query — sort accepts an aggregate alias or a group_by key here (${accepted.join(", ")})`);
+  if (keys.length > 0) {
+    const chosen: number[] = [];
+    const first: SQL[] = [];
+    for (const key of keys) {
+      const { field, dir } = parseSort(key);
+      const ordinal = ordinals.get(field);
+      if (ordinal === undefined || field === "parent_id") {
+        const accepted = [...ordinals.keys()].filter((k) => k !== "parent_id");
+        throw new Error(`Invalid sort field '${field}' for an aggregate query — sort accepts an aggregate alias or a group_by key here (${accepted.join(", ")})`);
+      }
+      first.push(sql`${sql.raw(String(ordinal))} ${dir} NULLS LAST`);
+      chosen.push(ordinal);
+      clauses.push({ label: `sort on ${field}`, indexes: [] });
     }
-    order = [sql`${sql.raw(String(ordinal))} ${dir} NULLS LAST`, ...order.filter((_, i) => defaultOrder[i] !== ordinal)];
-    clauses.push({ label: `sort on ${field}`, indexes: [] });
+    order = [...first, ...order.filter((_, i) => !chosen.includes(defaultOrder[i]))];
   }
 
   const where: SQL[] = [...parent, ...existsConditions(parsed, route === "child" ? path ?? undefined : undefined)];
@@ -784,11 +1074,13 @@ function compileAggregate(
     from = sql`${table} t, jsonb_array_elements(CASE WHEN jsonb_typeof(t.data->${path}::text) = 'array' THEN t.data->${path}::text ELSE '[]'::jsonb END) WITH ORDINALITY e(val, ord)`;
     // Conditions on this path were compiled for the child table (or as
     // jsonpath over the parent); on the unnested element they are the
-    // ordinary jsonb conditions over e.val.
-    if (childFilter) where.push(...buildFilterConditions(childFilter.raw, sql`e.val`));
+    // ordinary document conditions over e.val.
+    const raw = parsed.nestedRaw.get(path);
+    if (raw) where.push(...elementConditions(raw));
   } else {
     from = sql`${table} t`;
   }
+  if (unnests.length > 0) from = sql`${from}, ${sql.join(unnests, sql`, `)}`;
 
   const groupClause = group.length > 0 ? sql`GROUP BY ${sql.raw(group.join(", "))}` : sql``;
   const orderClause = order.length > 0 ? sql`ORDER BY ${sql.join(order, sql`, `)}` : sql``;
@@ -798,9 +1090,10 @@ function compileAggregate(
     kind: "aggregate",
     query,
     limit,
-    nested: path && route ? { path, route } : null,
+    nested: path && route && perRecord ? { path, route } : null,
     stripPaths: [...new Set([...registry.unwinds.map((u) => u.path), ...(path ? [path] : [])])],
     clauses,
+    typeChecks,
   };
 }
 
@@ -859,11 +1152,18 @@ export function summarizePlan(root: PlanNode, tablePrefix: string, clauses: Clau
     for (const child of node.Plans ?? []) findScan(child);
   };
   findScan(root);
-  const plan = scan ? `${scan["Node Type"]} on ${scan["Relation Name"]}` : root["Node Type"];
+  // An index scan that serves none of the caller's clauses (the default
+  // created_at order, the live-row unique index) is named as such, so the
+  // plan never reads as indexed when `indexed` is false.
+  const viaIndex = scan?.["Index Name"];
+  const plan = !scan ? root["Node Type"]
+    : viaIndex ? `${scan["Node Type"]} using ${viaIndex} on ${scan["Relation Name"]}, serving none of the query's clauses`
+    : `${scan["Node Type"]} on ${scan["Relation Name"]}`;
   const notes = [...new Set(clauses.flatMap((c) => (c.note ? [c.note] : [])))];
+  const how = viaIndex ? `${viaIndex} only supplied row order or the live-row check, and the clauses were evaluated over the stored documents` : "evaluated over the stored documents";
   const reason = clauses.length === 0
     ? "The query has no filter, search or sort to serve; rows were read in storage order."
-    : `No index served ${clauses.map((c) => c.label).join(", ")}; evaluated over the stored documents.${notes.map((n) => ` ${n}.`).join("")}`;
+    : `No index served ${clauses.map((c) => c.label).join(", ")}; ${how}.${notes.map((n) => ` ${n}.`).join("")}`;
   return { indexed: false, plan, reason };
 }
 
@@ -889,7 +1189,7 @@ async function explain(collectionId: number, query: SQL, clauses: Clause[]): Pro
 }
 
 /** First segments of every dotted field the query references. */
-function dottedHeads(params: Omit<QueryParams, "collectionId">): string[] {
+function dottedHeads(params: TableQueryParams): string[] {
   const heads = new Set<string>();
   const take = (f: string | undefined) => {
     if (!f) return;
@@ -902,8 +1202,41 @@ function dottedHeads(params: Omit<QueryParams, "collectionId">): string[] {
   for (const spec of Object.values(params.aggregate ?? {})) {
     if (isPlainObject(spec)) for (const f of Object.values(spec)) if (typeof f === "string") take(f);
   }
-  take(params.sort);
+  for (const k of sortKeys(params.sort)) take(k);
   return [...heads];
+}
+
+const scalarArrayCache = new Map<string, { isArray: boolean; expires: number }>();
+
+/**
+ * group_by keys (top-level keys or nested object paths) that hold an array
+ * in some live document, so the aggregate groups per element. A projection
+ * without misfits proves the field never holds an array; others are probed
+ * with one cached query each.
+ */
+async function detectScalarArrayKeys(collection: Collection, registry: StorageRegistry, arrayPaths: Set<string>, params: TableQueryParams): Promise<Set<string>> {
+  const out = new Set<string>();
+  const table = ident(collectionTableName(collection.id));
+  const now = Date.now();
+  for (const key of normalizeGroupBy(params.groupBy)) {
+    const parsed = parsePath(registry, arrayPaths, key);
+    if (parsed.kind === "nested") continue;
+    const segments = parsed.kind === "object" ? parsed.segments : [key];
+    const projection = parsed.kind === "object" ? findPathProjection(registry, segments) : findProjection(registry, key);
+    if (projection && !projection.mixed) continue;
+    const cacheKey = `${collection.id}:${JSON.stringify(segments)}`;
+    const cached = scalarArrayCache.get(cacheKey);
+    let isArray: boolean;
+    if (cached && cached.expires > now) {
+      isArray = cached.isArray;
+    } else {
+      const r = await db.execute(sql`SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND jsonb_typeof(data #> ${pathArray(segments)}) = 'array' LIMIT 1`);
+      isArray = r.rows.length > 0;
+      scalarArrayCache.set(cacheKey, { isArray, expires: now + EXPLAIN_TTL_MS });
+    }
+    if (isArray) out.add(key);
+  }
+  return out;
 }
 
 /**
@@ -932,6 +1265,17 @@ async function detectArrayPaths(collection: Collection, registry: StorageRegistr
   return out;
 }
 
+/**
+ * WHERE conditions (alias `t`, live rows) for a filter outside a query,
+ * with the same array detection a query does: transform's set_field.filter.
+ */
+export async function tableFilterWhere(collection: Collection, filter: Record<string, unknown>): Promise<SQL> {
+  const registry = readRegistry(collection.storage);
+  const heads = dottedHeads({ filter });
+  const arrayPaths = await detectArrayPaths(collection, registry, heads);
+  return compileFilterWhere(collection, filter, { arrayPaths });
+}
+
 const sortPathCache = new Map<string, { exists: boolean; expires: number }>();
 
 /**
@@ -940,9 +1284,12 @@ const sortPathCache = new Map<string, { exists: boolean; expires: number }>();
  * order; refuse it instead. Projected fields and system columns are known
  * to exist; an empty collection has nothing to check.
  */
-async function assertSortPathExists(collection: Collection, registry: StorageRegistry, params: Omit<QueryParams, "collectionId">): Promise<void> {
-  const sort = params.sort;
-  if (!sort || normalizeGroupBy(params.groupBy).length > 0 || params.aggregate) return;
+async function assertSortPathExists(collection: Collection, registry: StorageRegistry, params: TableQueryParams): Promise<void> {
+  if (normalizeGroupBy(params.groupBy).length > 0 || params.aggregate) return;
+  for (const key of sortKeys(params.sort)) await assertSortKeyExists(collection, registry, key);
+}
+
+async function assertSortKeyExists(collection: Collection, registry: StorageRegistry, sort: string): Promise<void> {
   const field = sort.startsWith("-") ? sort.slice(1) : sort;
   const segments = field.split(".");
   if (["created_at", "updated_at", "id"].includes(field) || !PATH_RE.test(field) || findProjection(registry, field) || findPathProjection(registry, segments)) return;
@@ -963,23 +1310,26 @@ async function assertSortPathExists(collection: Collection, registry: StorageReg
   }
 }
 
-export async function queryTable(collection: Collection, params: Omit<QueryParams, "collectionId">): Promise<TableRecordsResult | TableAggregateResult> {
+export async function queryTable(collection: Collection, params: TableQueryParams): Promise<TableRecordsResult | TableAggregateResult> {
   const registry = readRegistry(collection.storage);
   const arrayPaths = await detectArrayPaths(collection, registry, dottedHeads(params));
-  const compiled = compileQuery(collection, params, { arrayPaths });
+  const scalarArrayKeys = await detectScalarArrayKeys(collection, registry, arrayPaths, params);
+  const compiled = compileQuery(collection, params, { arrayPaths, scalarArrayKeys });
   await assertSortPathExists(collection, registry, params);
 
   if (compiled.kind === "aggregate") {
     const [rows, report] = await Promise.all([db.execute(compiled.query), explain(collection.id, compiled.query, compiled.clauses)]);
     const raw = rows.rows as Record<string, unknown>[];
     const total = raw.length > 0 ? Number(raw[0].__total) : 0;
-    let results = raw.map(({ __total: _omit, ...rest }) => rest);
+    const hidden = new Set(["__total", ...compiled.typeChecks.map((c) => c.column)]);
+    const warnings = typeCheckWarnings(compiled.typeChecks, raw);
+    let results = raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
     if (compiled.nested && params.record !== false) {
       const ids = [...new Set(results.map((r) => Number(r.parent_id)))];
       const parents = new Map((await fetchEmbeddedRecords(collection.id, ids, params.fields)).map((r) => [r.id, r]));
       results = results.map((r) => ({ ...r, record: parents.get(Number(r.parent_id)) ?? null }));
     }
-    return { results, total, count: results.length, limit: compiled.limit, ...report };
+    return { results, total, count: results.length, limit: compiled.limit, ...report, ...(warnings.length > 0 ? { warnings } : {}) };
   }
 
   const { query, countQuery, limit, offset, fields, nullsLast } = compiled;
@@ -1017,6 +1367,27 @@ export async function queryTable(collection: Collection, params: Omit<QueryParam
     next_offset: hasMore ? offset + rows.length : null,
     ...report,
   };
+}
+
+/**
+ * sum/avg add numbers and booleans. A group whose values at the field are
+ * all of another type (strings, arrays, objects) would come back null with
+ * no explanation: when that is every returned group the query fails naming
+ * the type, otherwise each such aggregate gets a warning.
+ */
+export function typeCheckWarnings(checks: { alias: string; op: string; field: string; column: string }[], rows: Record<string, unknown>[]): string[] {
+  const warnings: string[] = [];
+  for (const check of checks) {
+    const bad = rows.filter((r) => r[check.alias] == null && typeof r[check.column] === "string");
+    if (bad.length === 0) continue;
+    const types = [...new Set(bad.map((r) => r[check.column] as string))].join(", ");
+    const what = `${check.op} '${check.alias}' over '${check.field}'`;
+    if (bad.length === rows.length) {
+      throw new Error(`${what} found ${types} values and nothing it can add: sum and avg take numbers, and booleans count as 1 (true) and 0 (false). Use count with a filter, or min/max/distinct, for other types.`);
+    }
+    warnings.push(`${what} is null in ${bad.length} of ${rows.length} groups, whose values are ${types}: sum and avg take numbers and booleans only.`);
+  }
+  return warnings;
 }
 
 /**
