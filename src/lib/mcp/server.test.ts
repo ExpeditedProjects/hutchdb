@@ -161,7 +161,7 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
-      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
       { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
       { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
       { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
@@ -401,8 +401,13 @@ describe('storage-aware descriptions', () => {
     expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
     expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
     const shape = shapeOf('hutch_query_records')
-    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
+    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
     expect(shape.record.description).toMatch(/omits the embedded parent record/)
+    // fields reach into arrays of objects; array_sort/array_limit order and cut embedded arrays.
+    expect(shape.fields.description).toMatch(/sibling paths combine/)
+    expect(shape.fields.description).toMatch(/A field no record has is an error/)
+    expect(shape.array_sort.description).toMatch(/top 10 answers/)
+    expect(shape.array_limit.description).toMatch(/after array_sort/)
     // Arrays of scalars, per-element groups, totals across records, multi-key sort, typed keys.
     expect(query).toMatch(/array of scalars \(tags\) matches when some element matches/)
     expect(query).toMatch(/groups per element/)
@@ -415,7 +420,7 @@ describe('storage-aware descriptions', () => {
     expect(shape.aggregate.description).toMatch(/count booleans as 1 \(true\) and 0 \(false\)/)
     expect(shape.slug.description).toMatch(/exact name/)
     expect(descriptionOf('hutch_transform_records')).toMatch(/same filter syntax as hutch_query_records/)
-    expect(shape.fields.description).toMatch(/embedded in nested aggregates/)
+    expect(shape.fields.description).toMatch(/embedded in per_record aggregates/)
     expect(shape.limit.description).toMatch(/max 1000/)
   })
 

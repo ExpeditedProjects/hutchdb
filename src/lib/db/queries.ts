@@ -221,7 +221,12 @@ export type QueryParams = {
   search?: string;
   searchFields?: string[];
   sort?: string;
+  /** Keys of each document to return: top-level keys or dotted paths into objects and arrays of objects. */
   fields?: string[];
+  /** Records only: sort keys for an embedded array of objects, by its path ({"answers": "-score"}). */
+  arraySort?: Record<string, string | string[]>;
+  /** Records only: how many elements of an embedded array to return, by its path ({"answers": 10}). */
+  arrayLimit?: Record<string, number>;
   /** One field, or up to MAX_GROUP_BY_KEYS fields; each may be a dotted object path. */
   groupBy?: string | string[];
   aggregate?: Record<string, string | Record<string, string>>;
@@ -249,16 +254,6 @@ export function isOperatorSpec(value: unknown): value is Record<string, unknown>
   if (!isPlainObject(value)) return false;
   const keys = Object.keys(value);
   return keys.length > 0 && keys.every((k) => k.startsWith("$"));
-}
-
-/** Keep only the requested top-level keys of a record's data (projection). */
-export function projectData(data: unknown, fields: string[]): unknown {
-  if (!isPlainObject(data)) return data;
-  const projected: Record<string, unknown> = {};
-  for (const field of fields) {
-    if (Object.hasOwn(data, field)) projected[field] = data[field];
-  }
-  return projected;
 }
 
 export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";

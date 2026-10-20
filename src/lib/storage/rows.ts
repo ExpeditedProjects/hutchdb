@@ -221,14 +221,17 @@ export async function listRecords(collectionId: number, limit: number, offset: n
 
 /**
  * Parent records for nested aggregate rows, slimmed in SQL: only the
- * requested top-level `fields`, or — without fields — only top-level
- * scalar values, so hundreds of large documents never leave Postgres.
+ * given top-level keys (the caller projects paths below them), or —
+ * without keys — only top-level scalar values (plus `extraKeys`), so
+ * hundreds of large documents never leave Postgres.
  */
-export async function fetchEmbeddedRecords(collectionId: number, ids: number[], fields: string[] | undefined): Promise<TableRecord[]> {
+export async function fetchEmbeddedRecords(collectionId: number, ids: number[], keys: string[] | undefined, extraKeys: string[] = []): Promise<TableRecord[]> {
   if (ids.length === 0) return [];
-  const keep = fields && fields.length > 0
-    ? sql`kv.key = ANY(${toTextArrayLiteral(fields)}::text[])`
-    : sql`jsonb_typeof(kv.value) IN ('string', 'number', 'boolean', 'null')`;
+  const keep = keys && keys.length > 0
+    ? sql`kv.key = ANY(${toTextArrayLiteral(keys)}::text[])`
+    : extraKeys.length > 0
+      ? sql`(jsonb_typeof(kv.value) IN ('string', 'number', 'boolean', 'null') OR kv.key = ANY(${toTextArrayLiteral(extraKeys)}::text[]))`
+      : sql`jsonb_typeof(kv.value) IN ('string', 'number', 'boolean', 'null')`;
   const result = await db.execute(sql`
     SELECT t.id,
            coalesce((SELECT jsonb_object_agg(kv.key, kv.value) FROM jsonb_each(t.data) kv WHERE ${keep}), '{}'::jsonb) AS data,

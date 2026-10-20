@@ -7,7 +7,6 @@ import {
   isOperatorSpec,
   MAX_GROUP_BY_KEYS,
   normalizeGroupBy,
-  projectData,
   type QueryParams,
 } from "@/lib/db/queries";
 import { isPlainObject } from "@/lib/validation";
@@ -26,6 +25,7 @@ import {
   valueFitsType,
 } from "./registry";
 import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from "./rows";
+import { applyArrayOps, ARRAY_OPS_HELP, fieldHeads, fieldsCover, parseArrayOps, projectData, type ArrayOps } from "./projection";
 
 /**
  * Query compiler for a collection's hc_<id> table: records, aggregates and
@@ -1310,12 +1310,87 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
   }
 }
 
+const fieldPathCache = new Map<string, { exists: boolean; expires: number }>();
+
+/**
+ * Whether some live document has a value at `field` (lax jsonpath, so a
+ * path through an array of objects, "answers.score", counts when some
+ * element has it), or `asArray`: holds an array at that object path. A
+ * top-level key that literally contains dots also counts. Projected
+ * fields are known to exist; an empty collection has nothing to check.
+ */
+async function pathExists(collection: Collection, registry: StorageRegistry, field: string, asArray = false): Promise<boolean> {
+  const segments = field.split(".");
+  if (!asArray) {
+    if (findProjection(registry, field) || (segments.length > 1 && findPathProjection(registry, segments))) return true;
+    const unwind = segments.length === 2 ? findUnwind(registry, segments[0]) : undefined;
+    if (unwind?.fields.some((f) => f.field === segments[1])) return true;
+  }
+  const key = `${collection.id}:${asArray ? "array" : "path"}:${field}`;
+  const now = Date.now();
+  const cached = fieldPathCache.get(key);
+  if (cached && cached.expires > now) return cached.exists;
+  const table = ident(collectionTableName(collection.id));
+  const test = asArray
+    ? sql`jsonb_typeof(data #> ${pathArray(segments)}) = 'array'`
+    : sql`(data @? ${`lax $${segments.map(jsonpathKey).join("")}`}::jsonpath OR data ? ${field}::text)`;
+  const r = await db.execute(sql`
+    SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND ${test} LIMIT 1) IS NOT NULL AS found,
+           (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
+  const row = r.rows[0] as { found: boolean; empty: boolean };
+  const exists = row.found || row.empty;
+  fieldPathCache.set(key, { exists, expires: now + EXPLAIN_TTL_MS });
+  return exists;
+}
+
+/**
+ * `fields`, `array_sort` and `array_limit` shape returned documents, so
+ * every path they name must be one some record has: a typo or a path the
+ * data doesn't hold is an error, never an empty response.
+ */
+async function assertShapingPaths(collection: Collection, registry: StorageRegistry, fields: string[] | undefined, arrayOps: ArrayOps): Promise<void> {
+  for (const field of fields ?? []) {
+    if (typeof field !== "string" || field === "") throw new Error("fields must be a list of field names or dotted paths");
+    const segments = field.split(".");
+    if (segments.length > 1 && !PATH_RE.test(field)) {
+      throw new Error(`Invalid field '${field}' — fields takes top-level keys or dotted paths ("answers.score") whose segments are letters, numbers and underscores`);
+    }
+    if (!(await pathExists(collection, registry, field))) {
+      throw new Error(`Invalid field '${field}' in fields: no record in this collection has it. fields takes top-level keys and dotted paths into objects or arrays of objects ("answers.score"); run hutch_describe_collection to see the fields.`);
+    }
+  }
+  for (const op of arrayOps) {
+    if (!fieldsCover(fields, op.path)) throw new Error(`'${op.path}' in array_sort/array_limit is not returned by fields — add it (or a path below it) to fields`);
+    if (!(await pathExists(collection, registry, op.path, true))) {
+      throw new Error(`Invalid array_sort/array_limit path '${op.path}': no record in this collection holds an array there — ${ARRAY_OPS_HELP}`);
+    }
+    for (const key of op.sort) {
+      const full = [op.path, ...key.segments].join(".");
+      if (!(await pathExists(collection, registry, full))) {
+        throw new Error(`Invalid array_sort key '${key.segments.join(".")}' for '${op.path}': no element in this collection has it`);
+      }
+    }
+  }
+}
+
+/** array_sort/array_limit, then fields, on one returned document. */
+function shapeData(data: unknown, fields: string[] | undefined, arrayOps: ArrayOps): unknown {
+  const ordered = applyArrayOps(data, arrayOps);
+  return fields && fields.length > 0 ? projectData(ordered, fields) : ordered;
+}
+
 export async function queryTable(collection: Collection, params: TableQueryParams): Promise<TableRecordsResult | TableAggregateResult> {
   const registry = readRegistry(collection.storage);
   const arrayPaths = await detectArrayPaths(collection, registry, dottedHeads(params));
   const scalarArrayKeys = await detectScalarArrayKeys(collection, registry, arrayPaths, params);
   const compiled = compileQuery(collection, params, { arrayPaths, scalarArrayKeys });
   await assertSortPathExists(collection, registry, params);
+  const arrayOps = parseArrayOps(params.arraySort, params.arrayLimit);
+  const fieldsGiven = (params.fields ?? []).length > 0;
+  if (compiled.kind === "aggregate" && (fieldsGiven || arrayOps.length > 0) && !(compiled.nested && params.record !== false)) {
+    throw new Error("fields, array_sort and array_limit shape returned records: they apply to a records query, or to the `record` attached to each row of a per_record aggregate. An aggregate's columns are its group_by keys and aggregate aliases.");
+  }
+  await assertShapingPaths(collection, registry, params.fields, arrayOps);
 
   if (compiled.kind === "aggregate") {
     const [rows, report] = await Promise.all([db.execute(compiled.query), explain(collection.id, compiled.query, compiled.clauses)]);
@@ -1326,7 +1401,10 @@ export async function queryTable(collection: Collection, params: TableQueryParam
     let results = raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
     if (compiled.nested && params.record !== false) {
       const ids = [...new Set(results.map((r) => Number(r.parent_id)))];
-      const parents = new Map((await fetchEmbeddedRecords(collection.id, ids, params.fields)).map((r) => [r.id, r]));
+      // Without fields the record carries its top-level scalars, plus any array array_sort/array_limit names.
+      const extra = [...new Set(arrayOps.map((op) => op.path.split(".")[0]))];
+      const fetched = await fetchEmbeddedRecords(collection.id, ids, fieldsGiven ? fieldHeads(params.fields!) : undefined, extra);
+      const parents = new Map(fetched.map((r) => [r.id, fieldsGiven || arrayOps.length > 0 ? { ...r, data: shapeData(r.data, params.fields, arrayOps) } : r]));
       results = results.map((r) => ({ ...r, record: parents.get(Number(r.parent_id)) ?? null }));
     }
     return { results, total, count: results.length, limit: compiled.limit, ...report, ...(warnings.length > 0 ? { warnings } : {}) };
@@ -1355,7 +1433,7 @@ export async function queryTable(collection: Collection, params: TableQueryParam
     total = (countRows.rows[0] as { count: number }).count;
   }
 
-  const projected = fields && fields.length > 0 ? rows.map((r) => ({ ...r, data: projectData(r.data, fields) })) : rows;
+  const projected = fieldsGiven || arrayOps.length > 0 ? rows.map((r) => ({ ...r, data: shapeData(r.data, fields, arrayOps) })) : rows;
   const hasMore = offset + rows.length < total;
   return {
     records: projected,
