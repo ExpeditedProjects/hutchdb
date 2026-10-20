@@ -3,7 +3,7 @@ import { describe, it, expect, vi } from 'vitest'
 vi.mock('@/lib/db', () => ({ db: { execute: vi.fn() } }))
 
 import { PgDialect } from 'drizzle-orm/pg-core'
-import { compileQuery, summarizePlan, embeddedRecord, sortKeys, typeCheckWarnings } from './compiler'
+import { compileQuery, summarizePlan, sortKeys, typeCheckWarnings } from './compiler'
 import type { StorageRegistry } from './registry'
 
 const dialect = new PgDialect()
@@ -370,18 +370,6 @@ describe('compileQuery: group_by with several keys', () => {
   it('rejects more than five keys and keys on different arrays', () => {
     expect(() => compile({ groupBy: ['a', 'b', 'c', 'd', 'e', 'f'] })).toThrow(/at most 5 keys/)
     expect(() => compileQuery(collection, { groupBy: ['votes.label', 'items.sku'] }, { arrayPaths: ['items'] })).toThrow(/one nested array/)
-  })
-})
-
-describe('embeddedRecord', () => {
-  const rec = { id: 1, collectionId: 12, data: { name: 'A', n: 2, ok: true, nil: null, totals: { x: 1 }, votes: [{ a: 1 }] }, source: null, status: null, deletedAt: null, createdAt: null, updatedAt: null }
-
-  it('keeps only top-level scalars when no fields are requested', () => {
-    expect(embeddedRecord(rec, undefined).data).toEqual({ name: 'A', n: 2, ok: true, nil: null })
-  })
-
-  it('applies the requested fields, including nested objects', () => {
-    expect(embeddedRecord(rec, ['name', 'totals']).data).toEqual({ name: 'A', totals: { x: 1 } })
   })
 })
 

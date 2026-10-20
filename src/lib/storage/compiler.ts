@@ -24,6 +24,7 @@ import {
   type Unwind,
   valueFitsType,
 } from "./registry";
+import { TtlCache } from "./ttl-cache";
 import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from "./rows";
 import { applyArrayOps, ARRAY_OPS_HELP, fieldHeads, fieldsCover, parseArrayOps, projectData, type ArrayOps } from "./projection";
 
@@ -1186,8 +1187,10 @@ function compileAggregate(
 // ── execute ──────────────────────────────────────────────────────────────────
 
 const dialect = new PgDialect();
-const explainCache = new Map<string, { report: IndexReport; expires: number }>();
-const arrayPathCache = new Map<string, { isArray: boolean; expires: number }>();
+/** Entries per probe/EXPLAIN cache (TtlCache: expired first, then oldest, are evicted). */
+const CACHE_MAX_ENTRIES = 1000;
+const explainCache = new TtlCache<IndexReport>(EXPLAIN_TTL_MS, CACHE_MAX_ENTRIES);
+const arrayPathCache = new TtlCache<boolean>(EXPLAIN_TTL_MS, CACHE_MAX_ENTRIES);
 
 /** Render a chunk to SQL text — the query's shape with literals replaced by $n. */
 export function renderSql(query: SQL): string {
@@ -1267,18 +1270,14 @@ async function explain(collectionId: number, query: SQL, clauses: Clause[]): Pro
   // bound values: the plan for LIMIT 10 is not the plan for OFFSET 5000.
   const { sql: text, params } = dialect.sqlToQuery(query);
   const key = `${collectionId}:${text}:${JSON.stringify(params)}:${JSON.stringify(clauses)}`;
-  const now = Date.now();
   const cached = explainCache.get(key);
-  if (cached && cached.expires > now) return cached.report;
+  if (cached) return cached;
   const result = await db.execute(sql`EXPLAIN (FORMAT JSON) ${query}`);
   const raw = (result.rows[0] as { "QUERY PLAN": unknown })["QUERY PLAN"];
   const parsed = typeof raw === "string" ? JSON.parse(raw) : raw;
   const root = (parsed as { Plan: PlanNode }[])[0].Plan;
   const report = summarizePlan(root, collectionTableName(collectionId), clauses);
-  explainCache.set(key, { report, expires: now + EXPLAIN_TTL_MS });
-  if (explainCache.size > 1000) {
-    for (const [k, v] of explainCache) if (v.expires <= now) explainCache.delete(k);
-  }
+  explainCache.set(key, report);
   return report;
 }
 
@@ -1309,7 +1308,7 @@ function dottedHeads(params: TableQueryParams): string[] {
   return [...heads];
 }
 
-const scalarArrayCache = new Map<string, { isArray: boolean; expires: number }>();
+const scalarArrayCache = new TtlCache<boolean>(EXPLAIN_TTL_MS, CACHE_MAX_ENTRIES);
 
 /**
  * group_by keys (top-level keys or nested object paths) that hold an array
@@ -1320,7 +1319,6 @@ const scalarArrayCache = new Map<string, { isArray: boolean; expires: number }>(
 async function detectScalarArrayKeys(collection: Collection, registry: StorageRegistry, arrayPaths: Set<string>, params: TableQueryParams): Promise<Set<string>> {
   const out = new Set<string>();
   const table = ident(collectionTableName(collection.id));
-  const now = Date.now();
   for (const key of normalizeGroupBy(params.groupBy)) {
     const parsed = parsePath(registry, arrayPaths, key);
     if (parsed.kind === "nested") continue;
@@ -1328,14 +1326,11 @@ async function detectScalarArrayKeys(collection: Collection, registry: StorageRe
     const projection = parsed.kind === "object" ? findPathProjection(registry, segments) : findProjection(registry, key);
     if (projection && !projection.mixed) continue;
     const cacheKey = `${collection.id}:${JSON.stringify(segments)}`;
-    const cached = scalarArrayCache.get(cacheKey);
-    let isArray: boolean;
-    if (cached && cached.expires > now) {
-      isArray = cached.isArray;
-    } else {
+    let isArray = scalarArrayCache.get(cacheKey);
+    if (isArray === undefined) {
       const r = await db.execute(sql`SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND jsonb_typeof(data #> ${pathArray(segments)}) = 'array' LIMIT 1`);
       isArray = r.rows.length > 0;
-      scalarArrayCache.set(cacheKey, { isArray, expires: now + EXPLAIN_TTL_MS });
+      scalarArrayCache.set(cacheKey, isArray);
     }
     if (isArray) out.add(key);
   }
@@ -1350,18 +1345,14 @@ async function detectScalarArrayKeys(collection: Collection, registry: StorageRe
 async function detectArrayPaths(collection: Collection, registry: StorageRegistry, heads: string[]): Promise<Set<string>> {
   const out = new Set<string>();
   const table = ident(collectionTableName(collection.id));
-  const now = Date.now();
   for (const head of heads) {
     if (findUnwind(registry, head)) continue;
     const key = `${collection.id}:${head}`;
-    const cached = arrayPathCache.get(key);
-    let isArray: boolean;
-    if (cached && cached.expires > now) {
-      isArray = cached.isArray;
-    } else {
+    let isArray = arrayPathCache.get(key);
+    if (isArray === undefined) {
       const r = await db.execute(sql`SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND jsonb_typeof(data->${head}::text) = 'array' LIMIT 1`);
       isArray = r.rows.length > 0;
-      arrayPathCache.set(key, { isArray, expires: now + EXPLAIN_TTL_MS });
+      arrayPathCache.set(key, isArray);
     }
     if (isArray) out.add(head);
   }
@@ -1379,7 +1370,7 @@ export async function tableFilterWhere(collection: Collection, filter: Record<st
   return compileFilterWhere(collection, filter, { arrayPaths });
 }
 
-const sortPathCache = new Map<string, { exists: boolean; expires: number }>();
+const sortPathCache = new TtlCache<boolean>(EXPLAIN_TTL_MS, CACHE_MAX_ENTRIES);
 
 /**
  * A records-query sort on a field or object path that no live document
@@ -1397,23 +1388,22 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
   const segments = field.split(".");
   if (["created_at", "updated_at", "id"].includes(field) || !PATH_RE.test(field) || findProjection(registry, field) || findPathProjection(registry, segments)) return;
   const key = `${collection.id}:${field}`;
-  const now = Date.now();
   let exists = sortPathCache.get(key);
-  if (!exists || exists.expires <= now) {
+  if (exists === undefined) {
     const table = ident(collectionTableName(collection.id));
     const r = await db.execute(sql`
       SELECT (SELECT 1 FROM ${table} WHERE deleted_at IS NULL AND data #> ${pathArray(segments)} IS NOT NULL LIMIT 1) IS NOT NULL AS found,
              (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
     const row = r.rows[0] as { found: boolean; empty: boolean };
-    exists = { exists: row.found || row.empty, expires: now + EXPLAIN_TTL_MS };
+    exists = row.found || row.empty;
     sortPathCache.set(key, exists);
   }
-  if (!exists.exists) {
+  if (!exists) {
     throw new Error(`Invalid sort field '${field}': no record in this collection has it — ${SORT_HELP}`);
   }
 }
 
-const fieldPathCache = new Map<string, { exists: boolean; expires: number }>();
+const fieldPathCache = new TtlCache<boolean>(EXPLAIN_TTL_MS, CACHE_MAX_ENTRIES);
 
 /**
  * Whether some live document has a value at `field` (lax jsonpath, so a
@@ -1430,9 +1420,8 @@ async function pathExists(collection: Collection, registry: StorageRegistry, fie
     if (unwind?.fields.some((f) => f.field === segments[1])) return true;
   }
   const key = `${collection.id}:${asArray ? "array" : "path"}:${field}`;
-  const now = Date.now();
   const cached = fieldPathCache.get(key);
-  if (cached && cached.expires > now) return cached.exists;
+  if (cached !== undefined) return cached;
   const table = ident(collectionTableName(collection.id));
   const test = asArray
     ? sql`jsonb_typeof(data #> ${pathArray(segments)}) = 'array'`
@@ -1442,7 +1431,7 @@ async function pathExists(collection: Collection, registry: StorageRegistry, fie
            (SELECT 1 FROM ${table} WHERE deleted_at IS NULL LIMIT 1) IS NULL AS empty`);
   const row = r.rows[0] as { found: boolean; empty: boolean };
   const exists = row.found || row.empty;
-  fieldPathCache.set(key, { exists, expires: now + EXPLAIN_TTL_MS });
+  fieldPathCache.set(key, exists);
   return exists;
 }
 
@@ -1594,19 +1583,4 @@ export function typeCheckWarnings(checks: { alias: string; op: string; field: st
     warnings.push(`${what} is null in ${bad.length} of ${rows.length} groups, whose values are ${types}: sum and avg take numbers and booleans only.`);
   }
   return warnings;
-}
-
-/**
- * In-JS equivalent of fetchEmbeddedRecords' slimming (kept for callers
- * that already hold the document): the requested `fields`, or only the
- * top-level scalar values.
- */
-export function embeddedRecord(record: TableRecord, fields: string[] | undefined): TableRecord {
-  if (!isPlainObject(record.data)) return record;
-  if (fields && fields.length > 0) return { ...record, data: projectData(record.data, fields) };
-  const data: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(record.data)) {
-    if (v === null || typeof v === "string" || typeof v === "number" || typeof v === "boolean") data[k] = v;
-  }
-  return { ...record, data };
 }

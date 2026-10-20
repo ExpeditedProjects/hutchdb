@@ -1,5 +1,6 @@
 import { db } from "@/lib/db";
-import { sql, type SQL } from "drizzle-orm";
+import { sql, TransactionRollbackError, type SQL } from "drizzle-orm";
+import { toTextArrayLiteral } from "./ddl";
 import { collectionTableName, ident, readRegistry } from "./registry";
 
 /**
@@ -195,13 +196,9 @@ export async function upsertRecords(
     }
     return { results };
   }).catch((err: unknown) => {
-    if (mode === "error" && isRollback(err)) return { conflict: true as const };
+    if (mode === "error" && err instanceof TransactionRollbackError) return { conflict: true as const };
     throw err;
   });
-}
-
-function isRollback(err: unknown): boolean {
-  return err instanceof Error && /rollback/i.test(err.message);
 }
 
 async function findByKey(
@@ -453,10 +450,6 @@ export async function fetchEmbeddedRecords(collectionId: number, ids: number[], 
     FROM ${table(collectionId)} t
     WHERE t.id = ANY(${toIntArrayLiteral(ids)}::int[]) AND t.deleted_at IS NULL`);
   return (result.rows as RawRow[]).map((r) => toRecord(collectionId, r));
-}
-
-function toTextArrayLiteral(values: string[]): string {
-  return `{${values.map((v) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(",")}}`;
 }
 
 function toIntArrayLiteral(ids: number[]): string {
