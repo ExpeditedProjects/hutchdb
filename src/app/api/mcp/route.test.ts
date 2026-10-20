@@ -73,3 +73,12 @@ describe('POST /api/mcp — HUTCH_API_KEY unset', () => {
     expect(res.status).not.toBe(401)
   })
 })
+
+describe('POST /api/mcp — links in tool responses', () => {
+  it('hands the server the origin the request reached when HUTCH_BASE_URL is unset', async () => {
+    authenticateMock.mockResolvedValue({ userId: 'u1', orgId: 'o1' })
+    await POST(new Request('http://localhost:3116/api/mcp', { method: 'POST', body: '{}' }))
+    const [, options] = transportHandleRequest.mock.calls[0]
+    expect(options.authInfo.extra).toEqual({ userId: 'u1', orgId: 'o1', baseUrl: 'http://localhost:3116' })
+  })
+})

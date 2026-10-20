@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
 import { views } from "@/lib/db/schema";
 import { eq, and } from "drizzle-orm";
-import { findAccessibleCollectionBySlug } from "@/lib/db/queries";
+import { findAccessibleCollection } from "./resolve";
 import { uniqueSlug, titleCase } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { MAX_VIEW_NAME_LENGTH } from "@/lib/views/types";
@@ -28,8 +28,10 @@ export async function createView(collectionSlug: string, userId: string, params:
     resolvedName = validated.value;
   }
 
-  const access = await findAccessibleCollectionBySlug(collectionSlug, userId, "editor");
+  const access = await findAccessibleCollection(collectionSlug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  collectionSlug = access.collection.slug;
 
   const type = params.type || "table";
   const name = resolvedName ?? titleCase(type);
@@ -52,12 +54,12 @@ export async function createView(collectionSlug: string, userId: string, params:
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
-  return { view: created };
+  return { view: created, slug: collectionSlug };
 }
 
 /** Same access rule as createView; the view must belong to collectionSlug. */
 async function findEditableView(collectionSlug: string, viewId: number, userId: string) {
-  const access = await findAccessibleCollectionBySlug(collectionSlug, userId, "editor");
+  const access = await findAccessibleCollection(collectionSlug, userId, "editor");
   if (!access) return null;
 
   const [view] = await db

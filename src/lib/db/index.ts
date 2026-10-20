@@ -4,7 +4,8 @@ import * as schema from "./schema";
 
 export const pool = new Pool({
   connectionString: process.env.HUTCH_DATABASE_URL || process.env.DATABASE_URL,
-  statement_timeout: 5000,
+  // Scripts (storage:cutover) raise or lift this; requests keep 5 s.
+  statement_timeout: Number(process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS ?? 5000),
   idle_in_transaction_session_timeout: 10000,
   // Fail fast when the pool is exhausted instead of waiting forever.
   connectionTimeoutMillis: 5000,

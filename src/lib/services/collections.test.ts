@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const { insertReturning, updateReturning, selectLimit, dbExecute, txSelectFor, txUpdateMock } = vi.hoisted(() => ({
+const { insertReturning, updateReturning, selectLimit, dbExecute, txSelectFor, txUpdateMock, txDeleteMock } = vi.hoisted(() => ({
   insertReturning: vi.fn(),
   updateReturning: vi.fn(),
   selectLimit: vi.fn(),
@@ -9,6 +9,7 @@ const { insertReturning, updateReturning, selectLimit, dbExecute, txSelectFor, t
   txUpdateMock: vi.fn(() => ({
     set: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })),
   })),
+  txDeleteMock: vi.fn(() => ({ where: vi.fn().mockResolvedValue(undefined) })),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -38,20 +39,42 @@ vi.mock('@/lib/db', () => ({
         })),
       })),
       update: txUpdateMock,
+      delete: txDeleteMock,
     })),
   },
+}))
+
+// Row reads on the collection's hc_<id> table. collectionStats stays real
+// so the stats tests drive it through the mocked db.execute.
+vi.mock('@/lib/storage/rows', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/storage/rows')>()),
+  countRecords: vi.fn().mockResolvedValue(7),
+  lastRecordAt: vi.fn().mockResolvedValue(new Date('2026-01-01T00:00:00.000Z')),
+  childTableCounts: vi.fn().mockResolvedValue({}),
+}))
+
+vi.mock('@/lib/storage/ddl', () => ({
+  dropCollectionTable: vi.fn().mockResolvedValue(undefined),
 }))
 
 vi.mock('@/lib/db/queries', () => ({
   findAccessibleCollectionBySlug: vi.fn(),
   createCollectionWithOwner: vi.fn(),
-  getCollectionRecordCount: vi.fn().mockResolvedValue(7),
-  notDeleted: { __notDeleted: true },
 }))
 
 vi.mock('@/lib/describe', () => ({
   describeCollection: vi.fn().mockResolvedValue([]),
 }))
+
+// Name resolution has its own tests (resolve.test.ts and the integration
+// suite); here a slug argument resolves exactly as the mocked slug lookup says.
+vi.mock('./resolve', async () => {
+  const queries = await import('@/lib/db/queries')
+  return {
+    findAccessibleCollection: (ref: string, userId: string, role?: string) =>
+      (queries.findAccessibleCollectionBySlug as (...a: unknown[]) => unknown)(ref, userId, role),
+  }
+})
 
 vi.mock('@/lib/revalidation', () => ({
   revalidateDashboard: vi.fn(),
@@ -85,10 +108,10 @@ import {
 import { sortCollections } from '@/lib/collections/sort'
 import { findAccessibleCollectionBySlug, createCollectionWithOwner } from '@/lib/db/queries'
 import { seedAutoViews } from './views'
+import { dropCollectionTable } from '@/lib/storage/ddl'
 
 const baseCollection = {
   id: 1,
-  apiKeyId: 1,
   organizationId: 'org-test',
   name: 'Bookmarks',
   slug: 'bookmarks',
@@ -99,6 +122,7 @@ const baseCollection = {
   publishedAt: null,
   visibility: 'private',
   orgDefaultRole: 'viewer',
+  storage: {},
   createdAt: new Date(),
   updatedAt: new Date(),
 }
@@ -175,9 +199,8 @@ describe('getCollection', () => {
 
   it('exposes the role on the returned collection', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'viewer' })
-    selectLimit.mockResolvedValue([{ lastAt: '2026-01-01' }])
     const result = await getCollection('bookmarks', 'user-test')
-    expect(result).toEqual(expect.objectContaining({ role: 'viewer', recordCount: 7 }))
+    expect(result).toEqual(expect.objectContaining({ role: 'viewer', recordCount: 7, lastRecordAt: '2026-01-01T00:00:00.000Z' }))
   })
 })
 
@@ -221,6 +244,8 @@ describe('deleteCollection', () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'owner' })
     const result = await deleteCollection('bookmarks', 'user-test')
     expect(result).toEqual({ deleted: true, slug: 'bookmarks' })
+    expect(dropCollectionTable).toHaveBeenCalledWith(expect.anything(), 1)
+    expect(txDeleteMock).toHaveBeenCalled()
   })
 })
 
@@ -248,7 +273,7 @@ describe('updateFieldDefinition', () => {
   it('marks the updated field as not inferred and bumps schema version', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: { ...baseCollection }, role: 'editor' })
     const result = await updateFieldDefinition('bookmarks', 'user-test', 'url', { hidden: true })
-    expect(result).toEqual({ field: expect.objectContaining({ name: 'url', hidden: true, inferred: false }) })
+    expect(result).toEqual({ slug: 'bookmarks', field: expect.objectContaining({ name: 'url', hidden: true, inferred: false }) })
   })
 })
 
@@ -266,6 +291,7 @@ describe('describeCollection', () => {
       name: 'Bookmarks',
       slug: 'bookmarks',
       recordCount: 7,
+      storage: { evaluated_rows: 0, projections: [], unwinds: [], not_unwound: [], indexes: [expect.objectContaining({ index: 'hc_1_data_gin_idx' }), expect.objectContaining({ index: 'hc_1_created_at_idx' })] },
     }))
   })
 })

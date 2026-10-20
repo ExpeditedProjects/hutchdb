@@ -7,6 +7,10 @@ const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
 
 vi.mock('@modelcontextprotocol/server', () => {
   class McpServer {
+    static lastOptions: { instructions?: string } | undefined
+    constructor(_info: unknown, options?: { instructions?: string }) {
+      McpServer.lastOptions = options
+    }
     registerTool(name: string, config: Record<string, unknown>, handler: (params: unknown) => Promise<unknown>) {
       registeredTools.set(name, handler)
       registeredConfigs.set(name, config)
@@ -158,13 +162,13 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
       { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict'] },
+      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
-      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
       { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
       { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
-      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records'] },
+      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
       { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
       { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
       { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
@@ -326,6 +330,184 @@ describe('tool input schemas and descriptions', () => {
     for (const op of FILTER_OPERATORS) {
       expect(filter.description, `expected filter description to mention ${op}`).toContain(op)
     }
+  })
+
+  it('describes top-level $or / $and and what they do with array elements', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const filter = (registeredConfigs.get('hutch_query_records')!.inputSchema as {
+      shape: { filter: { description?: string } }
+    }).shape.filter
+    expect(filter.description).toContain('{"$or": [{"status": "open"}, {"score": {"$gt": 10}}]}')
+    expect(filter.description).toMatch(/does not restrict which elements are aggregated/)
+    expect(filter.description).toMatch(/Any other top-level key starting with \$ is an error/)
+  })
+})
+
+describe('query, store and import descriptions', () => {
+  type Shape = Record<string, { description?: string; safeParse: (v: unknown) => { success: boolean } }>
+  const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
+  const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
+
+  it('describes dotted object paths, alias/key sort with top-N, total, multi-key group_by and unknown-sort errors', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const description = descriptionOf('hutch_query_records')
+    expect(description).toMatch(/dotted paths of any depth: "a\.b\.c" reaches into nested objects/)
+    expect(description).toMatch(/aggregate aliases and group_by keys and limit applies after sorting/)
+    expect(description).toMatch(/include total/)
+    expect(description).toMatch(/array of up to 5 keys/)
+    expect(description).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
+    expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
+  })
+
+  it('says every collection argument takes a slug or exact name, and that store reports index building', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
+    expect(McpServer.lastOptions?.instructions).toMatch(/Every tool that takes a collection accepts its slug or its exact name/)
+    expect(shapeOf('hutch_query_records').slug.description).toMatch(/exact name/)
+    expect(descriptionOf('hutch_store_records')).toMatch(/says so in storage_note/)
+  })
+
+  it('documents the response shape, array_sort/array_limit/array_totals, dotted fields, booleans in sums, null groups and what inference indexes', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/a records query returns `records`.*a group_by\/aggregate query returns `results`/)
+    expect(query).toContain('{"array_sort": {"answers": "-score,creation_date"}, "array_limit": {"answers": 10}}')
+    expect(query).toMatch(/array_totals/)
+    expect(query).toContain('["title", "answers.answer_id", "answers.score"]')
+    expect(query).toMatch(/sum and avg count booleans as 1 \(true\) and 0 \(false\)/)
+    expect(query).toMatch(/limit: 0 means count only/)
+    expect(query).toMatch(/null come last in both directions/)
+    expect(query).not.toMatch(/first key/)
+    expect(query).toMatch(/every scalar key present in most of its elements/)
+    expect(query).toMatch(/GIN index on the documents serves equality/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/storage\.indexes/)
+  })
+
+  it('documents limit: 0 as count-only', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(shapeOf('hutch_query_records').limit.description).toMatch(/limit: 0 only counts: the response has total and no records/)
+  })
+
+  it('accepts group_by as a string or up to 5 keys', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const groupBy = shapeOf('hutch_query_records').group_by
+    expect(groupBy.safeParse('status').success).toBe(true)
+    expect(groupBy.safeParse(['a', 'b.c', 'd', 'e', 'f']).success).toBe(true)
+    expect(groupBy.safeParse(['a', 'b', 'c', 'd', 'e', 'f']).success).toBe(false)
+  })
+
+  it('gives the aggregate spec an explicit example, count of a path, first, and what an array filter does to aggregated elements', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const aggregate = shapeOf('hutch_query_records').aggregate.description!
+    expect(aggregate).toContain('{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}')
+    expect(aggregate).toMatch(/counts only those with a non-null value/)
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/also restricts which elements are aggregated/)
+    expect(query).toContain('{"filter": {"votes.category": "veterans"}, "group_by": "name"')
+    expect(query).toMatch(/"count" counts every row in the group/)
+    expect(shapeOf('hutch_query_records').group_by.description).toContain('{"first": "name"}')
+  })
+
+  it('states the configured request body limit (HUTCH_MCP_MAX_BODY_BYTES) on store and import', async () => {
+    vi.resetModules()
+    vi.stubEnv('HUTCH_MCP_MAX_BODY_BYTES', String(4 * 1024 * 1024))
+    try {
+      const fresh = await import('./server')
+      fresh.createMcpServer('user-1', 'org-test', 'https://example.test')
+      expect(descriptionOf('hutch_store_records')).toContain('limited to 4 MB')
+      expect(descriptionOf('hutch_import_records')).toContain('limited to 4 MB (content up to a little less than that)')
+    } finally {
+      vi.unstubAllEnvs()
+      vi.resetModules()
+    }
+  })
+
+  it('states the 16 MB request body limit on store and import', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
+    expect(descriptionOf('hutch_import_records')).toContain('limited to 16 MB')
+    expect(shapeOf('hutch_store_records').return.safeParse('summary').success).toBe(true)
+    expect(shapeOf('hutch_import_records').return.safeParse('bogus').success).toBe(false)
+  })
+
+  it('forwards return to createRecords and importRecords', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'U', slug: 'u' }, count: 2 } as never)
+    vi.mocked(recordService.importRecords).mockResolvedValue({ collection: { name: 'U', slug: 'u' }, count: 2 } as never)
+    await registeredTools.get('hutch_store_records')!({ collection: 'U', records: [{ a: 1 }, { a: 2 }], return: 'summary' })
+    await registeredTools.get('hutch_import_records')!({ collection: 'U', content: 'a\n1', return: 'records' })
+    expect(recordService.createRecords).toHaveBeenCalledWith('user-1', 'org-test', expect.objectContaining({ return: 'summary' }))
+    expect(recordService.importRecords).toHaveBeenCalledWith('user-1', 'org-test', expect.objectContaining({ return: 'records' }))
+  })
+
+  it('forwards a multi-key group_by and sort to the service', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: ['chamber', 'party'], aggregate: { n: 'count' }, sort: '-n', limit: 10 })
+    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }))
+  })
+})
+
+describe('storage-aware descriptions', () => {
+  type Shape = Record<string, { description?: string }>
+  const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
+  const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
+
+  it('describes nested arrays, automatic indexing, indexed/plan and record', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/reaches into an array of objects/)
+    expect(query).toMatch(/nested up to two objects deep/)
+    expect(query).toMatch(/at most 16 per collection/)
+    expect(query).toMatch(/treated as a map/)
+    expect(query).toMatch(/`indexed`/)
+    expect(query).toMatch(/`plan`/)
+    expect(query).toMatch(/record: false/)
+    expect(query).toMatch(/include total/)
+    expect(query).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/projected into indexed columns/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/distinctCount is an exact count/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/distinctCountEstimate instead/)
+    expect(descriptionOf('hutch_store_records')).toMatch(/made queryable automatically/)
+    expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
+    expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
+    const shape = shapeOf('hutch_query_records')
+    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
+    expect(shape.record.description).toMatch(/omits the embedded parent record/)
+    // fields reach into arrays of objects; array_sort/array_limit order and cut embedded arrays.
+    expect(shape.fields.description).toMatch(/sibling paths combine/)
+    expect(shape.fields.description).toMatch(/A field no record has is an error/)
+    expect(shape.array_sort.description).toMatch(/top 10 answers/)
+    expect(shape.array_limit.description).toMatch(/after array_sort/)
+    // Arrays of scalars, per-element groups, totals across records, multi-key sort, typed keys.
+    expect(query).toMatch(/array of scalars \(tags\) matches when some element matches/)
+    expect(query).toMatch(/groups per element/)
+    expect(query).toMatch(/array of objects \("items"\) likewise groups per element, keyed by the whole element; an empty array groups as null/)
+    expect(query).toMatch(/totals across records/)
+    expect(query).toMatch(/per_record: true/)
+    expect(query).toMatch(/up to 3 keys, as "-points,name"/)
+    expect(query).toMatch(/numbers come back as numbers/)
+    expect(shape.per_record.description).toMatch(/one row per record and group value/)
+    expect(shape.filter.description).toMatch(/\$ne\/\$nin match when no element does/)
+    expect(shape.aggregate.description).toMatch(/count booleans as 1 \(true\) and 0 \(false\)/)
+    expect(shape.slug.description).toMatch(/exact name/)
+    expect(descriptionOf('hutch_transform_records')).toMatch(/same filter syntax as hutch_query_records/)
+    expect(shape.fields.description).toMatch(/embedded in per_record aggregates/)
+    expect(shape.limit.description).toMatch(/max 1000/)
+  })
+
+  it('forwards per_record and a sort array to the service', async () => {
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', per_record: true, sort: ['-n', 'votes.vote'] })
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ perRecord: true, sort: ['-n', 'votes.vote'] }))
+  })
+
+  it('forwards record to the service', async () => {
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', record: false })
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ record: false }))
   })
 })
 
@@ -746,20 +928,21 @@ describe('collection url in mutation responses', () => {
   })
 
   describe('hutch_update_record', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.updateRecord).mockResolvedValue({
         record: { id: 7, data: { name: 'Alice' } },
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_update_record', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 7,
         data: { name: 'Alice' },
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
@@ -781,87 +964,93 @@ describe('collection url in mutation responses', () => {
   })
 
   describe('hutch_set_record_status', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.updateRecordStatus).mockResolvedValue({
         record: { id: 3, status: 'archived' },
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_set_record_status', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 3,
         status: 'archived',
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
   describe('hutch_delete_record', () => {
-    it('includes url because the collection still exists', async () => {
+    it('includes url with the resolved slug because the collection still exists', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.deleteRecord).mockResolvedValue({
-        record: { id: 9 },
+        deleted: true,
+        id: 9,
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_delete_record', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 9,
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
   describe('hutch_infer_schema', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(collectionService.inferCollectionSchema).mockResolvedValue({
-        fields: [{ name: 'title', type: 'text' }],
+        schema: { fields: [{ name: 'title', type: 'text' }] },
+        slug: 'notes-1a2b',
       } as never)
 
-      const result = await callTool('hutch_infer_schema', { slug: 'notes' })
+      const result = await callTool('hutch_infer_schema', { slug: 'Notes' })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/notes`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/notes-1a2b`)
     })
   })
 
   describe('hutch_update_schema', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(collectionService.updateFieldDefinition).mockResolvedValue({
         field: { name: 'status', type: 'select' },
+        slug: 'tasks-1a2b',
       } as never)
 
       const result = await callTool('hutch_update_schema', {
-        slug: 'tasks',
+        slug: 'Tasks',
         field: 'status',
         type: 'select',
         options: ['todo', 'done'],
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/tasks`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/tasks-1a2b`)
     })
   })
 
   describe('hutch_create_view', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(createView).mockResolvedValue({
         view: { id: 1, name: 'Table' },
+        slug: 'tasks-1a2b',
       } as never)
 
       const result = await callTool('hutch_create_view', {
-        slug: 'tasks',
+        slug: 'Tasks',
         type: 'table',
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/tasks`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/tasks-1a2b`)
     })
   })
 

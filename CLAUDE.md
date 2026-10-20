@@ -13,6 +13,7 @@ npm run dev          # Start dev server on port 3111
 npm run db:generate  # Generate Drizzle migrations
 npm run db:migrate   # Run migrations
 npm run smoke        # Hit /api/mcp against SMOKE_BASE_URL
+npm run storage:cutover -- --dry-run   # Move an older database out of `records` (see Cutover below)
 ```
 
 Core self-bootstraps its singleton user + personal org on the first authenticated request — no seed step.
@@ -23,8 +24,10 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - **REST seed** at `/api/v1/collections` (list only). Everything else goes through MCP.
 - **Auth seam** at `src/lib/auth/seam.ts` — the only place auth lives.
 - **Singleton bootstrap** at `src/lib/auth/singleton.ts` — lazy user + personal org insert.
-- **DB schema** in `src/lib/db/schema.ts` — users, organizations, organization_members, collections, records, views (schema stays merge-compatible with Cloud; do not drop Cloud-only tables).
-- **Query engine** in `src/lib/db/queries.ts` — JSONB containment, full-text search, aggregation.
+- **DB schema** in `src/lib/db/schema.ts` — users, organizations, organization_members, collections, views (schema stays merge-compatible with Cloud; do not drop Cloud-only tables). There is no shared `records` table: each collection's rows live in its own table.
+- **Per-collection storage** in `src/lib/storage/` — every collection's rows live in its own table `hc_<id>`, created in the same transaction as the collection (`ddl.ts`, `rows.ts`). As data arrives, `inference.ts`/`apply.ts` add stored generated projection columns for common scalar fields (top-level and nested object paths; text over 2000 bytes projects to NULL) and unwind large arrays of objects into child tables `hc_<id>__<path>` kept in sync by triggers. What exists is recorded in `collections.storage` (`registry.ts`); the SQL helpers are in migration `0021`.
+- **Query engine** in `src/lib/storage/compiler.ts` — compiles filter/search/sort/group_by/aggregate for one collection table, using projection columns and child tables only where they give the same answer as the JSONB document, and reports `indexed`/`plan`. Filter operator definitions live in `src/lib/db/queries.ts`; collection name-or-slug lookup in `src/lib/services/resolve.ts`.
+- **Cutover** `npm run storage:cutover -- [--dry-run] [--drop-records] [--dump-dir <dir>]` moves a database created before per-collection storage out of the old shared `records` table: pg_dump first (refuses without it), copy and verify every collection in one transaction, then inference. Re-runs skip finished collections. `db:migrate` never touches `records`; only `--drop-records` drops it, after every collection has verified.
 
 ## Key Design Decisions
 

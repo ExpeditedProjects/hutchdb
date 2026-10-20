@@ -1,8 +1,9 @@
 import { db } from "@/lib/db";
-import { collections, records, collectionMembers, organizations, user, type CollectionRole } from "@/lib/db/schema";
+import { collections, collectionMembers, organizations, user, type CollectionRole } from "@/lib/db/schema";
 import { alias } from "drizzle-orm/pg-core";
-import { eq, and, isNull, sql, desc } from "drizzle-orm";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, getCollectionRecordCount, notDeleted } from "@/lib/db/queries";
+import { eq, and, sql, desc } from "drizzle-orm";
+import { createCollectionWithOwner } from "@/lib/db/queries";
+import { findAccessibleCollection } from "./resolve";
 import { describeCollection as describeCollectionFields } from "@/lib/describe";
 import { uniqueSlug } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
@@ -10,6 +11,10 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
+import { queryIndexes, readRegistry } from "@/lib/storage/registry";
+import { dropCollectionTable } from "@/lib/storage/ddl";
+import * as tableRows from "@/lib/storage/rows";
+import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 
 export type RecentCollection = { name: string; slug: string; role: CollectionRole };
 
@@ -34,8 +39,8 @@ export type CrossOrgRecentCollection = {
  * sidebar). Annotates each row with its org so the table can render an
  * Organization column.
  *
- * One aggregated query: COUNT/MAX over a LEFT JOIN to records replaces
- * the per-row correlated subqueries.
+ * Record counts come from each collection's own table in one extra round
+ * trip (see recordCounts).
  */
 export async function listRecentCollectionsAcrossOrgs(
   userId: string,
@@ -50,8 +55,6 @@ export async function listRecentCollectionsAcrossOrgs(
       slug: collections.slug,
       role: collectionMembers.role,
       updatedAt: collections.updatedAt,
-      recordCount: sql<number>`count(${records.id})::int`,
-      lastRecordAt: sql<string | null>`max(${records.createdAt})::text`,
       organizationId: organizations.id,
       organizationSlug: organizations.slug,
       organizationName: organizations.name,
@@ -63,12 +66,16 @@ export async function listRecentCollectionsAcrossOrgs(
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId)),
     )
     .innerJoin(organizations, eq(organizations.id, collections.organizationId))
-    .leftJoin(records, and(eq(records.collectionId, collections.id), isNull(records.deletedAt)))
-    .groupBy(collections.id, collectionMembers.role, organizations.id)
     .orderBy(desc(collections.updatedAt))
     .limit(limit);
 
-  return rows.map((r) => ({ ...r, role: r.role as CollectionRole }));
+  const counts = await tableRows.recordCounts(rows.map((r) => r.id));
+  return rows.map((r) => ({ ...r, role: r.role as CollectionRole, ...countFields(counts.get(r.id)) }));
+}
+
+/** recordCount / lastRecordAt (ISO) for a listing row. */
+function countFields(entry: { count: number; lastAt: Date | null } | undefined): { recordCount: number; lastRecordAt: string | null } {
+  return { recordCount: entry?.count ?? 0, lastRecordAt: entry?.lastAt ? entry.lastAt.toISOString() : null };
 }
 
 export type DashboardCollectionRow = {
@@ -97,18 +104,16 @@ export async function listCollectionsForDashboard(
   const callerMember = alias(collectionMembers, "caller_member");
   const ownerMember = alias(collectionMembers, "owner_member");
 
-  return db
+  const rows = await db
     .select({
       id: collections.id,
       name: collections.name,
       slug: collections.slug,
-      recordCount: sql<number>`(SELECT count(*)::int FROM records r WHERE r.collection_id = "collections"."id" AND r.deleted_at IS NULL)`,
       viewCount: sql<number>`(SELECT count(*)::int + 1 FROM views v WHERE v.collection_id = "collections"."id")`,
       role: sql<CollectionRole>`${callerMember.role}`,
       ownerName: user.name,
       ownerEmail: user.email,
       updatedAt: collections.updatedAt,
-      lastRecordAt: sql<string | null>`(SELECT max(created_at)::text FROM records r WHERE r.collection_id = "collections"."id" AND r.deleted_at IS NULL)`,
     })
     .from(collections)
     .innerJoin(
@@ -122,6 +127,9 @@ export async function listCollectionsForDashboard(
     .leftJoin(user, eq(user.id, ownerMember.userId))
     .where(eq(collections.organizationId, organizationId))
     .orderBy(desc(collections.updatedAt));
+
+  const counts = await tableRows.recordCounts(rows.map((r) => r.id));
+  return rows.map(({ viewCount, ...r }) => ({ ...r, viewCount, ...countFields(counts.get(r.id)) }));
 }
 
 export async function listRecentCollectionsForUser(
@@ -171,8 +179,6 @@ export async function listCollections(userId: string, organizationId?: string) {
       createdAt: collections.createdAt,
       updatedAt: collections.updatedAt,
       role: collectionMembers.role,
-      recordCount: sql<number>`(SELECT count(*)::int FROM records WHERE records.collection_id = ${collections.id} AND deleted_at IS NULL)`,
-      lastRecordAt: sql<string>`(SELECT max(created_at) FROM records WHERE records.collection_id = ${collections.id} AND deleted_at IS NULL)`,
     })
     .from(collections)
     .innerJoin(
@@ -184,30 +190,11 @@ export async function listCollections(userId: string, organizationId?: string) {
 
   if (colls.length === 0) return [];
 
-  const collIds = colls.map((c) => c.id);
-  const fieldRows = await db.execute(
-    sql`SELECT r.collection_id, jsonb_object_keys(r.data) AS field_name
-        FROM (
-          SELECT DISTINCT ON (collection_id, data) collection_id, data
-          FROM records
-          WHERE collection_id = ANY(${sql.raw(`ARRAY[${collIds.join(',')}]`)})
-            AND deleted_at IS NULL
-          LIMIT ${colls.length * 10}
-        ) r`
-  );
-
-  const fieldsByCollection = new Map<number, Set<string>>();
-  for (const row of fieldRows.rows as { collection_id: number; field_name: string }[]) {
-    if (!fieldsByCollection.has(row.collection_id)) {
-      fieldsByCollection.set(row.collection_id, new Set());
-    }
-    fieldsByCollection.get(row.collection_id)!.add(row.field_name);
-  }
-
-  return colls.map((coll) => ({
-    ...coll,
-    fields: Array.from(fieldsByCollection.get(coll.id) || []).sort(),
-  }));
+  const counts = await tableRows.recordCounts(colls.map((c) => c.id));
+  return mapLimit(colls, COLLECTION_QUERY_CONCURRENCY, async (coll) => {
+    const fields = await tableRows.sampleFieldNames(coll.id, 10);
+    return { ...coll, ...countFields(counts.get(coll.id)), fields: fields.sort() };
+  });
 }
 
 export async function createCollection(userId: string, organizationId: string, params: {
@@ -241,29 +228,22 @@ export async function createCollection(userId: string, organizationId: string, p
 }
 
 export async function getCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
 
-  const [recordCount, [lastRecord]] = await Promise.all([
-    getCollectionRecordCount(collection.id),
-    db
-      .select({ lastAt: sql<string>`max(created_at)` })
-      .from(records)
-      .where(and(eq(records.collectionId, collection.id), notDeleted)),
+  const [recordCount, lastAt] = await Promise.all([
+    tableRows.countRecords(collection.id),
+    tableRows.lastRecordAt(collection.id),
   ]);
-
-  return {
-    ...collection,
-    role: access.role,
-    recordCount,
-    lastRecordAt: lastRecord?.lastAt,
-  };
+  return { ...collection, role: access.role, recordCount, lastRecordAt: lastAt ? lastAt.toISOString() : null };
 }
 
 export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
+  const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const dbUpdates: Record<string, unknown> = { updatedAt: new Date() };
@@ -289,17 +269,24 @@ export async function updateCollection(slug: string, userId: string, updates: Re
 }
 
 export async function deleteCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
+  const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
 
-  await db.delete(collections).where(eq(collections.id, access.collection.id));
+  await db.transaction(async (tx) => {
+    await dropCollectionTable(tx, access.collection.id);
+    await tx.delete(collections).where(eq(collections.id, access.collection.id));
+  });
   revalidateDashboard(slug);
   return { deleted: true, slug };
 }
 
 export async function inferCollectionSchema(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const inferred = await inferSchema(collection.id);
@@ -309,7 +296,7 @@ export async function inferCollectionSchema(slug: string, userId: string) {
   await db.update(collections).set({ schema: merged, updatedAt: new Date() }).where(eq(collections.id, collection.id));
   revalidateDashboard(slug, "schema");
 
-  return { schema: merged };
+  return { schema: merged, slug };
 }
 
 export async function updateFieldDefinition(
@@ -318,8 +305,10 @@ export async function updateFieldDefinition(
   fieldName: string,
   updates: Partial<Pick<FieldDefinition, "type" | "options" | "position" | "hidden">>
 ) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const schema = (collection.schema as CollectionSchema) || { fields: [], version: 0, lastInferredAt: "" };
@@ -340,7 +329,7 @@ export async function updateFieldDefinition(
   await db.update(collections).set({ schema, updatedAt: new Date() }).where(eq(collections.id, collection.id));
   revalidateDashboard(slug, "schema");
 
-  return { field: schema.fields[fieldIndex] };
+  return { field: schema.fields[fieldIndex], slug };
 }
 
 export async function addFieldDefinition(
@@ -356,8 +345,10 @@ export async function addFieldDefinition(
     return { error: `Field name must be ${MAX_FIELD_NAME_LENGTH} characters or fewer`, status: 400 };
   }
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collectionId = access.collection.id;
 
   // Lock the row so concurrent addFieldDefinition / addFieldOption calls can't
@@ -411,8 +402,10 @@ export async function addFieldOption(
   if ("error" in validated) return validated;
   const trimmed = validated.value;
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collectionId = access.collection.id;
 
   // Fast path: skip the row lock when the cached snapshot already contains the
@@ -480,34 +473,13 @@ const STATS_MAX_FIELDS = 50;
  * fill rates for top-level keys (most common first, capped at 50).
  */
 export async function getCollectionStats(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
-  const [summaryResult, statusResult, fieldResult] = await Promise.all([
-    db.execute(sql`
-      SELECT count(*)::int AS record_count,
-             min(created_at)::text AS first_created_at,
-             max(created_at)::text AS last_created_at,
-             min(updated_at)::text AS first_updated_at,
-             max(updated_at)::text AS last_updated_at,
-             coalesce(sum(pg_column_size(data)), 0)::bigint AS approx_storage_bytes
-      FROM records
-      WHERE collection_id = ${collection.id} AND deleted_at IS NULL`),
-    db.execute(sql`
-      SELECT status, count(*)::int AS count
-      FROM records
-      WHERE collection_id = ${collection.id} AND deleted_at IS NULL
-      GROUP BY status`),
-    db.execute(sql`
-      SELECT key, count(*)::int AS count
-      FROM records, LATERAL jsonb_object_keys(data) AS key
-      WHERE collection_id = ${collection.id} AND deleted_at IS NULL
-        AND jsonb_typeof(data) = 'object'
-      GROUP BY key
-      ORDER BY count DESC, key ASC
-      LIMIT ${STATS_MAX_FIELDS}`),
-  ]);
+  const [summaryResult, statusResult, fieldResult] = await tableRows.collectionStats(collection.id, STATS_MAX_FIELDS);
 
   const summary = (summaryResult.rows[0] ?? {}) as {
     record_count?: number;
@@ -545,12 +517,14 @@ export async function getCollectionStats(slug: string, userId: string) {
 }
 
 export async function describeCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
-  const recordCount = await getCollectionRecordCount(collection.id);
-  const fields = await describeCollectionFields(collection.id, recordCount);
+  const recordCount = await tableRows.countRecords(collection.id);
+  const fields = await describeCollectionFields(collection.id, recordCount, collection.storage);
 
   return {
     name: collection.name,
@@ -559,5 +533,29 @@ export async function describeCollection(slug: string, userId: string) {
     recordCount,
     uniqueKey: collection.uniqueKey,
     fields,
+    storage: await describeStorage(collection),
+  };
+}
+
+/**
+ * What inference has created for a collection: projected fields and
+ * unwound arrays with their reasons and child row counts.
+ */
+async function describeStorage(collection: { id: number; storage: unknown }) {
+  const registry = readRegistry(collection.storage);
+  const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
+  return {
+    evaluated_rows: registry.evaluated_rows,
+    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
+    unwinds: registry.unwinds.map((u) => ({
+      path: u.path,
+      fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
+      rows: counts[u.table] ?? 0,
+      reason: u.reason,
+    })),
+    // Arrays of objects that are not unwound yet, and why.
+    not_unwound: registry.pending_unwinds ?? [],
+    // Every index that can serve a query, including the GIN on the documents.
+    indexes: queryIndexes(collection.id, registry),
   };
 }

@@ -1,7 +1,3 @@
-import { db } from "./db";
-import { records } from "./db/schema";
-import { eq, and, sql } from "drizzle-orm";
-import { notDeleted } from "./db/queries";
 import { inferFieldType } from "./schema-inference";
 import { ISO_DATE, URL_RE } from "./constants";
 
@@ -12,7 +8,10 @@ type FieldInfo = {
   conflict?: boolean;
   frequency: number;
   sampleValues?: unknown[];
+  /** Exact number of distinct values over every live record (collections up to EXACT_DISTINCT_MAX_RECORDS). */
   distinctCount?: number;
+  /** Larger collections, indexed fields only: Postgres's planner estimate (pg_stats), not a count. */
+  distinctCountEstimate?: number;
   min?: unknown;
   max?: unknown;
   avg?: number;
@@ -21,16 +20,15 @@ type FieldInfo = {
   latest?: string;
 };
 
-export async function describeCollection(collectionId: number, totalRecords: number): Promise<FieldInfo[]> {
+/** Collections up to this many records get exact distinct counts; larger ones an estimate for indexed fields. */
+export const EXACT_DISTINCT_MAX_RECORDS = 20_000;
+
+export async function describeCollection(collectionId: number, totalRecords: number, storage?: unknown): Promise<FieldInfo[]> {
   if (totalRecords === 0) return [];
 
   const sampleSize = Math.min(totalRecords, 500);
-  const sampleRecords = await db
-    .select({ data: records.data })
-    .from(records)
-    .where(and(eq(records.collectionId, collectionId), notDeleted))
-    .orderBy(sql`random()`)
-    .limit(sampleSize);
+  const { sampleDocuments } = await import("./storage/rows");
+  const sampleRecords = (await sampleDocuments(collectionId, sampleSize, true)).map((data) => ({ data }));
 
   const fieldStats: Record<string, {
     count: number;
@@ -94,16 +92,13 @@ export async function describeCollection(collectionId: number, totalRecords: num
       name,
       type: inferredType || primaryType,
       frequency: Math.round(frequency * 100) / 100,
-      sampleValues: stat.values.slice(0, 3),
+      sampleValues: stat.values.slice(0, 3).map((v) => truncateSample(v)),
     };
 
     if (types.length > 1) {
       field.types = types;
       field.conflict = true;
     }
-
-    const uniqueValues = new Set(stat.values.map(v => JSON.stringify(v)));
-    field.distinctCount = uniqueValues.size;
 
     if (stat.numericValues.length > 0) {
       field.min = Math.min(...stat.numericValues);
@@ -124,9 +119,52 @@ export async function describeCollection(collectionId: number, totalRecords: num
     fields.push(field);
   }
 
+  // Distinct counts for scalar fields (arrays and objects have none).
+  const scalarKeys = Object.entries(fieldStats)
+    .filter(([, stat]) => ![...stat.types].some((t) => t === "array" || t === "object"))
+    .map(([name]) => name);
+  const { exactDistinctCounts, estimatedDistinctCounts } = await import("./storage/rows");
+  if (totalRecords <= EXACT_DISTINCT_MAX_RECORDS) {
+    const counts = await exactDistinctCounts(collectionId, scalarKeys);
+    for (const field of fields) if (counts[field.name] !== undefined) field.distinctCount = counts[field.name];
+  } else {
+    const counts = await estimatedDistinctCounts(collectionId, storage, scalarKeys);
+    for (const field of fields) if (counts[field.name] !== undefined) field.distinctCountEstimate = counts[field.name];
+  }
+
   fields.sort((a, b) => b.frequency - a.frequency || a.name.localeCompare(b.name));
 
   return fields;
+}
+
+/** Longest sample string describe returns; longer ones end in an ellipsis. */
+export const MAX_SAMPLE_STRING = 200;
+/** Array elements and object keys a sample keeps before summarizing the rest. */
+const MAX_SAMPLE_ITEMS = 3;
+const MAX_SAMPLE_DEPTH = 3;
+
+/**
+ * A sample value small enough to show: strings over MAX_SAMPLE_STRING are
+ * cut with an ellipsis, arrays keep their first few elements plus a
+ * "… N more" marker, objects their first few keys plus a "…" key, and
+ * anything nested deeper than MAX_SAMPLE_DEPTH becomes "…".
+ */
+export function truncateSample(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > MAX_SAMPLE_STRING ? `${value.slice(0, MAX_SAMPLE_STRING)}…` : value;
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= MAX_SAMPLE_DEPTH) return "…";
+  if (Array.isArray(value)) {
+    const kept = value.slice(0, MAX_SAMPLE_ITEMS).map((v) => truncateSample(v, depth + 1));
+    return value.length > MAX_SAMPLE_ITEMS ? [...kept, `… ${value.length - MAX_SAMPLE_ITEMS} more`] : kept;
+  }
+  const keys = Object.keys(value);
+  const limit = depth === 0 ? Math.max(MAX_SAMPLE_ITEMS, 8) : MAX_SAMPLE_ITEMS;
+  const out: Record<string, unknown> = {};
+  for (const k of keys.slice(0, limit)) out[k] = truncateSample((value as Record<string, unknown>)[k], depth + 1);
+  if (keys.length > limit) out["…"] = `${keys.length - limit} more keys`;
+  return out;
 }
 
 function inferSingleType(value: unknown): string {
