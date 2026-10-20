@@ -74,8 +74,9 @@ export type UpsertResult =
  * see hc_set_unique_key). Documents missing any key field never conflict
  * and are inserted, as in the shared layout. Within one batch, later
  * documents with the same key win for 'replace', are shallow-merged over
- * earlier ones for 'merge', and lose for 'skip'. 'merge' updates an existing
- * row to `data || excluded.data`, the shared layout's {...old, ...new}.
+ * earlier ones for 'merge', lose for 'skip', and make 'error' a conflict.
+ * 'merge' updates an existing row to `data || excluded.data`, the shared
+ * layout's {...old, ...new}.
  */
 export async function upsertRecords(
   collectionId: number,
@@ -99,6 +100,11 @@ export async function upsertRecords(
     if (at === undefined) {
       seen.set(key, deduped.length);
       deduped.push(doc);
+    } else if (mode === "error") {
+      // Two documents in one batch with the same key are a conflict, as
+      // they were in the old shared layout (which stored the first before
+      // reporting the second). The batch is one statement: nothing lands.
+      return { conflict: true };
     } else if (mode === "replace") {
       deduped[at] = doc;
     } else if (mode === "merge") {

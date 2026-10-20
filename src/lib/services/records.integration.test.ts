@@ -809,6 +809,17 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(data).toEqual([{ sku: "a1", qty: 1 }]);
     });
 
+    it("on_conflict error returns 409 for duplicates within one batch and writes nothing", async () => {
+      const slug = await upsertCollection("Upsert Error Batch");
+      const result = await recordsSvc.createRecords(USER_ID, ORG_ID, {
+        collection: "Upsert Error Batch",
+        records: [{ sku: "b1", qty: 1 }, { sku: "c1", qty: 1 }, { sku: "b1", qty: 2 }],
+        on_conflict: "error",
+      });
+      expect(result).toMatchObject({ status: 409 });
+      expect(await rawData(slug)).toEqual([]);
+    });
+
     it("non-conflicting records still insert alongside upserts", async () => {
       const slug = await upsertCollection("Upsert Mixed");
       await recordsSvc.createRecords(USER_ID, ORG_ID, {
