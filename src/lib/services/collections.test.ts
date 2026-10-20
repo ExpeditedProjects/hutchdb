@@ -42,6 +42,14 @@ vi.mock('@/lib/db', () => ({
   },
 }))
 
+// Writes run inside withCollectionWriteLock (a transaction holding the
+// collection's advisory lock); here it hands the mocked db and the
+// caller's collection straight to the callback.
+vi.mock('@/lib/storage/lock', async () => {
+  const { db } = await import('@/lib/db')
+  return { withCollectionWriteLock: vi.fn((collection: unknown, fn: (tx: unknown, c: unknown) => unknown) => fn(db, collection)) }
+})
+
 vi.mock('@/lib/db/queries', () => ({
   findAccessibleCollectionBySlug: vi.fn(),
   createCollectionWithOwner: vi.fn(),

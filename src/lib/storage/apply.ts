@@ -3,6 +3,7 @@ import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { addProjection, addUnwind, toTextArrayLiteral, type Executor } from "./ddl";
+import type { Conn, DbTx } from "./lock";
 import { arrayCandidates, inferDecisions, thresholdsFromEnv, type Thresholds } from "./inference";
 import {
   collectionTableName,
@@ -69,9 +70,10 @@ async function loadRegistry(collectionId: number): Promise<StorageRegistry> {
  */
 export async function updateRegistry(
   collectionId: number,
-  mutate: (registry: StorageRegistry, tx: Parameters<Parameters<typeof db.transaction>[0]>[0]) => Promise<StorageRegistry | null>,
+  mutate: (registry: StorageRegistry, tx: DbTx) => Promise<StorageRegistry | null>,
+  conn: Conn = db,
 ): Promise<StorageRegistry> {
-  return db.transaction(async (tx) => {
+  return conn.transaction(async (tx) => {
     const [row] = await tx
       .select({ storage: collections.storage })
       .from(collections)

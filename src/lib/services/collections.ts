@@ -13,6 +13,7 @@ import { seedAutoViews } from "./views";
 import { isTableLayout, readRegistry } from "@/lib/storage/registry";
 import { createCollectionTable, dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
+import { withCollectionWriteLock } from "@/lib/storage/lock";
 
 export type RecentCollection = { name: string; slug: string; role: CollectionRole };
 
@@ -320,14 +321,15 @@ export async function deleteCollection(slug: string, userId: string) {
   const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
 
-  if (isTableLayout(access.collection)) {
-    await db.transaction(async (tx) => {
-      await dropCollectionTable(tx, access.collection.id);
-      await tx.delete(collections).where(eq(collections.id, access.collection.id));
-    });
-  } else {
-    await db.delete(collections).where(eq(collections.id, access.collection.id));
-  }
+  // Under the write lock, so a storage migration of this collection is
+  // either finished (drop its table too) or not started.
+  await withCollectionWriteLock(access.collection, async (tx, fresh) => {
+    if (!fresh) return;
+    // A collection the storage migration has touched can own an hc_<id>
+    // table while still (or again, after a rollback) on 'shared'.
+    if (isTableLayout(fresh) || fresh.migrationState) await dropCollectionTable(tx, fresh.id);
+    await tx.delete(collections).where(eq(collections.id, fresh.id));
+  });
   revalidateDashboard(slug);
   return { deleted: true, slug };
 }

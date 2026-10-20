@@ -1,6 +1,7 @@
 import { db } from "@/lib/db";
 import { sql, type SQL } from "drizzle-orm";
 import { collectionTableName, ident } from "./registry";
+import type { Conn } from "./lock";
 
 /**
  * Row operations on a layout='table' collection's hc_<id> table. Result
@@ -55,9 +56,9 @@ function table(collectionId: number): SQL {
 }
 
 /** Plain batch insert, one statement, rows returned in input order. */
-export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api"): Promise<TableRecord[]> {
+export async function insertRecords(collectionId: number, docs: Record<string, unknown>[], source = "api", ex: Conn = db): Promise<TableRecord[]> {
   if (docs.length === 0) return [];
-  const result = await db.execute(sql`
+  const result = await ex.execute(sql`
     INSERT INTO ${table(collectionId)} AS t (data, source)
     SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(docs)}::jsonb)
     RETURNING ${RECORD_COLUMNS}`);
@@ -83,6 +84,7 @@ export async function upsertRecords(
   keys: string[],
   mode: UpsertMode,
   source = "api",
+  ex: Conn = db,
 ): Promise<UpsertResult> {
   const keyOf = (doc: Record<string, unknown>): string | null =>
     keys.every((k) => doc[k] !== undefined) ? JSON.stringify(keys.map((k) => doc[k])) : null;
@@ -113,7 +115,7 @@ export async function upsertRecords(
       ? sql`DO UPDATE SET data = t.data || excluded.data, source = excluded.source, updated_at = now()`
       : sql`DO NOTHING`;
 
-  return db.transaction(async (tx) => {
+  return ex.transaction(async (tx) => {
     const result = await tx.execute(sql`
       INSERT INTO ${table(collectionId)} AS t (data, source)
       SELECT value, ${source}::text FROM jsonb_array_elements(${JSON.stringify(deduped)}::jsonb)
@@ -165,8 +167,8 @@ async function findByKey(
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>): Promise<TableRecord | undefined> {
-  const result = await db.execute(sql`
+export async function updateRecordData(collectionId: number, recordId: number, data: Record<string, unknown>, ex: Conn = db): Promise<TableRecord | undefined> {
+  const result = await ex.execute(sql`
     UPDATE ${table(collectionId)} AS t SET data = ${JSON.stringify(data)}::jsonb, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -174,8 +176,8 @@ export async function updateRecordData(collectionId: number, recordId: number, d
   return row ? toRecord(collectionId, row) : undefined;
 }
 
-export async function setRecordStatus(collectionId: number, recordId: number, status: string): Promise<TableRecord | undefined> {
-  const result = await db.execute(sql`
+export async function setRecordStatus(collectionId: number, recordId: number, status: string, ex: Conn = db): Promise<TableRecord | undefined> {
+  const result = await ex.execute(sql`
     UPDATE ${table(collectionId)} AS t SET status = ${status}::text, updated_at = now()
     WHERE t.id = ${recordId} AND t.deleted_at IS NULL
     RETURNING ${RECORD_COLUMNS}`);
@@ -184,16 +186,16 @@ export async function setRecordStatus(collectionId: number, recordId: number, st
 }
 
 /** Soft delete; returns false when the record does not exist (or is already deleted). */
-export async function softDeleteRecord(collectionId: number, recordId: number): Promise<boolean> {
-  const result = await db.execute(sql`
+export async function softDeleteRecord(collectionId: number, recordId: number, ex: Conn = db): Promise<boolean> {
+  const result = await ex.execute(sql`
     UPDATE ${table(collectionId)} SET deleted_at = now()
     WHERE id = ${recordId} AND deleted_at IS NULL
     RETURNING id`);
   return result.rows.length > 0;
 }
 
-export async function softDeleteAll(collectionId: number): Promise<void> {
-  await db.execute(sql`UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL`);
+export async function softDeleteAll(collectionId: number, ex: Conn = db): Promise<void> {
+  await ex.execute(sql`UPDATE ${table(collectionId)} SET deleted_at = now() WHERE deleted_at IS NULL`);
 }
 
 export async function countRecords(collectionId: number): Promise<number> {
