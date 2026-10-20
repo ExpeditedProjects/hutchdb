@@ -13,7 +13,8 @@ import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
 import { isReady, queryIndexes, readRegistry, stateOf } from "@/lib/storage/registry";
 import { queueDueIndexBuild } from "@/lib/storage/build-queue";
-import { dropCollectionTable } from "@/lib/storage/ddl";
+import { dropCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout } from "@/lib/storage/ddl";
+import { findPgError } from "@/lib/db/errors";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 
@@ -291,10 +292,18 @@ export async function deleteCollection(slug: string, userId: string) {
   // The argument may be the collection's name; continue with its slug.
   slug = access.collection.slug;
 
-  await db.transaction(async (tx) => {
-    await dropCollectionTable(tx, access.collection.id);
-    await tx.delete(collections).where(eq(collections.id, access.collection.id));
-  });
+  try {
+    await db.transaction(async (tx) => {
+      // A background build holds a lock on the table: fail fast instead of
+      // queueing every read and write of it behind DROP TABLE.
+      await setRequestDdlLockTimeout(tx);
+      await dropCollectionTable(tx, access.collection.id);
+      await tx.delete(collections).where(eq(collections.id, access.collection.id));
+    });
+  } catch (err) {
+    if (findPgError(err)?.code === "55P03") return { error: `Collection '${slug}' was not deleted: ${INDEX_BUILD_BUSY_MESSAGE}.`, status: 409 };
+    throw err;
+  }
   revalidateDashboard(slug);
   return { deleted: true, slug };
 }

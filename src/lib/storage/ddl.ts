@@ -45,6 +45,23 @@ export async function createCollectionTable(ex: Executor, collectionId: number):
     ON ${table} (created_at)`);
 }
 
+/**
+ * lock_timeout for DDL a request runs on a collection table (DROP TABLE on
+ * delete, the unique-key change). A background build holds a lock on the
+ * table for as long as it runs; without this the request would wait the
+ * whole statement timeout, and every read and write of the table would
+ * queue behind it.
+ */
+export const REQUEST_DDL_LOCK_TIMEOUT_MS = 2000;
+
+/** What a request is told when its DDL could not get the table lock in time (see REQUEST_DDL_LOCK_TIMEOUT_MS). */
+export const INDEX_BUILD_BUSY_MESSAGE = "an index on this collection is being built in the background; try again in a minute";
+
+/** SET LOCAL lock_timeout = REQUEST_DDL_LOCK_TIMEOUT_MS, inside the caller's transaction. */
+export async function setRequestDdlLockTimeout(ex: Executor): Promise<void> {
+  await ex.execute(sql`SELECT set_config('lock_timeout', ${String(REQUEST_DDL_LOCK_TIMEOUT_MS)}, true)`);
+}
+
 export async function dropCollectionTable(ex: Executor, collectionId: number): Promise<void> {
   // DROP ... CASCADE only removes the child tables' FK constraints, so the
   // unwind tables (hc_<id>__*) are dropped by name first. starts_with, not
@@ -131,15 +148,15 @@ export async function createUnwindTable(ex: Executor, collectionId: number, unwi
       ON ${ident(child)} (${ident(f.column)})`);
   }
 
-  await ex.execute(sql`DROP TRIGGER IF EXISTS ${ident(triggerName(child, "ins"))} ON ${ident(parent)}`);
+  // CREATE OR REPLACE: one statement per trigger, so the SHARE ROW
+  // EXCLUSIVE lock writes queue behind is requested once each, not twice.
   await ex.execute(sql`
-    CREATE TRIGGER ${ident(triggerName(child, "ins"))}
+    CREATE OR REPLACE TRIGGER ${ident(triggerName(child, "ins"))}
     AFTER INSERT ON ${ident(parent)}
     REFERENCING NEW TABLE AS new_rows
     FOR EACH STATEMENT EXECUTE FUNCTION hc_sync_unwind(${sql.raw(String(collectionId))}, ${identLiteral(child)})`);
-  await ex.execute(sql`DROP TRIGGER IF EXISTS ${ident(triggerName(child, "upd"))} ON ${ident(parent)}`);
   await ex.execute(sql`
-    CREATE TRIGGER ${ident(triggerName(child, "upd"))}
+    CREATE OR REPLACE TRIGGER ${ident(triggerName(child, "upd"))}
     AFTER UPDATE ON ${ident(parent)}
     REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
     FOR EACH STATEMENT EXECUTE FUNCTION hc_sync_unwind(${sql.raw(String(collectionId))}, ${identLiteral(child)})`);

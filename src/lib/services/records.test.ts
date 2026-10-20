@@ -62,6 +62,8 @@ vi.mock('@/lib/storage/ddl', () => ({
   collectionTableExists: vi.fn().mockResolvedValue(true),
   createCollectionTable: vi.fn().mockResolvedValue(undefined),
   setUniqueKey: vi.fn().mockResolvedValue(undefined),
+  setRequestDdlLockTimeout: vi.fn().mockResolvedValue(undefined),
+  INDEX_BUILD_BUSY_MESSAGE: 'busy',
 }))
 
 vi.mock('@/lib/db/queries', () => ({

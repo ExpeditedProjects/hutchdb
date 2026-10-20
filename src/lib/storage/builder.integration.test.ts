@@ -179,6 +179,17 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
 
   const ids = (r: QueryResult) => r.records!.map((x) => x.data.n);
 
+  /** Poll until some other backend is waiting on a heavyweight lock with a statement matching `pattern` (ILIKE). */
+  async function waitForLockWaiter(pattern: string, timeoutMs = 5000): Promise<void> {
+    const end = Date.now() + timeoutMs;
+    while (Date.now() < end) {
+      const r = await testDb.execute(sql`SELECT count(*)::int AS n FROM pg_stat_activity WHERE pid <> pg_backend_pid() AND wait_event_type = 'Lock' AND query ILIKE ${pattern}`);
+      if ((r.rows[0] as { n: number }).n > 0) return;
+      await new Promise((res) => setTimeout(res, 10));
+    }
+    throw new Error(`no backend waited on a lock for ${pattern}`);
+  }
+
   describe("writes only queue; the builder creates expression indexes", () => {
     it("a threshold-crossing write queues pending expression projections and builds nothing; the builder makes them ready without adding columns", async () => {
       const docs = makeDocs(0, 150);
@@ -610,6 +621,55 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
     }, 20_000);
   });
 
+  describe("request DDL while a build holds the table", () => {
+    // What CREATE INDEX CONCURRENTLY holds on the table for the whole build.
+    async function holdBuildLock(id: number) {
+      const holder = await testPool.connect();
+      await holder.query("BEGIN");
+      await holder.query(`LOCK TABLE hc_${id} IN SHARE UPDATE EXCLUSIVE MODE`);
+      return async () => {
+        await holder.query("ROLLBACK");
+        holder.release();
+      };
+    }
+
+    it("deleting the collection fails fast with a clear error instead of blocking, and works once the build is done", async () => {
+      const slug = await store("busy-delete", makeDocs(0, 20));
+      const id = (await collectionRow(slug)).id;
+      const release = await holdBuildLock(id);
+      let result;
+      const started = Date.now();
+      try {
+        result = await collectionsSvc.deleteCollection(slug, USER_ID);
+      } finally {
+        await release();
+      }
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(result).toEqual({ error: `Collection '${slug}' was not deleted: an index on this collection is being built in the background; try again in a minute.`, status: 409 });
+      expect((await query(slug, { limit: 0 })).total).toBe(20);
+      expect(await collectionsSvc.deleteCollection(slug, USER_ID)).toEqual({ deleted: true, slug });
+    });
+
+    it("a store that has to apply a new unique key fails fast with a clear error, stores nothing, and works once the build is done", async () => {
+      const slug = await store("busy-key", makeDocs(0, 20));
+      const id = (await collectionRow(slug)).id;
+      ok(await collectionsSvc.updateCollection(slug, USER_ID, { unique_key: ["n"] }));
+      const release = await holdBuildLock(id);
+      let result;
+      const started = Date.now();
+      try {
+        result = await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: slug, records: makeDocs(100, 2), return: "summary" });
+      } finally {
+        await release();
+      }
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(result).toEqual({ error: "Nothing was stored: the collection's unique key [n] could not be applied because an index on this collection is being built in the background; try again in a minute.", status: 409 });
+      expect((await query(slug, { limit: 0 })).total).toBe(20);
+      ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: slug, records: makeDocs(100, 2), return: "summary" }));
+      expect((await query(slug, { limit: 0 })).total).toBe(22);
+    });
+  });
+
   describe("requests queue due builds", () => {
     it("a read of a collection with pending work queues it, and the drain builds it; a collection with nothing due queues nothing", async () => {
       const slug = await store("reads", makeDocs(0, 150));
@@ -726,6 +786,38 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       const after = ok(await recordsSvc.queryRecords(slug, USER_ID, { filter, sort: "key", limit: 1000 })) as { records: { data: Order }[] };
       expect(after.records.map((r) => r.data.key)).toEqual(expected);
       expect(await planIndexes(slug, { filter: { "items.sku": "s3" } })).toContain(`hc_${id}__items_p_sku_idx`);
+    });
+
+    it("an unwind build waiting for the table lock gives up well inside the request timeout, so a write queued behind it still lands", async () => {
+      const docs = orders(0, 120);
+      const slug = await store("ddl-wait", docs);
+      const id = (await collectionRow(slug)).id;
+      // Only the unwind stays queued: a projection's CREATE INDEX CONCURRENTLY would wait for the open transaction below too.
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{projections}', '[]') WHERE id = ${id}`);
+      expect((await registry(slug)).unwinds.map((u) => u.build?.state)).toEqual(["pending"]);
+      // An open write transaction: the child table's FK and the triggers need SHARE ROW EXCLUSIVE on the parent, so the build waits for it.
+      const holder = await testPool.connect();
+      let writeMs = 0;
+      let report;
+      try {
+        await holder.query("BEGIN");
+        await holder.query(`UPDATE hc_${id} SET source = source WHERE id = 1`);
+        const building = builder.buildPendingIndexes({ collectionId: id });
+        await waitForLockWaiter("%CREATE TABLE%");
+        // A request's write now queues behind the build's lock request.
+        const started = Date.now();
+        await store(slug, orders(1000, 1));
+        writeMs = Date.now() - started;
+        report = await building;
+      } finally {
+        await holder.query("ROLLBACK");
+        holder.release();
+      }
+      expect(writeMs).toBeLessThan(2500);
+      expect(report.collections[0].outcomes).toEqual([expect.objectContaining({ kind: "unwind", state: "failed", error: "the build could not get a lock on the collection's table in time" })]);
+      const retried = await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
+      expect(retried.failed).toBe(0);
+      expect(await childMatchesDocuments(id)).toMatchObject({ missing: 0, extra: 0 });
     });
 
     it("the backfill stays exact while inserts, updates and transforms run during it", async () => {

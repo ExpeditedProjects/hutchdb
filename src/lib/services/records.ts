@@ -12,14 +12,14 @@ import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } 
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
 import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
-import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
+import { collectionTableExists, createCollectionTable, INDEX_BUILD_BUSY_MESSAGE, setRequestDdlLockTimeout, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
 import { limitQueryOutput, truncateStrings, type OutputLimits } from "./output-limits";
-import { classifyDbError, describeDbError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
+import { classifyDbError, describeDbError, findPgError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -269,14 +269,20 @@ async function ensureUniqueKeyIndex(collection: CollectionRow, uniqueKey: string
   try {
     await updateRegistry(collection.id, async (current, tx) => {
       if (JSON.stringify(current.unique_key ?? []) === JSON.stringify(uniqueKey)) return null;
+      // A background build holds a lock on the table: fail fast instead of
+      // queueing every read and write of it behind the key change.
+      await setRequestDdlLockTimeout(tx);
       await setUniqueKey(tx, collection.id, uniqueKey);
       return { ...current, unique_key: uniqueKey };
     });
     return null;
   } catch (err) {
-    const pg = (err as { cause?: { code?: string } }).cause ?? (err as { code?: string });
-    if (pg && (pg as { code?: string }).code === "23505") {
+    const code = findPgError(err)?.code;
+    if (code === "23505") {
       return { error: `Existing records already contain duplicates of unique key [${uniqueKey.join(", ")}] — remove them before storing with on_conflict`, status: 409 };
+    }
+    if (code === "55P03") {
+      return { error: `Nothing was stored: the collection's unique key [${uniqueKey.join(", ")}] could not be applied because ${INDEX_BUILD_BUSY_MESSAGE}.`, status: 409 };
     }
     throw err;
   }

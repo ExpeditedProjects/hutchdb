@@ -56,6 +56,8 @@ vi.mock('@/lib/storage/rows', async (importOriginal) => ({
 
 vi.mock('@/lib/storage/ddl', () => ({
   dropCollectionTable: vi.fn().mockResolvedValue(undefined),
+  setRequestDdlLockTimeout: vi.fn().mockResolvedValue(undefined),
+  INDEX_BUILD_BUSY_MESSAGE: 'busy',
 }))
 
 vi.mock('@/lib/db/queries', () => ({

@@ -77,7 +77,7 @@ describe('builder settings', () => {
     expect(buildTimeoutMs({ HUTCH_INDEX_BUILD_TIMEOUT_MS: '30000' })).toBe(30_000)
     expect(buildTimeoutMs({ HUTCH_INDEX_BUILD_TIMEOUT_MS: 'nope' })).toBe(600_000)
     expect(buildTimeoutMs({ HUTCH_INDEX_BUILD_TIMEOUT_MS: '0' })).toBe(600_000)
-    expect(buildLockTimeoutMs({})).toBe(5000)
+    expect(buildLockTimeoutMs({})).toBe(1500)
     expect(staleBuildingMs({ HUTCH_INDEX_BUILD_TIMEOUT_MS: '1000' })).toBe(61_000)
   })
 })

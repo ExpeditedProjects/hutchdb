@@ -53,8 +53,13 @@ import {
 /** First key of the per-collection advisory lock ("HC" + 1). */
 export const INDEX_BUILD_LOCK_CLASS = 0x48430001;
 export const DEFAULT_INDEX_BUILD_TIMEOUT_MS = 10 * 60 * 1000;
-/** How long a build waits for a table lock (CREATE INDEX CONCURRENTLY's own, the trigger DDL's) before it fails and backs off. */
-export const DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS = 5000;
+/**
+ * How long a build waits for a table lock (the unwind's child table and
+ * trigger DDL) before it fails and backs off. Writes to the table queue
+ * behind that lock request, so it stays well under the request statement
+ * timeout (5 s): a write stuck behind it still finishes.
+ */
+export const DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS = 1500;
 /**
  * lock_timeout for CREATE/DROP INDEX CONCURRENTLY. Besides the table lock,
  * they wait for every transaction with an older snapshot — another
