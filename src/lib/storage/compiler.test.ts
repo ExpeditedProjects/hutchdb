@@ -684,11 +684,12 @@ describe('compileQuery: $or / $and', () => {
 
 describe('compileQuery: count of a path, first, group_by keys', () => {
   it('"count" counts rows; {"count": path} counts rows with a non-null value there; {"count": "*"} is count', () => {
-    const { sql } = compile({ groupBy: 'status', aggregate: { rows: 'count', star: { count: '*' }, priced: { count: 'price' } } })
+    const { sql } = compile({ groupBy: 'status', aggregate: { rows: 'count', star: { count: '*' }, titled: { count: 'title' }, priced: { count: 'price' } } })
     expect(sql).toContain('count(*)::int AS "rows"')
     expect(sql).toContain('count(*)::int AS "star"')
-    expect(sql).toContain(`(count(*) FILTER (WHERE t.data->$`)
-    expect(sql).toMatch(/IS NOT NULL AND t\.data->\$\d+::text <> 'null'::jsonb\)\)::int AS "priced"/)
+    expect(sql).toMatch(/\(count\(\*\) FILTER \(WHERE t\.data->\$\d+::text IS NOT NULL AND t\.data->\$\d+::text <> 'null'::jsonb\)\)::int AS "titled"/)
+    // A projected field without misfits is read from its column, like a group key.
+    expect(sql).toContain(`(count(*) FILTER (WHERE to_jsonb(t."p_price") IS NOT NULL AND to_jsonb(t."p_price") <> 'null'::jsonb))::int AS "priced"`)
   })
 
   it('{"count": path} and first on an unwound array read the element itself (lateral), not the child column', () => {
@@ -700,7 +701,8 @@ describe('compileQuery: count of a path, first, group_by keys', () => {
   })
 
   it('first takes the first non-null value in row id (then element) order', () => {
-    expect(compile({ groupBy: 'status', aggregate: { p: { first: 'price' } } }).sql).toMatch(/\(array_agg\(t\.data->\$\d+::text ORDER BY t\.id\) FILTER \(WHERE .* <> 'null'::jsonb\)\)\[1\] AS "p"/)
+    expect(compile({ groupBy: 'status', aggregate: { p: { first: 'title' } } }).sql).toMatch(/\(array_agg\(t\.data->\$\d+::text ORDER BY t\.id\) FILTER \(WHERE .* <> 'null'::jsonb\)\)\[1\] AS "p"/)
+    expect(compile({ groupBy: 'status', aggregate: { p: { first: 'price' } } }).sql).toContain(`(array_agg(to_jsonb(t."p_price") ORDER BY t.id)`)
     expect(compile({ groupBy: 'votes.label', aggregate: { p: { first: 'votes.points' } } }).sql).toContain('ORDER BY t.id, e.ord)')
   })
 

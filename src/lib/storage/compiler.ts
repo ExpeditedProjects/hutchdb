@@ -850,7 +850,11 @@ function childExprs(unwind: Unwind, key: string): FieldExprs | null {
  * true and avg the share that are).
  */
 function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
-  const present = sql`${f.jsonb} IS NOT NULL AND ${f.jsonb} <> 'null'::jsonb`;
+  // count-of-path and first read the value as a group key does: from a
+  // projection column while it holds every value at the field (no
+  // misfits), so a parent field aggregated per element is not re-read
+  // from the whole document for every element.
+  const present = sql`${f.group} IS NOT NULL AND ${f.group} <> 'null'::jsonb`;
   switch (op) {
     case "count":
       // {"count": "path"}: rows (or elements) in the group with a value at the path.
@@ -858,7 +862,7 @@ function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
     case "first":
       // Any one value from the group, chosen deterministically: the first
       // non-null value in row id order (then element order within a record).
-      return sql`(array_agg(${f.jsonb} ORDER BY ${firstOrder}) FILTER (WHERE ${present}))[1]`;
+      return sql`(array_agg(${f.group} ORDER BY ${firstOrder}) FILTER (WHERE ${present}))[1]`;
     case "min":
     case "max": {
       const fn = sql.raw(op);
