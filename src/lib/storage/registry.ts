@@ -19,10 +19,23 @@ export type Projection = {
    * a path.
    */
   path?: string[];
-  /** Sanitized column name on the collection table (p_<...>). */
+  /**
+   * Sanitized name (p_<...>): the generated column of a legacy "column"
+   * projection, and the name its index is derived from (indexName).
+   */
   column: string;
   type: ProjectionType;
   reason: string;
+  /**
+   * How the projection is stored. "expression" (every projection created
+   * now): an expression index over the guarded cast of the document value,
+   * built in the background (`build`), never a column. Absent: a legacy
+   * stored generated column `column`, created in the write before builds
+   * moved out of it; those stay as they are and are always ready.
+   */
+  kind?: "expression";
+  /** Background build state. Absent means ready (legacy entries). */
+  build?: IndexBuild;
   /**
    * Sticky: some live document has held a value at this field that is not
    * of `type` (including JSON null, and text over MAX_INDEXED_TEXT_BYTES).
@@ -46,7 +59,34 @@ export type Unwind = {
   table: string;
   fields: UnwindField[];
   reason: string;
+  /**
+   * Background build state of the child table (create, triggers, backfill).
+   * Absent means ready (unwinds built in the write before builds moved out
+   * of it). The compiler only reads the child table once it is ready.
+   */
+  build?: IndexBuild;
 };
+
+export type BuildState = "pending" | "building" | "ready" | "failed";
+
+/**
+ * Where a background build stands (builder.ts). Writes only queue work
+ * ("pending"); the builder moves it to building, then ready or failed.
+ */
+export type IndexBuild = {
+  state: BuildState;
+  /** When the state last changed. */
+  at: string;
+  /** Failed attempts so far (cleared when it becomes ready). */
+  attempts?: number;
+  /** failed: a generic reason, never driver or SQL text (that goes to the server log). */
+  error?: string;
+  /** failed: no automatic retry before this time. */
+  retry_after?: string;
+};
+
+/** The full-text search index (GIN over the documents' tsvector). */
+export type SearchIndex = { build: IndexBuild; reason: string };
 
 export type StorageRegistry = {
   projections: Projection[];
@@ -56,20 +96,14 @@ export type StorageRegistry = {
   unique_key?: string[];
   /** Arrays of objects that are not unwound yet, each with the latest reason (below threshold, mixed shapes, a failed attempt, ...). */
   pending_unwinds?: { path: string; reason: string }[];
-  /**
-   * Projection/unwind DDL that failed, by projectionKey (projections) or
-   * path (unwinds), with when; not retried until DDL_RETRY_BACKOFF_MS has
-   * passed (apply.ts). The failure detail goes to the server log only.
-   */
-  failed_ddl?: FailedDdl[];
+  /** GIN index serving `search`, queued once the table is large enough (apply.ts). */
+  search_index?: SearchIndex;
   /**
    * Set by `npm run storage:cutover` once the collection's rows were copied
    * from the old `records` table and verified; a re-run skips it.
    */
   cutover?: CutoverMark;
 };
-
-export type FailedDdl = { kind: "projection" | "unwind"; key: string; at: string };
 
 export type CutoverMark = {
   at: string;
@@ -99,9 +133,61 @@ export function readRegistry(raw: unknown): StorageRegistry {
     evaluated_rows: typeof r.evaluated_rows === "number" ? r.evaluated_rows : 0,
     ...(Array.isArray(r.unique_key) ? { unique_key: r.unique_key } : {}),
     ...(Array.isArray(r.pending_unwinds) ? { pending_unwinds: r.pending_unwinds } : {}),
-    ...(Array.isArray(r.failed_ddl) ? { failed_ddl: r.failed_ddl } : {}),
+    ...(r.search_index && typeof r.search_index === "object" ? { search_index: r.search_index } : {}),
     ...(r.cutover && typeof r.cutover === "object" ? { cutover: r.cutover } : {}),
   };
+}
+
+/** Whether a registry entry can serve queries: built, or a legacy entry (no build state). */
+export function isReady(entry: { build?: IndexBuild }): boolean {
+  return !entry.build || entry.build.state === "ready";
+}
+
+/**
+ * The registry as queries see it: only projections, unwinds and the search
+ * index whose build is ready. Anything still pending, building or failed is
+ * invisible to the compiler, which then evaluates the documents (same
+ * answers, no index).
+ */
+export function readQueryRegistry(raw: unknown): StorageRegistry {
+  const registry = readRegistry(raw);
+  const { search_index, ...rest } = registry;
+  return {
+    ...rest,
+    projections: registry.projections.filter(isReady),
+    unwinds: registry.unwinds.filter(isReady),
+    ...(search_index && isReady(search_index) ? { search_index } : {}),
+  };
+}
+
+/** Every entry with a build state, as [kind, key, entry]. */
+export function buildEntries(registry: StorageRegistry): { kind: "projection" | "unwind" | "search"; key: string; build?: IndexBuild }[] {
+  return [
+    ...registry.projections.map((p) => ({ kind: "projection" as const, key: projectionKey(p), build: p.build })),
+    ...registry.unwinds.map((u) => ({ kind: "unwind" as const, key: u.path, build: u.build })),
+    ...(registry.search_index ? [{ kind: "search" as const, key: "search", build: registry.search_index.build }] : []),
+  ];
+}
+
+/**
+ * Whether `build` is work a builder should pick up at `now`: pending, failed
+ * with its retry time passed (or `retryFailed`), or building for longer than
+ * `staleBuildingMs` (the builder that set it is gone; a builder holding the
+ * collection's lock passes 0, since no one else can be building).
+ */
+export function isDue(build: IndexBuild | undefined, now: number, opts: { retryFailed?: boolean; staleBuildingMs?: number } = {}): boolean {
+  if (!build) return false;
+  switch (build.state) {
+    case "pending": return true;
+    case "failed": return opts.retryFailed === true || !(Date.parse(build.retry_after ?? "") > now);
+    case "building": return opts.staleBuildingMs !== undefined && now - Date.parse(build.at) >= opts.staleBuildingMs;
+    default: return false;
+  }
+}
+
+/** Whether the registry has build work due (see isDue). */
+export function hasDueBuilds(registry: StorageRegistry, now: number, opts: { retryFailed?: boolean; staleBuildingMs?: number } = {}): boolean {
+  return buildEntries(registry).some((e) => isDue(e.build, now, opts));
 }
 
 // ── Identifiers ──────────────────────────────────────────────────────────────
@@ -278,13 +364,37 @@ export function findUnwind(registry: StorageRegistry, path: string): Unwind | un
   return registry.unwinds.find((u) => u.path === path);
 }
 
-export type IndexDescription = { index: string; on: string; serves: string };
+export type IndexDescription = {
+  index: string;
+  on: string;
+  serves: string;
+  /** Background build state: queries use the index only once it is "ready". */
+  state: BuildState;
+  /** failed: generic reason and when it is retried. */
+  error?: string;
+  retry_after?: string;
+};
+
+/** The index name of the full-text search GIN on a collection table. */
+export function searchIndexName(table: string): string {
+  return indexName(table, "search");
+}
+
+function stateOf(build: IndexBuild | undefined): Pick<IndexDescription, "state" | "error" | "retry_after"> {
+  if (!build) return { state: "ready" };
+  return {
+    state: build.state,
+    ...(build.state === "failed" && build.error ? { error: build.error } : {}),
+    ...(build.state === "failed" && build.retry_after ? { retry_after: build.retry_after } : {}),
+  };
+}
 
 /**
  * Every index on a collection's tables that can serve a query, in the
- * words of what it serves: the GIN on the documents, created_at, the
- * unique key, each projection and each unwound element column. Derived
- * from the registry (the same names the compiler matches against EXPLAIN).
+ * words of what it serves, with its build state: the GIN on the documents,
+ * created_at, the unique key, each projection, the search index and each
+ * unwound element column. Derived from the registry (the same names the
+ * compiler matches against EXPLAIN). Only "ready" ones serve queries.
  */
 export function queryIndexes(collectionId: number, registry: StorageRegistry): IndexDescription[] {
   const table = collectionTableName(collectionId);
@@ -293,22 +403,27 @@ export function queryIndexes(collectionId: number, registry: StorageRegistry): I
       index: indexName(table, "data_gin"),
       on: "data (every document, GIN jsonb_path_ops)",
       serves: "equality on any field or path, including elements of arrays of scalars ({\"tags\": \"hiking\"}) and keys inside arrays of objects ({\"answers.author.user_id\": 4148}), containment ({\"tags\": [\"a\", \"b\"]}) and $in; not ranges, $ne/$nin, $exists or $contains",
+      state: "ready",
     },
-    { index: indexName(table, "created_at"), on: "created_at", serves: "created_after / created_before and sort on created_at" },
+    { index: indexName(table, "created_at"), on: "created_at", serves: "created_after / created_before and sort on created_at", state: "ready" },
   ];
   if ((registry.unique_key ?? []).length > 0) {
-    out.push({ index: uniqueIndexName(table), on: `unique key (${registry.unique_key!.join(", ")})`, serves: "equality on the unique key fields and on_conflict upserts" });
+    out.push({ index: uniqueIndexName(table), on: `unique key (${registry.unique_key!.join(", ")})`, serves: "equality on the unique key fields and on_conflict upserts", state: "ready" });
   }
   for (const p of registry.projections) {
     out.push({
       index: indexName(table, p.column),
       on: `${projectionKey(p)} (${p.type}), then created_at DESC, id DESC`,
       serves: `equality, $in, $ne${p.mixed ? "" : ", ranges and sort"} on ${projectionKey(p)}, returned newest first without a separate sort`,
+      ...stateOf(p.build),
     });
+  }
+  if (registry.search_index) {
+    out.push({ index: searchIndexName(table), on: "to_tsvector('english', data::text) (GIN)", serves: "search (full-text) in hutch_query_records and hutch_search", ...stateOf(registry.search_index.build) });
   }
   for (const u of registry.unwinds) {
     for (const f of u.fields) {
-      out.push({ index: indexName(u.table, f.column), on: `${u.path}[].${f.field} (${f.type})`, serves: `filters on ${u.path}.${f.field}, and group_by/aggregate over ${u.path} elements` });
+      out.push({ index: indexName(u.table, f.column), on: `${u.path}[].${f.field} (${f.type})`, serves: `filters on ${u.path}.${f.field}, and group_by/aggregate over ${u.path} elements`, ...stateOf(u.build) });
     }
   }
   return out;

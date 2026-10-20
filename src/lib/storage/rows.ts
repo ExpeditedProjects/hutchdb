@@ -1,7 +1,7 @@
 import { db } from "@/lib/db";
 import { sql, TransactionRollbackError, type SQL } from "drizzle-orm";
 import { toTextArrayLiteral } from "./ddl";
-import { collectionTableName, ident, readRegistry } from "./registry";
+import { collectionTableName, ident, indexName, readQueryRegistry } from "./registry";
 
 /**
  * Row operations on a collection's hc_<id> table. Result rows are the
@@ -463,13 +463,22 @@ export type SearchMatch = TableRecord & { rank: number };
  * `rank` lets matches from several collections be merged in one order.
  */
 export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<SearchMatch[]> {
-  const result = await tx.execute(sql`
+  const result = await tx.execute(searchRecordsQuery(collectionId, search, limit));
+  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+}
+
+/**
+ * The searchRecords statement. Its match condition is the expression of
+ * the collection's search GIN (builder.ts), so the index serves it once
+ * built.
+ */
+export function searchRecordsQuery(collectionId: number, search: string, limit: number): SQL {
+  return sql`
     SELECT ${RECORD_COLUMNS}, m.rank FROM ${table(collectionId)} t,
       LATERAL (SELECT ts_rank(to_tsvector('english', t.data::text), plainto_tsquery('english', ${search}))::float8 AS rank) m
     WHERE t.deleted_at IS NULL AND to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})
     ORDER BY m.rank DESC, t.created_at DESC, t.id DESC
-    LIMIT ${limit}`);
-  return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
+    LIMIT ${limit}`;
 }
 
 /** Top-level keys of a few live documents, for hutch_list_collections. */
@@ -562,24 +571,37 @@ export async function exactDistinctCounts(collectionId: number, keys: string[]):
 
 /**
  * Postgres's estimate of distinct values for top-level keys that have a
- * projection column, from pg_stats (n_distinct, a fraction of reltuples
- * when negative). Keys without a column or without statistics yet are
- * left out.
+ * ready projection, from pg_stats (n_distinct, a fraction of reltuples
+ * when negative): the table's statistics for a legacy projection column,
+ * the projection index's own statistics (its first column) for an
+ * expression projection. Keys without a ready projection or without
+ * statistics yet (ANALYZE has not run since the index was built) are left
+ * out.
  */
 export async function estimatedDistinctCounts(collectionId: number, storage: unknown, keys: string[]): Promise<Record<string, number>> {
-  const registry = readRegistry(storage);
-  const columns = new Map(registry.projections.filter((p) => !p.path && keys.includes(p.field)).map((p) => [p.column, p.field]));
-  if (columns.size === 0) return {};
+  const registry = readQueryRegistry(storage);
   const name = collectionTableName(collectionId);
+  // pg_stats relation name and column -> field.
+  const sources = new Map<string, string>();
+  for (const p of registry.projections) {
+    if (p.path || !keys.includes(p.field)) continue;
+    // An index's expression column is named by Postgres ("case" for ours): matched as attnum 1 below, "" here.
+    sources.set(JSON.stringify(p.kind === "expression" ? [indexName(name, p.column), ""] : [name, p.column]), p.field);
+  }
+  if (sources.size === 0) return {};
+  const pairs = [...sources.keys()].map((k) => JSON.parse(k) as [string, string]);
   const result = await db.execute(sql`
-    SELECT s.attname, s.n_distinct, c.reltuples
-    FROM pg_stats s JOIN pg_class c ON c.relname = s.tablename AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname)
-    WHERE s.schemaname = current_schema() AND s.tablename = ${name} AND s.attname = ANY(${`{${[...columns.keys()].join(",")}}`}::text[])`);
+    SELECT w.rel AS tablename, w.col AS attname, s.n_distinct, c.reltuples
+    FROM unnest(${toTextArrayLiteral(pairs.map((p) => p[0]))}::text[], ${toTextArrayLiteral(pairs.map((p) => p[1]))}::text[]) AS w(rel, col)
+    JOIN pg_stats s ON s.schemaname = current_schema() AND s.tablename = w.rel
+      AND s.attname = CASE WHEN w.col = '' THEN (SELECT a.attname FROM pg_attribute a WHERE a.attrelid = to_regclass(w.rel) AND a.attnum = 1) ELSE w.col END
+    JOIN pg_class c ON c.relname = ${name} AND c.relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = s.schemaname)`);
   const out: Record<string, number> = {};
-  for (const row of result.rows as { attname: string; n_distinct: number; reltuples: number }[]) {
+  for (const row of result.rows as { tablename: string; attname: string; n_distinct: number; reltuples: number }[]) {
     const nd = Number(row.n_distinct);
     const estimate = nd >= 0 ? nd : Math.round(-nd * Number(row.reltuples));
-    if (Number.isFinite(estimate) && estimate > 0) out[columns.get(row.attname)!] = Math.round(estimate);
+    const field = sources.get(JSON.stringify([row.tablename, row.attname]));
+    if (field !== undefined && Number.isFinite(estimate) && estimate > 0) out[field] = Math.round(estimate);
   }
   return out;
 }

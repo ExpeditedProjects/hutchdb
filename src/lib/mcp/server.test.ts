@@ -427,7 +427,7 @@ describe('field paging on describe and get_collection', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const get = registeredConfigs.get('hutch_get_collection')!.description as string
     expect(get).toMatch(/saved schema/)
-    expect(get).toMatch(/failed_ddl/)
+    expect(get).toMatch(/build state \(pending, building, ready, or failed/)
     expect(get).toMatch(/storage\.unwinds/)
     const describe = registeredConfigs.get('hutch_describe_collection')!.description as string
     expect(describe).toMatch(/at most 60 fields per call/)

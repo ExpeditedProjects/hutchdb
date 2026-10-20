@@ -11,7 +11,8 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { queryIndexes, readRegistry } from "@/lib/storage/registry";
+import { queryIndexes, readRegistry, type IndexBuild } from "@/lib/storage/registry";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import { dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
@@ -579,26 +580,39 @@ export async function describeCollection(slug: string, userId: string, page: Fie
   };
 }
 
+/** An entry's build state for describe: ready unless still pending, building or failed (with a generic reason). */
+function buildState(build: IndexBuild | undefined) {
+  if (!build || build.state === "ready") return { state: "ready" as const };
+  return {
+    state: build.state,
+    ...(build.state === "failed" ? { error: build.error, retry_after: build.retry_after } : {}),
+  };
+}
+
 /**
  * What inference has created for a collection: projected fields and
- * unwound arrays with their reasons and child row counts.
+ * unwound arrays with their reasons, build states and child row counts.
  */
 async function describeStorage(collection: { id: number; storage: unknown }) {
+  queueDueIndexBuild(collection);
   const registry = readRegistry(collection.storage);
-  const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
+  const ready = registry.unwinds.filter((u) => !u.build || u.build.state === "ready");
+  const counts = await tableRows.childTableCounts(ready.map((u) => u.table));
   return {
     evaluated_rows: registry.evaluated_rows,
     projections: registry.projections.map((p) => p.mixed
       // The stored reason describes the data when the column was made;
       // since then some record held another type there.
-      ? { field: p.field, type: p.type, mixed: true, reason: `Projected as ${p.type} when '${p.field}' held only ${p.type} values; some records now hold other types there (mixed), so this column serves equality, $in and $ne, while ranges and sort read the documents.` }
-      : { field: p.field, type: p.type, reason: p.reason }),
+      ? { field: p.field, type: p.type, mixed: true, ...buildState(p.build), reason: `Projected as ${p.type} when '${p.field}' held only ${p.type} values; some records now hold other types there (mixed), so this column serves equality, $in and $ne, while ranges and sort read the documents.` }
+      : { field: p.field, type: p.type, reason: p.reason, ...buildState(p.build) }),
     unwinds: registry.unwinds.map((u) => ({
       path: u.path,
       fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
       rows: counts[u.table] ?? 0,
       reason: u.reason,
+      ...buildState(u.build),
     })),
+    ...(registry.search_index ? { search_index: { reason: registry.search_index.reason, ...buildState(registry.search_index.build) } } : {}),
     // Arrays of objects that are not unwound yet, and why.
     not_unwound: registry.pending_unwinds ?? [],
     // Every index that can serve a query, including the GIN on the documents.
@@ -607,24 +621,28 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
 }
 
 /**
- * One sentence for a timeout message when the collection's registry shows
- * index builds (projections or unwinds) that failed, so queries on those
- * fields read every document; undefined when there are none. One indexed
- * lookup of the collection row, run only after a timeout.
+ * One sentence for a timeout message when some of the collection's indexes
+ * (projections, unwinds, the search index) are not ready — queued, being
+ * built, or failed — so queries on those fields read every document;
+ * undefined when every index is ready. One indexed lookup of the
+ * collection row, run only after a timeout.
  */
 export async function storageTimeoutHint(slug: string, userId: string): Promise<string | undefined> {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return undefined;
-  const failed = readRegistry(access.collection.storage).failed_ddl ?? [];
-  if (failed.length === 0) return undefined;
-  const names = failed.map((f) => {
-    if (f.kind === "unwind") return f.key;
-    try {
-      const segments = JSON.parse(f.key);
-      return Array.isArray(segments) ? segments.join(".") : f.key;
-    } catch {
-      return f.key;
-    }
-  });
-  return `Building indexes for ${names.map((n) => `'${n}'`).join(", ")} on this collection failed (see hutch_get_collection storage.failed_ddl), so queries on those fields read every document until a later write retries them.`;
+  const registry = readRegistry(access.collection.storage);
+  const label = (kind: string, key: string) => (kind === "search" ? "full-text search" : `'${key}'`);
+  const names = (states: string[]) => [
+    ...registry.projections.filter((p) => p.build && states.includes(p.build.state)).map((p) => label("projection", p.path ? p.path.join(".") : p.field)),
+    ...registry.unwinds.filter((u) => u.build && states.includes(u.build.state)).map((u) => label("unwind", u.path)),
+    ...(registry.search_index?.build && states.includes(registry.search_index.build.state) ? [label("search", "")] : []),
+  ];
+  const failed = names(["failed"]);
+  const waiting = names(["pending", "building"]);
+  const parts: string[] = [];
+  if (failed.length > 0) parts.push(`Building indexes for ${failed.join(", ")} on this collection failed and will be retried`);
+  if (waiting.length > 0) parts.push(`indexes for ${waiting.join(", ")} are still being built in the background`);
+  if (parts.length === 0) return undefined;
+  const sentence = parts.join("; ");
+  return `${sentence[0].toUpperCase()}${sentence.slice(1)} (see hutch_describe_collection storage.indexes), so until they are ready queries on those fields read every document.`;
 }

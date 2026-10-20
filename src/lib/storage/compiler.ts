@@ -22,7 +22,8 @@ import {
   findUnwind,
   ident,
   indexName,
-  readRegistry,
+  readQueryRegistry,
+  searchIndexName,
   type Projection,
   type ProjectionType,
   type StorageRegistry,
@@ -30,6 +31,7 @@ import {
   valueFitsType,
 } from "./registry";
 import { TtlCache } from "./ttl-cache";
+import { projectionValue } from "./expression";
 import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from "./rows";
 import { applyArrayOps, ARRAY_OPS_HELP, fieldHeads, fieldsCover, parseArrayOps, projectData, type ArrayOps } from "./projection";
 
@@ -674,7 +676,7 @@ function fieldConditions(ctx: Ctx, key: string, target: DocTarget, projection: P
   const out: SQL[] = [];
   for (const cond of entries(value)) {
     const label = `filter on ${key}${cond.op ? ` (${cond.op})` : ""}`;
-    const routed = projection ? projectedCondition(target, sql`t.${ident(projection.column)}`, projection, cond.op, cond.operand) : null;
+    const routed = projection ? projectedCondition(target, projectionValue(projection, "t"), projection, cond.op, cond.operand) : null;
     if (routed && projection) {
       out.push(routed);
       const indexes = [indexName(ctx.parent, projection.column), ...(projection.mixed && cond.op === null ? [ctx.gin] : [])];
@@ -781,7 +783,7 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   if (parsed.kind === "object") {
     const projection = findPathProjection(registry, parsed.segments);
     if (projection && !projection.mixed) {
-      const column = sql`t.${ident(projection.column)}`;
+      const column = projectionValue(projection, "t");
       return { orderBy: sql`${column} ${dir} NULLS LAST`, clause: { label, indexes: [indexName(parent, projection.column)] }, ...(sort.startsWith("-") ? { descendingColumn: column } : {}) };
     }
     // `#>` keeps jsonb typing so numbers order numerically.
@@ -792,7 +794,7 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   }
   const projection = findProjection(registry, field);
   if (projection && !projection.mixed) {
-    const column = sql`t.${ident(projection.column)}`;
+    const column = projectionValue(projection, "t");
     return {
       orderBy: sql`${column} ${dir} NULLS LAST`,
       clause: { label, indexes: [indexName(parent, projection.column)] },
@@ -853,7 +855,7 @@ function documentExprs(json: SQL, text: SQL): FieldExprs {
  */
 function withProjection(exprs: FieldExprs, projection: Projection | undefined): FieldExprs {
   if (!projection) return exprs;
-  const col = sql`t.${ident(projection.column)}`;
+  const col = projectionValue(projection, "t");
   const out = { ...exprs };
   if (projection.type === "number") out.numeric = exactNumeric(col);
   if (projection.type === "boolean") out.boolean = col;
@@ -1120,7 +1122,7 @@ function dataTimeBucket(json: SQL, unit: string): SQL {
 // ── compile ──────────────────────────────────────────────────────────────────
 
 export function compileQuery(collection: Collection, params: TableQueryParams, options: CompileOptions = {}): CompiledQuery {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const parentTable = collectionTableName(collection.id);
   const ctx: Ctx = {
     registry,
@@ -1136,8 +1138,9 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
   const clauses = [...parsed.clauses];
   const parent: SQL[] = [sql`t.deleted_at IS NULL`, ...parsed.parent];
   if (search) {
+    // The same expression as the search GIN (builder.ts), so it serves this once built.
     parent.push(sql`to_tsvector('english', t.data::text) @@ plainto_tsquery('english', ${search})`);
-    clauses.push({ label: "search", indexes: [] });
+    clauses.push({ label: "search", indexes: registry.search_index ? [searchIndexName(parentTable)] : [] });
   }
   if (createdAfter) {
     parent.push(sql`t.created_at >= ${createdAfter}::timestamptz`);
@@ -1212,7 +1215,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
  * compiles to, for statements other than a query: transform's set_field.
  */
 export function compileFilterWhere(collection: Collection, filter: Record<string, unknown>, options: CompileOptions = {}): SQL {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const parentTable = collectionTableName(collection.id);
   const ctx: Ctx = { registry, arrayPaths: new Set(options.arrayPaths ?? []), parent: parentTable, gin: indexName(parentTable, "data_gin") };
   const parsed = compileFilter(ctx, filter);
@@ -1590,7 +1593,7 @@ async function detectArrayPaths(collection: Collection, registry: StorageRegistr
  * with the same array detection a query does: transform's set_field.filter.
  */
 export async function tableFilterWhere(collection: Collection, filter: Record<string, unknown>): Promise<SQL> {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const heads = dottedHeads({ filter });
   const arrayPaths = await detectArrayPaths(collection, registry, heads);
   return compileFilterWhere(collection, filter, { arrayPaths });
@@ -1739,7 +1742,7 @@ function shapeRecord<R extends { data: unknown }>(record: R, fields: string[] | 
 }
 
 export async function queryTable(collection: Collection, params: TableQueryParams): Promise<TableRecordsResult | TableAggregateResult> {
-  const registry = readRegistry(collection.storage);
+  const registry = readQueryRegistry(collection.storage);
   const arrayPaths = await detectArrayPaths(collection, registry, dottedHeads(params));
   const scalarArrayKeys = await detectScalarArrayKeys(collection, registry, arrayPaths, params);
   const compiled = compileQuery(collection, params, { arrayPaths, scalarArrayKeys });

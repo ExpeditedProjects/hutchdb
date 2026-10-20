@@ -167,6 +167,12 @@ describe.skipIf(!TEST_DB_URL)("storage cutover against real Postgres", () => {
     expect(reg.projections?.map((p) => p.field)).toEqual(expect.arrayContaining(["title", "n"]));
     expect(reg.unique_key).toEqual(["title"]);
     expect(log.some((l) => l.startsWith("  inferred big"))).toBe(true);
+    // Inference only queued the projections; the cutover ran the builder before returning.
+    expect((reg.projections as { build?: { state: string } }[]).every((p) => p.build?.state === "ready")).toBe(true);
+    expect(report.builds.filter((b) => b.slug === "big").map((b) => b.state)).toEqual(Array(reg.projections!.length).fill("ready"));
+    expect(log).toContain("building queued indexes and unwinds");
+    const valid = await rows(sql`SELECT count(*)::int AS n FROM pg_index WHERE indrelid = to_regclass(${`hc_${big}`}) AND indisvalid AND starts_with(indexrelid::regclass::text, ${`hc_${big}_p_`})`);
+    expect(valid).toEqual([{ n: reg.projections!.length }]);
 
     // The service reads the copied rows, including the soft delete.
     const page = ok(await recordsSvc.queryRecords("big", USER_ID, { sort: "n", limit: 100 }));

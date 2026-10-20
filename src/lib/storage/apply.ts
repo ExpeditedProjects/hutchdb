@@ -2,7 +2,8 @@ import { db } from "@/lib/db";
 import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
-import { addProjection, addUnwind, toTextArrayLiteral, type Executor } from "./ddl";
+import { toTextArrayLiteral, type Executor } from "./ddl";
+import { projectionValue } from "./expression";
 import { arrayCandidates, inferDecisions, pathsToCount, thresholdsFromEnv, type PendingUnwind, type Thresholds } from "./inference";
 import {
   childTableName,
@@ -12,48 +13,63 @@ import {
   projectionSegments,
   readRegistry,
   valueFitsType,
-  type FailedDdl,
+  type IndexBuild,
   type Projection,
   type StorageRegistry,
-  type Unwind,
 } from "./registry";
 
 /**
- * How long a projection or unwind whose DDL failed is left alone before a
- * write tries it again, so a failing ALTER (a lock it can't get, a value
- * the cast rejects) doesn't run, and fail, on every write.
+ * Table size (heap + TOAST, pg_table_size) at which a collection gets the
+ * full-text search GIN. Unindexed search parses every document on every
+ * query: the stress test measured roughly 25 MB of documents per second
+ * (product-catalog: 75 MB in ~3 s), so 10 MB keeps an unindexed search
+ * near 0.4 s, while a GIN over a smaller table would mostly add write cost
+ * (every insert parses its document into the index) for little gain.
+ * Measured in bytes, not rows: the cost of search follows the size of the
+ * documents (17k tiny rows searched in 146 ms; 10k articles timed out).
  */
-export const DDL_RETRY_BACKOFF_MS = 60 * 60 * 1000;
+export const DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES = 10 * 1024 * 1024;
 
-/** How long projection/unwind DDL waits for a lock on the collection table before failing. */
-const DDL_LOCK_TIMEOUT = "2s";
+export function searchIndexThresholdFromEnv(env: Record<string, string | undefined> = process.env): number {
+  const n = Number(env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES);
+  return env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES !== undefined && env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES !== "" && Number.isInteger(n) && n >= 0
+    ? n
+    : DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES;
+}
 
-export type ApplyOptions = {
-  /** Retry failed DDL now instead of after DDL_RETRY_BACKOFF_MS (the cutover's re-run). */
-  retryFailed?: boolean;
-};
+function formatBytes(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${Math.round(bytes / 1024 / 1024)} MB` : `${Math.round(bytes / 1024)} KB`;
+}
+
+function pending(now: number): IndexBuild {
+  return { state: "pending", at: new Date(now).toISOString() };
+}
 
 /**
- * Run inference for a batch that just landed in a collection
- * and apply each decision in its own transaction, updating the registry as
- * it goes. `docs` are the documents as stored (after a merge, the merged
- * documents). One failed decision never blocks the others or the
- * evaluated_rows count: a failure is logged, recorded in `failed_ddl`
- * (an unwind also gets a pending entry with a generic reason), and not
- * retried for DDL_RETRY_BACKOFF_MS. Failures here must never fail the
- * write that triggered them: callers wrap this in try/catch and log.
+ * Run inference for a batch that just landed in a collection and record
+ * its decisions in the registry as pending builds: expression projections,
+ * unwinds (child tables) and, once the table is large enough, the search
+ * index. Nothing is built here — no DDL runs in the write; builder.ts
+ * builds pending entries in the background (buildPendingIndexes), and the
+ * compiler ignores them until they are ready. `docs` are the documents as
+ * stored (after a merge, the merged documents). Failures here must never
+ * fail the write that triggered them: callers wrap this in try/catch and
+ * log.
  */
 export async function applyInference(
   collection: { id: number; storage: unknown },
   docs: Record<string, unknown>[],
   thresholds: Thresholds = thresholdsFromEnv(),
-  options: ApplyOptions = {},
+  searchThresholdBytes: number = searchIndexThresholdFromEnv(),
 ): Promise<StorageRegistry> {
-  const table = ident(collectionTableName(collection.id));
+  const tableName = collectionTableName(collection.id);
+  const table = ident(tableName);
   const now = Date.now();
-  let registry = await loadRegistry(collection.id);
+  const registry = await loadRegistry(collection.id);
 
-  const [{ count }] = (await db.execute(sql`SELECT count(*)::int AS count FROM ${table} WHERE deleted_at IS NULL`)).rows as { count: number }[];
+  const [{ count, bytes }] = (await db.execute(sql`
+    SELECT (SELECT count(*)::int FROM ${table} WHERE deleted_at IS NULL) AS count,
+           pg_table_size(${tableName}::regclass)::float8 AS bytes`)).rows as { count: number; bytes: number }[];
   const rowCount = count;
 
   // Element totals across the collection, only for paths this batch makes
@@ -69,63 +85,34 @@ export async function applyInference(
   }
 
   const decisions = inferDecisions({ collectionId: collection.id, docs, registry, rowCount, elementCounts, thresholds });
-  const pending: PendingUnwind[] = [...decisions.pending];
-  const backingOff = (kind: FailedDdl["kind"], key: string) => {
-    if (options.retryFailed) return undefined;
-    const failure = (registry.failed_ddl ?? []).find((f) => f.kind === kind && f.key === key);
-    const at = failure ? Date.parse(failure.at) : NaN;
-    return Number.isFinite(at) && now - at < DDL_RETRY_BACKOFF_MS ? failure : undefined;
-  };
+  const wantSearch = !registry.search_index && Number(bytes) >= searchThresholdBytes && rowCount > 0;
+  const evaluated = new Set([...candidates.map((c) => c.path), ...decisions.pending.map((p) => p.path)]);
 
-  for (const unwind of decisions.unwinds) {
-    const failed = backingOff("unwind", unwind.path);
-    if (failed) {
-      pending.push({ path: unwind.path, reason: unwindFailedReason(unwind.path, failed.at) });
-      continue;
+  return updateRegistry(collection.id, async (current) => {
+    // Re-checked under the row lock: another writer may have queued the
+    // same thing meanwhile.
+    let next = current;
+    for (const unwind of decisions.unwinds) {
+      if (next.unwinds.some((u) => u.path === unwind.path)) continue;
+      // Another writer may have unwound a path whose table name this one
+      // would collide with since inference picked it.
+      next = { ...next, unwinds: [...next.unwinds, { ...unwind, table: childTableName(collection.id, unwind.path, next), build: pending(now) }] };
     }
-    try {
-      registry = await applyUnwind(collection.id, unwind);
-    } catch (err) {
-      console.error(`[storage] unwind of '${unwind.path}' failed for collection ${collection.id}`, err);
-      const at = new Date(now).toISOString();
-      registry = await recordFailure(collection.id, { kind: "unwind", key: unwind.path, at });
-      pending.push({ path: unwind.path, reason: unwindFailedReason(unwind.path, at) });
+    for (const projection of decisions.projections) {
+      if (next.projections.some((p) => projectionKey(p) === projectionKey(projection))) continue;
+      const column = next.projections.some((p) => p.column === projection.column)
+        ? `${projection.column}_${next.projections.length}`
+        : projection.column;
+      next = { ...next, projections: [...next.projections, { ...projection, column, kind: "expression", build: pending(now) }] };
     }
-  }
-  for (const projection of decisions.projections) {
-    if (backingOff("projection", projectionKey(projection))) continue;
-    try {
-      registry = await applyProjection(collection.id, projection);
-    } catch (err) {
-      console.error(`[storage] projection of '${projection.field}' failed for collection ${collection.id}`, err);
-      registry = await recordFailure(collection.id, { kind: "projection", key: projectionKey(projection), at: new Date(now).toISOString() });
+    if (wantSearch && !next.search_index) {
+      next = {
+        ...next,
+        search_index: { build: pending(now), reason: `the collection's table reached ${formatBytes(Number(bytes))} (threshold ${formatBytes(searchThresholdBytes)}).` },
+      };
     }
-  }
-
-  const evaluated = new Set([...candidates.map((c) => c.path), ...pending.map((p) => p.path)]);
-  registry = await finishBatch(collection.id, docs.length, evaluated, pending);
-  return registry;
-}
-
-/** The pending reason for a failed unwind: generic, never driver or SQL text (that goes to the log). */
-function unwindFailedReason(path: string, at: string): string {
-  const retry = new Date(Date.parse(at) + DDL_RETRY_BACKOFF_MS).toISOString();
-  return `unwinding '${path}' failed at ${at}; a write after ${retry} tries again.`;
-}
-
-/** Record (or refresh) a failed DDL attempt in the registry. */
-async function recordFailure(collectionId: number, failure: FailedDdl): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (registry) => ({
-    ...registry,
-    failed_ddl: [...(registry.failed_ddl ?? []).filter((f) => !(f.kind === failure.kind && f.key === failure.key)), failure],
-  }));
-}
-
-/** The registry without a failed_ddl entry for (kind, key), after that DDL succeeded. */
-function clearFailure(registry: StorageRegistry, kind: FailedDdl["kind"], key: string): StorageRegistry {
-  const rest = (registry.failed_ddl ?? []).filter((f) => !(f.kind === kind && f.key === key));
-  const { failed_ddl: _old, ...without } = registry;
-  return rest.length > 0 ? { ...without, failed_ddl: rest } : without;
+    return finishBatch(next, docs.length, evaluated, decisions.pending);
+  });
 }
 
 async function loadRegistry(collectionId: number): Promise<StorageRegistry> {
@@ -155,32 +142,17 @@ export async function updateRegistry(
   });
 }
 
-async function applyProjection(collectionId: number, projection: Projection): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (current, tx) => {
-    if (current.projections.some((p) => projectionKey(p) === projectionKey(projection))) return null;
-    await tx.execute(sql`SET LOCAL lock_timeout = ${sql.raw(`'${DDL_LOCK_TIMEOUT}'`)}`);
-    const registry = clearFailure(current, "projection", projectionKey(projection));
-    const column = registry.projections.some((p) => p.column === projection.column)
-      ? `${projection.column}_${registry.projections.length}`
-      : projection.column;
-    const entry: Projection = { ...projection, column };
-    await addProjection(tx, collectionId, entry);
-    const mixed = await hasMisfits(tx, collectionId, entry);
-    return { ...registry, projections: [...registry.projections, { ...entry, ...(mixed ? { mixed: true } : {}) }] };
-  });
-}
-
 /**
  * Whether any live row holds a value at the projection's field that the
  * column cannot carry (another JSON type, JSON null, a non-date string for
  * a date): the column is NULL there while the document is not.
  */
-async function hasMisfits(ex: Executor, collectionId: number, projection: Projection): Promise<boolean> {
+export async function hasMisfits(ex: Executor, collectionId: number, projection: Projection): Promise<boolean> {
   const table = ident(collectionTableName(collectionId));
   const result = await ex.execute(sql`
     SELECT EXISTS (
       SELECT 1 FROM ${table}
-      WHERE deleted_at IS NULL AND ${ident(projection.column)} IS NULL
+      WHERE deleted_at IS NULL AND ${projectionValue(projection)} IS NULL
         AND data #> ${toTextArrayLiteral(projectionSegments(projection))}::text[] IS NOT NULL
     ) AS mixed`);
   return result.rows[0]?.mixed === true;
@@ -233,34 +205,15 @@ async function setMixed(collectionId: number, keys: Set<string>): Promise<void> 
   });
 }
 
-async function applyUnwind(collectionId: number, unwind: Unwind): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (current, tx) => {
-    if (current.unwinds.some((u) => u.path === unwind.path)) return null;
-    await tx.execute(sql`SET LOCAL lock_timeout = ${sql.raw(`'${DDL_LOCK_TIMEOUT}'`)}`);
-    const registry = clearFailure(current, "unwind", unwind.path);
-    // Another writer may have unwound a path whose table name this one
-    // would collide with since inference picked it.
-    const entry: Unwind = { ...unwind, table: childTableName(collectionId, unwind.path, registry) };
-    // The trigger and backfill read the unwind from collections.storage, so
-    // the registry row is written before the DDL runs (same transaction).
-    const next = { ...registry, unwinds: [...registry.unwinds, entry] };
-    await tx.update(collections).set({ storage: next }).where(eq(collections.id, collectionId));
-    await addUnwind(tx, collectionId, entry);
-    return next;
-  });
-}
-
 /**
  * Count the batch in evaluated_rows and refresh pending_unwinds: entries
  * for the paths this batch evaluated are replaced, others kept, and any
- * path that is unwound now is dropped.
+ * path that is unwound (or queued to be) now is dropped.
  */
-async function finishBatch(collectionId: number, n: number, evaluated: Set<string>, pending: PendingUnwind[]): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (registry) => {
-    const unwound = new Set(registry.unwinds.map((u) => u.path));
-    const kept = (registry.pending_unwinds ?? []).filter((p) => !evaluated.has(p.path));
-    const next = [...kept, ...pending].filter((p) => !unwound.has(p.path)).sort((a, b) => a.path.localeCompare(b.path));
-    const { pending_unwinds: _old, ...rest } = registry;
-    return { ...rest, evaluated_rows: registry.evaluated_rows + n, ...(next.length > 0 ? { pending_unwinds: next } : {}) };
-  });
+function finishBatch(registry: StorageRegistry, n: number, evaluated: Set<string>, pendingUnwinds: PendingUnwind[]): StorageRegistry {
+  const unwound = new Set(registry.unwinds.map((u) => u.path));
+  const kept = (registry.pending_unwinds ?? []).filter((p) => !evaluated.has(p.path));
+  const next = [...kept, ...pendingUnwinds].filter((p) => !unwound.has(p.path)).sort((a, b) => a.path.localeCompare(b.path));
+  const { pending_unwinds: _old, ...rest } = registry;
+  return { ...rest, evaluated_rows: registry.evaluated_rows + n, ...(next.length > 0 ? { pending_unwinds: next } : {}) };
 }

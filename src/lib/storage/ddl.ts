@@ -6,6 +6,7 @@ import {
   indexName,
   isChildTableNameFor,
   pgType,
+  searchIndexName,
   triggerName,
   type Projection,
   type Unwind,
@@ -20,7 +21,8 @@ export type Executor = {
  * DDL for collection tables. Every identifier here comes from the
  * registry (already sanitized) and is re-checked by ident(); every JSON key
  * is passed to a SQL helper (drizzle/0021) as a bound parameter and quoted
- * there with %L. No user string is ever concatenated into statement text.
+ * there with %L. No user string is ever concatenated into statement text
+ * by the app.
  */
 
 export async function createCollectionTable(ex: Executor, collectionId: number): Promise<void> {
@@ -63,32 +65,48 @@ export async function collectionTableExists(ex: Executor, collectionId: number):
 }
 
 /**
- * Add a stored generated projection column plus its btree index. Idempotent:
- * both statements are IF NOT EXISTS. The index carries the default record
- * order (created_at DESC, id DESC) after the column, so a filter on the
- * column with the default order and a limit reads matching rows already
- * in order from this one index, instead of the planner walking the
- * created_at index and filtering.
+ * The CREATE INDEX CONCURRENTLY statement for an expression projection:
+ * a btree over the guarded cast of the document value (the same
+ * expression projectionValue() emits for queries), then the default record
+ * order (created_at DESC, id DESC), so a filter on it with the default
+ * order and a limit reads matching rows already in order from this one
+ * index. Postgres writes the statement: format() quotes the identifiers
+ * with %I, and hc_cast_expr / hc_cast_path_expr quote the JSON key or path
+ * (user data, a bound parameter here) with %L. CREATE INDEX CONCURRENTLY
+ * can't run inside a function or transaction, so the builder executes the
+ * returned text itself.
  */
-export async function addProjection(ex: Executor, collectionId: number, projection: Projection): Promise<void> {
+export async function projectionIndexDdl(ex: Executor, collectionId: number, projection: Projection): Promise<string> {
   const table = collectionTableName(collectionId);
-  if (projection.path) {
-    await ex.execute(sql`SELECT hc_add_path_projection(${table}, ${projection.column}, ${toTextArrayLiteral(projection.path)}::text[], ${projection.type})`);
-  } else {
-    await ex.execute(sql`SELECT hc_add_projection(${table}, ${projection.column}, ${projection.field}, ${projection.type})`);
-  }
-  await ex.execute(sql`
-    CREATE INDEX IF NOT EXISTS ${ident(indexName(table, projection.column))}
-    ON ${ident(table)} (${ident(projection.column)}, created_at DESC, id DESC)`);
+  const index = indexName(table, projection.column);
+  ident(index);
+  const expr = projection.path
+    ? sql`hc_cast_path_expr('data', ${toTextArrayLiteral(projection.path)}::text[], ${projection.type})`
+    : sql`hc_cast_expr('data', ${projection.field}::text, ${projection.type})`;
+  const result = await ex.execute(sql`
+    SELECT format('CREATE INDEX CONCURRENTLY IF NOT EXISTS %I ON %I ((%s), created_at DESC, id DESC)', ${index}::text, ${table}::text, ${expr}) AS ddl`);
+  return result.rows[0].ddl as string;
+}
+
+/**
+ * The full-text search GIN: the exact expression `search` filters with
+ * (compiler.ts, rows.ts searchRecords), so the planner can serve it.
+ */
+export function searchIndexDdl(collectionId: number): SQL {
+  const table = collectionTableName(collectionId);
+  return sql`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${ident(searchIndexName(table))} ON ${ident(table)} USING gin (to_tsvector('english', data::text))`;
 }
 
 /**
  * Create the child table for an unwind, its indexes and the parent triggers
- * that keep it in sync, then backfill it from existing parent rows. The
- * registry entry must already be stored in collections.storage because the
- * trigger and backfill read the path and element columns from there.
+ * that keep it in sync, without backfilling it (backfillUnwindRows does
+ * that, in batches). Idempotent. The registry entry must already be stored
+ * in collections.storage because the trigger reads the path and element
+ * columns from there. Run in one transaction: CREATE TRIGGER waits for
+ * in-flight writes to the parent, so every write after it commits fires
+ * the trigger and every row from before is visible to the backfill.
  */
-export async function addUnwind(ex: Executor, collectionId: number, unwind: Unwind): Promise<void> {
+export async function createUnwindTable(ex: Executor, collectionId: number, unwind: Unwind): Promise<void> {
   const parent = collectionTableName(collectionId);
   const child = unwind.table;
   if (!isChildTableNameFor(collectionId, unwind.path, child)) {
@@ -104,7 +122,9 @@ export async function addUnwind(ex: Executor, collectionId: number, unwind: Unwi
       ${sql.join(columnDefs, sql``)}
     )`);
   // The primary key (parent_id, idx) already serves parent_id lookups; the
-  // extra btree is only built on each projected element column.
+  // extra btree is only built on each projected element column. The table
+  // is new and empty here (or being rebuilt after a failed attempt), so a
+  // plain CREATE INDEX is cheap.
   for (const f of unwind.fields) {
     await ex.execute(sql`
       CREATE INDEX IF NOT EXISTS ${ident(indexName(child, f.column))}
@@ -123,8 +143,26 @@ export async function addUnwind(ex: Executor, collectionId: number, unwind: Unwi
     AFTER UPDATE ON ${ident(parent)}
     REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
     FOR EACH STATEMENT EXECUTE FUNCTION hc_sync_unwind(${sql.raw(String(collectionId))}, ${identLiteral(child)})`);
+}
 
-  await ex.execute(sql`SELECT hc_unwind_backfill(${collectionId}, ${parent}, ${child})`);
+/**
+ * Backfill the child rows of the parent rows with lo < id <= hi (only
+ * `only`, when given). Returns the ids it could not lock because a writer
+ * holds them (see hc_unwind_backfill_rows, migration 0022).
+ */
+export async function backfillUnwindRows(ex: Executor, collectionId: number, unwind: Unwind, lo: number, hi: number, only: number[] | null): Promise<number[]> {
+  const parent = collectionTableName(collectionId);
+  ident(unwind.table);
+  const onlyArg = only ? sql`${`{${only.map((n) => Math.trunc(n)).join(",")}}`}::int[]` : sql`NULL::int[]`;
+  const result = await ex.execute(sql`
+    SELECT hc_unwind_backfill_rows(${collectionId}::int, ${parent}::text, ${unwind.table}::text, ${lo}::int, ${hi}::int, ${onlyArg}) AS skipped`);
+  return parsePgIntArray(result.rows[0].skipped);
+}
+
+function parsePgIntArray(value: unknown): number[] {
+  if (Array.isArray(value)) return value.map(Number);
+  if (typeof value === "string") return value.replace(/[{}]/g, "").split(",").filter(Boolean).map(Number);
+  return [];
 }
 
 /**

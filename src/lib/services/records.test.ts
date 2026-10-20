@@ -975,16 +975,17 @@ describe('storageChangeNote', () => {
   const base = { projections: [{ field: 'a', column: 'p_a', type: 'number' as const, reason: 'r' }], unwinds: [], evaluated_rows: 0 }
 
   it('is undefined when the batch added nothing', () => {
-    expect(storageChangeNote(base, base, 12)).toBeUndefined()
+    expect(storageChangeNote(base, base)).toBeUndefined()
   })
 
-  it('names new indexed fields and unwound arrays, and why the write was slower', () => {
+  it('names queued indexes, unwinds and the search index, and that they are built in the background', () => {
     const after = {
       ...base,
       projections: [...base.projections, { field: 'score', column: 'p_score', type: 'number' as const, reason: 'r' }, { field: 'owner.id', column: 'p_owner_id', type: 'number' as const, reason: 'r', path: ['owner', 'id'] }],
       unwinds: [{ path: 'answers', table: 'hc_1__answers', fields: [], reason: 'r' }],
+      search_index: { build: { state: 'pending' as const, at: '2026-10-20T00:00:00.000Z' }, reason: 'r' },
     }
-    const note = storageChangeNote(base, after, 840)!
-    expect(note).toBe("This batch made fields 'score', 'owner.id' queryable as indexed columns and unwound 'answers' into a queryable table (filters and aggregates on its elements can now use indexes); building them over the existing records took 840 ms of this write, which is why it was slower than usual. This is one-time work.")
+    const note = storageChangeNote(base, after)!
+    expect(note).toBe("This batch queued indexes on fields 'score', 'owner.id', unwinding 'answers' into a queryable table (so filters and aggregates on its elements can use indexes), a full-text index for search. They are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until they are ready, queries return the same results without them.")
   })
 })

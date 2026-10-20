@@ -161,16 +161,32 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
     expect(result).toEqual({ error: expect.stringMatching(/^Invalid set_field\.filter: Unsupported filter operator '\$regex'/), status: 400 });
   });
 
-  it("storageTimeoutHint names the fields whose index builds failed, and is silent otherwise", async () => {
+  it("storageTimeoutHint names indexes that failed or are still building, and is silent when all are ready", async () => {
     const { slug, id } = await seed("articles_hint", [{ title: "A" }]);
     expect(await collectionsSvc.storageTimeoutHint(slug, USER_ID)).toBeUndefined();
-    const storage = { projections: [], unwinds: [], evaluated_rows: 1, failed_ddl: [
-      { kind: "projection", key: JSON.stringify(["author"]), at: "2026-10-20T00:00:00Z" },
-      { kind: "projection", key: JSON.stringify(["totals", "points"]), at: "2026-10-20T00:00:00Z" },
-    ] };
+    const at = "2026-10-20T00:00:00Z";
+    const proj = (field: string, column: string, build: object, path?: string[]) =>
+      ({ field, column, type: "text", reason: "r", kind: "expression", build, ...(path ? { path } : {}) });
+    const failedBuild = { state: "failed", at, attempts: 1, error: "index build failed", retry_after: at };
+    const storage = {
+      projections: [
+        proj("author", "p_author", failedBuild),
+        proj("totals.points", "p_totals_points", failedBuild, ["totals", "points"]),
+        proj("title", "p_title", { state: "pending", at }),
+        proj("ready_one", "p_ready_one", { state: "ready", at }),
+      ],
+      unwinds: [],
+      evaluated_rows: 1,
+      search_index: { reason: "r", build: { state: "building", at } },
+    };
     await testDb.update(schema.collections).set({ storage }).where(eq(schema.collections.id, id));
     const hint = await collectionsSvc.storageTimeoutHint(slug, USER_ID);
-    expect(hint).toMatch(/Building indexes for 'author', 'totals\.points' on this collection failed/);
+    expect(hint).toMatch(/^Building indexes for 'author', 'totals\.points' on this collection failed and will be retried; indexes for 'title', full-text search are still being built in the background/);
+    expect(hint).not.toMatch(/ready_one/);
     expect(hint).not.toMatch(/hc_\d+/);
+
+    const allReady = { ...storage, projections: [proj("author", "p_author", { state: "ready", at }), { field: "legacy", column: "p_legacy", type: "number", reason: "r" }], search_index: undefined };
+    await testDb.update(schema.collections).set({ storage: allReady }).where(eq(schema.collections.id, id));
+    expect(await collectionsSvc.storageTimeoutHint(slug, USER_ID)).toBeUndefined();
   });
 });

@@ -165,7 +165,15 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
 
   async function store(collection: string, recs: Record<string, unknown>[], on_conflict?: string): Promise<string> {
     const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, return: "summary", on_conflict }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    await settle();
     return (result as { collection: { slug: string } }).collection.slug;
+  }
+
+  /** What the MCP route runs after a response: build every queued index and unwind. */
+  async function settle() {
+    const { buildPendingIndexes } = await import("./builder");
+    await buildPendingIndexes();
   }
 
   async function collectionRow(slug: string) {
@@ -180,7 +188,10 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
 
   async function analyze(slug: string) {
     const id = (await collectionRow(slug)).id;
-    await testDb.execute(sql`ANALYZE ${sql.identifier(`hc_${id}`)}`);
+    // VACUUM too, as autovacuum would: it flushes the GIN's pending list,
+    // which the planner otherwise prices high. (Projections used to be
+    // added by a table rewrite, which rebuilt the GIN as a side effect.)
+    await testDb.execute(sql`VACUUM ANALYZE ${sql.identifier(`hc_${id}`)}`);
   }
 
   /** Every response: `indexed` and the plan text never contradict each other. */
@@ -502,75 +513,87 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
       expect((await registry(slug)).unwinds.map((u) => u.path)).toEqual(["lines"]);
     });
 
-    it("records a failed unwind as pending, still counts the batch and applies the other decisions", async () => {
+    it("a failed unwind build is recorded with a generic reason, never blocks the write or the other builds, and is retried after its backoff", async () => {
       const slug = await store("broken", [{ seed: 1 }]);
       const id = (await collectionRow(slug)).id;
-      // A table squatting on the child name makes the unwind's backfill fail.
+      // A table squatting on the child name makes the unwind's build fail.
       await testDb.execute(sql`CREATE TABLE ${sql.identifier(`hc_${id}__lines`)} (parent_id int, idx int)`);
       const docs = Array.from({ length: 120 }, (_, i) => ({ n: i, lines: [{ item_id: i }] }));
       await store("broken", docs);
       const reg = await registry(slug);
-      expect(reg.unwinds).toEqual([]);
-      expect(reg.pending_unwinds).toEqual([{ path: "lines", reason: expect.stringMatching(/^unwinding 'lines' failed at \S+; a write after \S+ tries again\.$/) }]);
-      expect(reg.failed_ddl).toEqual([{ kind: "unwind", key: "lines", at: expect.any(String) }]);
+      const lines = reg.unwinds.find((u) => u.path === "lines")!;
+      expect(lines.build).toEqual({ state: "failed", at: expect.any(String), attempts: 1, error: "the build failed; the server log has the details", retry_after: expect.any(String) });
+      expect(Date.parse(lines.build!.retry_after!)).toBeGreaterThan(Date.now());
+      expect(reg.pending_unwinds).toBeUndefined();
       expect(reg.evaluated_rows).toBe(121);
-      expect(reg.projections.map((p) => p.field)).toContain("n");
+      // The other builds of the same batch went through.
+      expect(reg.projections.find((p) => p.field === "n")?.build?.state).toBe("ready");
       expect((await query(slug, { filter: { "lines.item_id": 5 } })).total).toBe(1);
 
-      // The reason describe returns is generic: the driver's text went to the log.
-      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { not_unwound: { path: string; reason: string }[] } };
-      expect(described.storage.not_unwound).toEqual(reg.pending_unwinds);
-      expect(JSON.stringify(described.storage.not_unwound)).not.toMatch(/relation|exists|constraint|column|ERROR|hc_\d+__lines/i);
+      // describe shows the state and the generic reason; the driver's text went to the log.
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { unwinds: { path: string; state: string; error?: string }[]; indexes: { index: string; state: string }[] } };
+      expect(described.storage.unwinds).toEqual([expect.objectContaining({ path: "lines", state: "failed", error: "the build failed; the server log has the details" })]);
+      expect(described.storage.indexes.filter((i) => i.index.startsWith(`hc_${id}__lines`)).map((i) => i.state)).toEqual(["failed"]);
+      expect(JSON.stringify(described.storage.unwinds)).not.toMatch(/relation|constraint|column|does not exist|hc_\d+__lines/i);
 
-      // Within the backoff the next write does not try again, even though it would succeed now.
+      // Within the backoff an automatic build does not try again, even though it would succeed now.
       await testDb.execute(sql`DROP TABLE ${sql.identifier(`hc_${id}__lines`)}`);
       await store("broken", [{ n: 500, lines: [{ item_id: 500 }] }]);
-      const waiting = await registry(slug);
-      expect(waiting.unwinds).toEqual([]);
-      expect(waiting.pending_unwinds).toEqual(reg.pending_unwinds);
-      expect(waiting.failed_ddl).toEqual(reg.failed_ddl);
+      expect((await registry(slug)).unwinds.find((u) => u.path === "lines")!.build).toEqual(lines.build);
 
-      // Once it has passed, a write retries, and success clears the failure.
-      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{failed_ddl,0,at}', to_jsonb((now() - interval '2 hours')::text)) WHERE id = ${id}`);
-      await store("broken", [{ n: 501, lines: [{ item_id: 501 }] }]);
+      // Once it has passed, the builder retries, and success clears the failure.
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{unwinds,0,build,retry_after}', to_jsonb((now() - interval '1 second')::text)) WHERE id = ${id}`);
+      await settle();
       const retried = await registry(slug);
-      expect(retried.unwinds.map((u) => u.path)).toEqual(["lines"]);
-      expect(retried.failed_ddl).toBeUndefined();
-      expect(retried.pending_unwinds).toBeUndefined();
+      expect(retried.unwinds.map((u) => [u.path, u.build?.state])).toEqual([["lines", "ready"]]);
+      expect(retried.unwinds[0].build).toEqual({ state: "ready", at: expect.any(String) });
       expect((await query(slug, { filter: { "lines.item_id": 5 } })).total).toBe(1);
+      const [{ n }] = (await testDb.execute(sql`SELECT count(*)::int AS n FROM ${sql.identifier(`hc_${id}__lines`)}`)).rows as { n: number }[];
+      expect(n).toBe(121);
     });
 
-    it("a projection whose ALTER can't get its lock fails within the lock timeout and is not retried by every write", async () => {
+    it("a projection build that can't get its lock never blocks the write, fails within the lock timeout leaving no index, and backs off", async () => {
       const slug = await store("locked", [{ seed: 1 }]);
       const id = (await collectionRow(slug)).id;
       const blocker = await testPool.connect();
+      const saved = process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
+      process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = "500";
       let elapsed = 0;
       try {
-        // A reader holding ACCESS SHARE blocks ALTER TABLE (ACCESS EXCLUSIVE), not inserts.
+        // SHARE UPDATE EXCLUSIVE conflicts with CREATE INDEX CONCURRENTLY, not with inserts.
         await blocker.query("BEGIN");
-        await blocker.query(`SELECT 1 FROM hc_${id} LIMIT 1`);
+        await blocker.query(`LOCK TABLE hc_${id} IN SHARE UPDATE EXCLUSIVE MODE`);
         const started = performance.now();
-        await store("locked", Array.from({ length: 120 }, (_, i) => ({ n: i })));
-        elapsed = performance.now() - started;
+        ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: slug, records: Array.from({ length: 120 }, (_, i) => ({ n: i })), return: "summary" }));
+        expect(performance.now() - started).toBeLessThan(2000);
+        expect((await registry(slug)).projections.find((p) => p.field === "n")?.build?.state).toBe("pending");
+        const buildStarted = performance.now();
+        await settle();
+        elapsed = performance.now() - buildStarted;
       } finally {
         await blocker.query("ROLLBACK");
         blocker.release();
+        if (saved === undefined) delete process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS;
+        else process.env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS = saved;
       }
-      // lock_timeout (2s), not the 5s statement timeout, ended the wait.
+      // lock_timeout, not the build's statement timeout, ended the wait.
       expect(elapsed).toBeLessThan(4500);
-      const failed = await registry(slug);
-      expect(failed.projections.map((p) => p.field)).not.toContain("n");
-      expect(failed.failed_ddl).toEqual([{ kind: "projection", key: JSON.stringify(["n"]), at: expect.any(String) }]);
+      const failed = (await registry(slug)).projections.find((p) => p.field === "n")!;
+      expect(failed.build).toMatchObject({ state: "failed", attempts: 1, error: "the build could not get a lock on the collection's table in time" });
+      const [{ present }] = (await testDb.execute(sql`SELECT to_regclass(${`hc_${id}_${failed.column}_idx`}) IS NOT NULL AS present`)).rows as { present: boolean }[];
+      expect(present).toBe(false);
 
-      // Nothing blocks it now, but the backoff holds.
+      // Nothing blocks it now, but the backoff holds for automatic builds.
       await store("locked", [{ n: 1000 }]);
-      expect((await registry(slug)).projections.map((p) => p.field)).not.toContain("n");
+      expect((await registry(slug)).projections.find((p) => p.field === "n")!.build!.state).toBe("failed");
 
-      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{failed_ddl,0,at}', to_jsonb((now() - interval '2 hours')::text)) WHERE id = ${id}`);
-      await store("locked", [{ n: 1001 }]);
-      const done = await registry(slug);
-      expect(done.projections.map((p) => p.field)).toContain("n");
-      expect(done.failed_ddl).toBeUndefined();
+      // An explicit retry (the CLI) ignores the backoff.
+      const { buildPendingIndexes } = await import("./builder");
+      await buildPendingIndexes({ collectionId: id, retryFailed: true });
+      const done = (await registry(slug)).projections.find((p) => p.field === "n")!;
+      expect(done.build).toEqual({ state: "ready", at: expect.any(String) });
+      const r = await query(slug, { filter: { n: { $gte: 1000 } } });
+      expect(r.total).toBe(1);
     }, 20_000);
 
     it("unwinds two arrays whose names differ only in case into separate child tables", async () => {
