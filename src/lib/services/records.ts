@@ -517,6 +517,18 @@ export async function importRecords(userId: string, organizationId: string, para
 }
 
 /**
+ * Time limits for hutch_search: each collection gets half the statement
+ * timeout, and none starts after the whole timeout has passed.
+ * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off, and then
+ * no collection gets a limit either.
+ */
+export function searchTimeLimits(now: number): { perCollectionMs: number | undefined; deadline: number } {
+  const budgetMs = statementTimeoutMs();
+  if (budgetMs === 0) return { perCollectionMs: undefined, deadline: Infinity };
+  return { perCollectionMs: Math.max(1, Math.floor(budgetMs / 2)), deadline: now + budgetMs };
+}
+
+/**
  * hutch_search: at most `limit` matches in total (max 50) across every
  * collection the user can read, the most relevant first (ts_rank), newest
  * first among equals. Each collection contributes at most `limit`
@@ -532,18 +544,6 @@ export async function importRecords(userId: string, organizationId: string, para
  * were not reached are named in not_searched with incomplete: true, while
  * the others' matches are returned.
  */
-/**
- * Time limits for hutch_search: each collection gets half the statement
- * timeout, and none starts after the whole timeout has passed.
- * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off, and then
- * no collection gets a limit either.
- */
-export function searchTimeLimits(now: number): { perCollectionMs: number | undefined; deadline: number } {
-  if (Number(process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS) === 0) return { perCollectionMs: undefined, deadline: Infinity };
-  const budgetMs = statementTimeoutMs();
-  return { perCollectionMs: Math.max(1, Math.floor(budgetMs / 2)), deadline: now + budgetMs };
-}
-
 export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));

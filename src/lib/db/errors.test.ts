@@ -80,6 +80,15 @@ describe('describeDbError', () => {
     expect(formatTimeout(800)).toBe('800ms')
   })
 
+  it('reports 0 when HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the timeout off, and formats that sensibly', () => {
+    process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = '0'
+    expect(statementTimeoutMs()).toBe(0)
+    expect(formatTimeout()).toBe('the time limit')
+    expect(describeDbError(wrapped('57014', 'x'), { tool: 't' })).toMatch(/^t timed out after the time limit\./)
+    process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = 'nope'
+    expect(statementTimeoutMs()).toBe(5000)
+  })
+
   it('appends a timeout hint when one is given', () => {
     const text = describeDbError(wrapped('57014', 'x'), { tool: 't', collection: 'c', timeoutHint: 'Index builds failed.' })
     expect(text.endsWith(' Index builds failed.')).toBe(true)

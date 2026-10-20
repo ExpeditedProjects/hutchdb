@@ -75,17 +75,20 @@ export function isStatementTimeout(err: unknown): boolean {
 }
 
 /**
- * The per-statement timeout requests run under, in ms. Mirrors the pool's
- * setting in src/lib/db/index.ts (HUTCH_DB_STATEMENT_TIMEOUT_MS, default
- * 5000); read here rather than imported so this module never builds a pool.
+ * The per-statement timeout requests run under, in ms; 0 when
+ * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns it off. Mirrors the pool's setting
+ * in src/lib/db/index.ts (default 5000); read here rather than imported so
+ * this module never builds a pool.
  */
 export function statementTimeoutMs(): number {
   const raw = Number(process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS ?? 5000);
+  if (raw === 0) return 0;
   return Number.isFinite(raw) && raw > 0 ? raw : 5000;
 }
 
-/** "5s", "2.5s", "800ms". */
+/** "5s", "2.5s", "800ms"; "the time limit" for 0 (no statement timeout: a cancel, or a shorter limit set for one statement). */
 export function formatTimeout(ms = statementTimeoutMs()): string {
+  if (ms <= 0) return "the time limit";
   if (ms < 1000) return `${ms}ms`;
   const s = ms / 1000;
   return `${Number.isInteger(s) ? s : s.toFixed(1)}s`;

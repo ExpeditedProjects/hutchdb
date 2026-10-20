@@ -414,7 +414,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       expect(report.failed).toBe(8);
       const reg = await registry(slug);
       for (const p of reg.projections) {
-        expect(p.build).toMatchObject({ state: "failed", attempts: 1, error: "the build ran past its 300 ms limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)" });
+        expect(p.build).toMatchObject({ state: "failed", attempts: 1, error: "the build ran past its 300ms limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)" });
         const delay = Date.parse(p.build!.retry_after!) - Date.parse(p.build!.at);
         expect(delay).toBe(builder.RETRY_BASE_MS);
         expect(await indexState(`hc_${id}_${p.column}_idx`)).toBe("missing");
@@ -438,7 +438,7 @@ describe.skipIf(!TEST_DB_URL)("background index builds against real Postgres", (
       process.env.HUTCH_INDEX_BUILD_TIMEOUT_MS = "1";
       await builder.buildPendingIndexes({ collectionId: id });
       const first = (await registry(slug)).projections[0].build!;
-      expect(first).toMatchObject({ state: "failed", attempts: 1, error: "the build ran past its 1 ms limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)" });
+      expect(first).toMatchObject({ state: "failed", attempts: 1, error: "the build ran past its 1ms limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)" });
       await builder.buildPendingIndexes({ collectionId: id, retryFailed: true });
       const second = (await registry(slug)).projections[0].build!;
       expect(second.attempts).toBe(2);

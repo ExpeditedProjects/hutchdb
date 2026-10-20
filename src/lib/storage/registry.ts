@@ -386,7 +386,8 @@ export function searchIndexName(table: string): string {
   return indexName(table, "search");
 }
 
-function stateOf(build: IndexBuild | undefined): Pick<IndexDescription, "state" | "error" | "retry_after"> {
+/** An entry's build state for describe: ready unless pending, building or failed (with its generic reason and retry time). */
+export function stateOf(build: IndexBuild | undefined): Pick<IndexDescription, "state" | "error" | "retry_after"> {
   if (!build) return { state: "ready" };
   return {
     state: build.state,

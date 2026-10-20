@@ -1,4 +1,6 @@
 import { db, pool } from "@/lib/db";
+import { envInt } from "@/lib/constants";
+import { findPgError, formatTimeout } from "@/lib/db/errors";
 import { sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { PoolClient } from "pg";
@@ -69,18 +71,15 @@ const BACKFILL_LOCKED_ROUNDS = 50;
 const BACKFILL_LOCKED_WAIT_MS = 100;
 
 export function buildLockTimeoutMs(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS);
-  return env.HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS && Number.isInteger(n) && n > 0 ? n : DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS;
+  return envInt("HUTCH_INDEX_BUILD_LOCK_TIMEOUT_MS", DEFAULT_INDEX_BUILD_LOCK_TIMEOUT_MS, { env });
 }
 
 export function buildWaitMs(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.HUTCH_INDEX_BUILD_WAIT_MS);
-  return env.HUTCH_INDEX_BUILD_WAIT_MS && Number.isInteger(n) && n > 0 ? n : DEFAULT_INDEX_BUILD_WAIT_MS;
+  return envInt("HUTCH_INDEX_BUILD_WAIT_MS", DEFAULT_INDEX_BUILD_WAIT_MS, { env });
 }
 
 export function buildTimeoutMs(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.HUTCH_INDEX_BUILD_TIMEOUT_MS);
-  return env.HUTCH_INDEX_BUILD_TIMEOUT_MS && Number.isInteger(n) && n > 0 ? n : DEFAULT_INDEX_BUILD_TIMEOUT_MS;
+  return envInt("HUTCH_INDEX_BUILD_TIMEOUT_MS", DEFAULT_INDEX_BUILD_TIMEOUT_MS, { env });
 }
 
 /** A "building" entry older than this has no live builder (it would have timed out by now): due again. */
@@ -364,22 +363,11 @@ async function assertValidIndex(client: PoolClient, index: string): Promise<void
   if ((await indexValidity(client, index)) !== true) throw new Error(`index ${index} is missing or invalid after CREATE INDEX CONCURRENTLY`);
 }
 
-function pgCode(err: unknown): string | undefined {
-  for (let e: unknown = err, depth = 0; e && depth < 3; e = (e as { cause?: unknown }).cause, depth++) {
-    const code = (e as { code?: unknown }).code;
-    if (typeof code === "string") return code;
-  }
-  return undefined;
-}
-
 /** What describe shows for a failed build: never driver or SQL text. */
 function genericReason(err: unknown): string {
   if (err instanceof BackfillLockedError) return "writes kept some records locked through every backfill retry";
-  switch (pgCode(err)) {
-    case "57014": {
-      const ms = buildTimeoutMs();
-      return `the build ran past its ${ms < 1000 ? `${ms} ms` : `${Math.round(ms / 1000)} s`} limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)`;
-    }
+  switch (findPgError(err)?.code) {
+    case "57014": return `the build ran past its ${formatTimeout(buildTimeoutMs())} limit (HUTCH_INDEX_BUILD_TIMEOUT_MS)`;
     case "55P03": return "the build could not get a lock on the collection's table in time";
     case "40P01": return "the build was cancelled by a deadlock with a concurrent write";
     default: return "the build failed; the server log has the details";

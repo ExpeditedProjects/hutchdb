@@ -1,4 +1,5 @@
 import { db } from "@/lib/db";
+import { envInt } from "@/lib/constants";
 import { sql, TransactionRollbackError, type SQL } from "drizzle-orm";
 import { toTextArrayLiteral } from "./ddl";
 import { collectionTableName, ident, indexName, readQueryRegistry } from "./registry";
@@ -546,10 +547,7 @@ export async function tableBytes(collectionId: number): Promise<number> {
 export const DEFAULT_FULL_SCAN_MAX_BYTES = 100 * 1024 * 1024;
 
 export function fullScanMaxBytes(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.HUTCH_FULL_SCAN_MAX_BYTES);
-  return env.HUTCH_FULL_SCAN_MAX_BYTES !== undefined && env.HUTCH_FULL_SCAN_MAX_BYTES !== "" && Number.isFinite(n) && n >= 0
-    ? n
-    : DEFAULT_FULL_SCAN_MAX_BYTES;
+  return envInt("HUTCH_FULL_SCAN_MAX_BYTES", DEFAULT_FULL_SCAN_MAX_BYTES, { min: 0, env });
 }
 
 /**
@@ -607,7 +605,7 @@ export async function fieldFillRates(collectionId: number, maxFields: number, sa
       LIMIT ${maxFields}`);
     return { fields: result.rows as { key: string; count: number }[], sampledRows: null };
   }
-  const percent = Math.min(100, (150 * sample.rows) / Math.max(1, sample.liveRows));
+  const percent = bernoulliPercent(sample.rows, sample.liveRows) ?? 100;
   const result = await db.execute(sql`
     WITH s AS MATERIALIZED (
       SELECT t.data FROM ${table(collectionId)} t TABLESAMPLE BERNOULLI (${percent})

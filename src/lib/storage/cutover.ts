@@ -4,7 +4,7 @@ import { applyInference, updateRegistry } from "./apply";
 import { buildPendingIndexes, type BuildReport } from "./builder";
 import { childTableCounts } from "./rows";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "./ddl";
-import { collectionTableName, ident, projectionKey, readRegistry, type CutoverMark, type StorageRegistry } from "./registry";
+import { collectionTableName, ident, isReady, projectionKey, readRegistry, type CutoverMark, type StorageRegistry } from "./registry";
 
 /**
  * One-shot move of an existing database from the old shared `records` table
@@ -358,7 +358,7 @@ export async function runCutover(options: CutoverOptions = {}): Promise<CutoverR
   for (const r of report.inference) {
     if (r.unwinds.length === 0) continue;
     const registry = readRegistry((await db.execute(sql`SELECT storage FROM collections WHERE id = ${r.id}`)).rows[0]?.storage);
-    const ready = registry.unwinds.filter((u) => r.unwinds.some((x) => x.path === u.path) && (!u.build || u.build.state === "ready"));
+    const ready = registry.unwinds.filter((u) => r.unwinds.some((x) => x.path === u.path) && isReady(u));
     const counts = await childTableCounts(r.id, ready.map((u) => u.table));
     r.unwinds = r.unwinds.map((u) => ({ ...u, rows: counts[ready.find((x) => x.path === u.path)?.table ?? ""] ?? 0 }));
   }

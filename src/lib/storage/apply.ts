@@ -1,4 +1,5 @@
 import { db } from "@/lib/db";
+import { envInt, formatBodyLimit } from "@/lib/constants";
 import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
@@ -31,14 +32,7 @@ import {
 export const DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES = 10 * 1024 * 1024;
 
 export function searchIndexThresholdFromEnv(env: Record<string, string | undefined> = process.env): number {
-  const n = Number(env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES);
-  return env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES !== undefined && env.HUTCH_SEARCH_INDEX_THRESHOLD_BYTES !== "" && Number.isInteger(n) && n >= 0
-    ? n
-    : DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES;
-}
-
-function formatBytes(bytes: number): string {
-  return bytes >= 1024 * 1024 ? `${Math.round(bytes / 1024 / 1024)} MB` : `${Math.round(bytes / 1024)} KB`;
+  return envInt("HUTCH_SEARCH_INDEX_THRESHOLD_BYTES", DEFAULT_SEARCH_INDEX_THRESHOLD_BYTES, { min: 0, env });
 }
 
 function pending(now: number): IndexBuild {
@@ -108,7 +102,7 @@ export async function applyInference(
     if (wantSearch && !next.search_index) {
       next = {
         ...next,
-        search_index: { build: pending(now), reason: `the collection's table reached ${formatBytes(Number(bytes))} (threshold ${formatBytes(searchThresholdBytes)}).` },
+        search_index: { build: pending(now), reason: `the collection's table reached ${formatBodyLimit(Number(bytes))} (threshold ${formatBodyLimit(searchThresholdBytes)}).` },
       };
     }
     return finishBatch(next, docs.length, evaluated, decisions.pending);

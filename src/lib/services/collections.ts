@@ -11,7 +11,7 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { queryIndexes, readRegistry, type IndexBuild } from "@/lib/storage/registry";
+import { isReady, queryIndexes, readRegistry, stateOf } from "@/lib/storage/registry";
 import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import { dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
@@ -616,15 +616,6 @@ export async function describeCollection(slug: string, userId: string, page: Fie
   };
 }
 
-/** An entry's build state for describe: ready unless still pending, building or failed (with a generic reason). */
-function buildState(build: IndexBuild | undefined) {
-  if (!build || build.state === "ready") return { state: "ready" as const };
-  return {
-    state: build.state,
-    ...(build.state === "failed" ? { error: build.error, retry_after: build.retry_after } : {}),
-  };
-}
-
 /**
  * What inference has created for a collection, compactly: every index
  * that can serve a query (one short entry each), unwound arrays with their
@@ -637,7 +628,7 @@ async function describeStorage(collection: { id: number; storage: unknown }, pre
   const registry = readRegistry(collection.storage);
   const matches = (field: string) => !prefix || field.startsWith(prefix);
   const unwinds = registry.unwinds.filter((u) => matches(u.path));
-  const ready = unwinds.filter((u) => !u.build || u.build.state === "ready");
+  const ready = unwinds.filter(isReady);
   const counts = await tableRows.childTableCounts(collection.id, ready.map((u) => u.table));
   return {
     // Every index that can serve a query, including the GIN on the documents.
@@ -646,7 +637,7 @@ async function describeStorage(collection: { id: number; storage: unknown }, pre
     unwinds: unwinds.map((u) => ({
       path: u.path,
       ...(ready.includes(u) ? { rows: counts[u.table] ?? 0 } : {}),
-      ...buildState(u.build),
+      ...stateOf(u.build),
     })),
     // Arrays of objects that are not unwound yet, and why.
     not_unwound: (registry.pending_unwinds ?? []).filter((p) => matches(p.path)),
