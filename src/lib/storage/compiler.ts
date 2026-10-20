@@ -28,15 +28,13 @@ import {
 import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from "./rows";
 
 /**
- * Query compiler for layout='table' collections. Same QueryParams and result
- * shapes as queryRecords over the shared table, plus `indexed`/`plan`.
+ * Query compiler for a collection's hc_<id> table: records, aggregates and
+ * time buckets, plus `indexed`/`plan`.
  *
  * Field paths:
  * - `field`            a top-level key (projected column when available)
  * - `a.b.c`            a path through nested objects: its projected column
  *                      when inference made one, else data #> '{a,b,c}'
- *                      (the same expressions as the shared layout, without
- *                      its literal "a.b.c" top-level key fallback)
  * - `arr.key[.deeper]` a path into an array of objects; `arr` is an unwound
  *                      array (child table) or one detected in the documents.
  *                      `arr.key` uses the child column when there is one;
@@ -47,8 +45,7 @@ import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from
  * the caller wrote (filter field or path, search, sort); the unique-key
  * index and the created_at index count only when the caller filtered on a
  * unique key field or filtered/sorted on created_at. `id` in a filter or
- * sort is the document field, as in the shared layout, so the primary key
- * never counts.
+ * sort is the document field, so the primary key never counts.
  *
  * A projection never changes a result, only the plan. Filters route to a
  * column only where the column comparison is provably the same as the
@@ -60,7 +57,7 @@ import { fetchEmbeddedRecords, RECORD_COLUMNS, toRecord, type TableRecord } from
  * values differently from jsonb.
  */
 
-/** Page ceiling, as in the shared layout: 1,000 rows unless the caller (export) raises limitCap. */
+/** Page ceiling: 1,000 rows unless the caller (export) raises limitCap. */
 export const DEFAULT_LIMIT_CAP = 1000;
 /** Hard ceiling for limitCap. */
 export const TABLE_LIMIT_CAP = 10_000;
@@ -81,7 +78,7 @@ export const SORT_HELP =
 type Collection = { id: number; storage: unknown };
 
 /**
- * QueryParams as the table layout takes them: `sort` may also be an array
+ * QueryParams for a collection table: `sort` may also be an array
  * of keys, and `perRecord` keeps one row per parent record in aggregates
  * over a nested array.
  */
@@ -163,8 +160,8 @@ type ParsedPath =
   | { kind: "nested"; path: string; rest: string[]; unwind?: Unwind };
 
 function parsePath(registry: StorageRegistry, arrayPaths: Set<string>, field: string): ParsedPath {
-  // Like the shared layout, a key that is not a valid dotted path (empty or
-  // non-identifier segments) is a literal top-level key.
+  // A key that is not a valid dotted path (empty or non-identifier
+  // segments) is a literal top-level key.
   const segments = field.split(".");
   if (segments.length === 1 || !PATH_RE.test(field)) return { kind: "parent", field };
   const unwind = findUnwind(registry, segments[0]);
@@ -384,7 +381,7 @@ function assertOperand(op: string, operand: unknown): void {
  * A positive condition on one jsonb value (a field's value, or one element
  * of an array held there): equality (op null), comparisons, $in and
  * $contains. Comparisons and $contains only see values of the operand's
- * type, as in the shared layout.
+ * type.
  */
 function valueMatch(json: SQL, text: SQL, op: string | null, operand: unknown): SQL {
   if (op === null) return sql`${json} = ${JSON.stringify(operand)}::jsonb`;
@@ -657,8 +654,8 @@ function compileRecordSort(ctx: Ctx, keys: string[]): { orderBy: SQL; clauses: C
   if (keys.length <= 1) {
     const { tiebreak, clause, ...sorted } = compileRecordSortKey(ctx, keys[0]);
     // Ties (equal values, same-batch created_at) break on the row id so a
-    // page of top-N results is the same every time; as in the shared layout,
-    // in the sort's direction for created_at, updated_at and id, else ascending.
+    // page of top-N results is the same every time: in the sort's direction
+    // for created_at, updated_at and id, else ascending.
     return { ...sorted, clauses: clause ? [clause] : [], orderBy: sql`${sorted.orderBy}, ${tiebreak ?? (keys[0] ? sql`t.id ASC` : sql`t.id DESC`)}` };
   }
   // Several keys: each in turn, then the row id. Only the first key can
@@ -675,9 +672,8 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
   const { field, dir } = parseSort(sort);
   const sameDir = sql`t.id ${dir}`;
   const { registry, parent } = ctx;
-  // `id` is a document field here, as in the shared layout (the row id is
-  // not addressable by filter or sort), so the primary key never serves a
-  // caller's clause.
+  // `id` is a document field here (the row id is not addressable by filter
+  // or sort), so the primary key never serves a caller's clause.
   if (field === "created_at") {
     return { orderBy: sql`t.created_at ${dir}`, clause: { label: "sort on created_at", indexes: [indexName(parent, "created_at")] }, tiebreak: sameDir };
   }

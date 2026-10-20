@@ -3,9 +3,8 @@ import { sql, type SQL } from "drizzle-orm";
 import { collectionTableName, ident } from "./registry";
 
 /**
- * Row operations on a collection's hc_<id> table. Result rows keep the
- * drizzle shape of the old shared `records` table, so service responses
- * look as they always have.
+ * Row operations on a collection's hc_<id> table. Result rows are the
+ * record shape services return (camelCase, with collectionId).
  */
 export type TableRecord = {
   id: number;
@@ -72,11 +71,11 @@ export type UpsertResult =
 /**
  * Upsert over the table's unique key (uk_* columns + partial unique index,
  * see hc_set_unique_key). Documents missing any key field never conflict
- * and are inserted, as in the shared layout. Within one batch, later
+ * and are inserted. Within one batch, later
  * documents with the same key win for 'replace', are shallow-merged over
  * earlier ones for 'merge', lose for 'skip', and make 'error' a conflict.
- * 'merge' updates an existing row to `data || excluded.data`, the shared
- * layout's {...old, ...new}.
+ * 'merge' updates an existing row to `data || excluded.data`, i.e.
+ * {...old, ...new}.
  */
 export async function upsertRecords(
   collectionId: number,
@@ -101,9 +100,8 @@ export async function upsertRecords(
       seen.set(key, deduped.length);
       deduped.push(doc);
     } else if (mode === "error") {
-      // Two documents in one batch with the same key are a conflict, as
-      // they were in the old shared layout (which stored the first before
-      // reporting the second). The batch is one statement: nothing lands.
+      // Two documents in one batch with the same key are a conflict. The
+      // batch is one statement: nothing lands.
       return { conflict: true };
     } else if (mode === "replace") {
       deduped[at] = doc;
@@ -221,15 +219,6 @@ export async function listRecords(collectionId: number, limit: number, offset: n
   return (result.rows as RawRow[]).map((r) => toRecord(collectionId, r));
 }
 
-/** Fetch live parent documents by id (for attaching to child aggregates). */
-export async function fetchRecordsByIds(collectionId: number, ids: number[]): Promise<TableRecord[]> {
-  if (ids.length === 0) return [];
-  const result = await db.execute(sql`
-    SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
-    WHERE t.id = ANY(${toIntArrayLiteral(ids)}::int[]) AND t.deleted_at IS NULL`);
-  return (result.rows as RawRow[]).map((r) => toRecord(collectionId, r));
-}
-
 /**
  * Parent records for nested aggregate rows, slimmed in SQL: only the
  * requested top-level `fields`, or — without fields — only top-level
@@ -257,7 +246,7 @@ function toIntArrayLiteral(ids: number[]): string {
   return `{${ids.map((id) => Math.trunc(id)).join(",")}}`;
 }
 
-/** Full-text matches for hutch_search, same predicate as the shared layout. */
+/** Full-text matches for hutch_search. */
 export async function searchRecords(collectionId: number, search: string, limit: number): Promise<TableRecord[]> {
   const result = await db.execute(sql`
     SELECT ${RECORD_COLUMNS} FROM ${table(collectionId)} t
@@ -282,7 +271,7 @@ export async function sampleDocuments(collectionId: number, limit: number, rando
   return (result.rows as { data: Record<string, unknown> }[]).map((r) => r.data);
 }
 
-/** The three result sets getCollectionStats needs, same shapes as the shared layout. */
+/** The three result sets getCollectionStats needs. */
 export async function collectionStats(collectionId: number, maxFields: number) {
   const t = table(collectionId);
   return Promise.all([

@@ -17,7 +17,7 @@ export type Executor = {
 };
 
 /**
- * DDL for layout='table' collections. Every identifier here comes from the
+ * DDL for collection tables. Every identifier here comes from the
  * registry (already sanitized) and is re-checked by ident(); every JSON key
  * is passed to a SQL helper (drizzle/0021) as a bound parameter and quoted
  * there with %L. No user string is ever concatenated into statement text.

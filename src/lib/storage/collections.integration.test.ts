@@ -21,8 +21,8 @@ import * as schema from "@/lib/db/schema";
 
 const TEST_DB_URL = process.env.HUTCH_TEST_DATABASE_URL;
 
-const USER_ID = "layouts-user";
-const ORG_ID = "layouts-org";
+const USER_ID = "collections-user";
+const ORG_ID = "collections-org";
 
 type RecordsService = typeof import("@/lib/services/records");
 type CollectionsService = typeof import("@/lib/services/collections");
@@ -69,8 +69,8 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
     collectionsSvc = await import("@/lib/services/collections");
     appPool = (await import("@/lib/db")).db.$client as Pool;
 
-    await testDb.insert(schema.user).values({ id: USER_ID, email: "layouts@hutch.test", name: "Layouts" }).onConflictDoNothing();
-    await testDb.insert(schema.organizations).values({ id: ORG_ID, slug: "layouts", name: "Layouts", personal: true }).onConflictDoNothing();
+    await testDb.insert(schema.user).values({ id: USER_ID, email: "collections@hutch.test", name: "Collections" }).onConflictDoNothing();
+    await testDb.insert(schema.organizations).values({ id: ORG_ID, slug: "collections-org", name: "Collections", personal: true }).onConflictDoNothing();
     await testDb.insert(schema.organizationMembers).values({ organizationId: ORG_ID, userId: USER_ID, role: "admin" }).onConflictDoNothing();
   });
 

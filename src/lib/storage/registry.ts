@@ -58,7 +58,7 @@ export type StorageRegistry = {
   pending_unwinds?: { path: string; reason: string }[];
   /**
    * Set by `npm run storage:cutover` once the collection's rows were copied
-   * from the old shared `records` table and verified; a re-run skips it.
+   * from the old `records` table and verified; a re-run skips it.
    */
   cutover?: CutoverMark;
 };

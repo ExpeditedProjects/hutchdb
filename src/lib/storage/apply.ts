@@ -17,7 +17,7 @@ import {
 } from "./registry";
 
 /**
- * Run inference for a batch that just landed in a layout='table' collection
+ * Run inference for a batch that just landed in a collection
  * and apply each decision in its own transaction, updating the registry as
  * it goes. `docs` are the documents as stored (after a merge, the merged
  * documents). One failed decision never blocks the others or the
@@ -146,7 +146,7 @@ function valueAt(doc: unknown, segments: string[]): unknown {
 
 /**
  * Mark projections `mixed` when documents just written hold a value of
- * another type at their field. Called after every table-layout write that
+ * another type at their field. Called after every write that
  * carries documents; the flag is sticky (deletes never clear it), which
  * only costs index use, never correctness.
  */

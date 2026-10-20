@@ -13,7 +13,7 @@ import {
 } from "./registry";
 
 /**
- * Fixed inference rules for layout='table' collections. Pure: takes the
+ * Fixed inference rules for collection tables. Pure: takes the
  * documents of one batch plus the collection's registry and counts, and
  * returns what to create. apply.ts runs the DDL.
  *

@@ -58,7 +58,6 @@ const collectionRow = {
   publishedAt: null,
   visibility: 'private',
   orgDefaultRole: 'viewer',
-  layout: 'shared',
   storage: {},
   migrationState: null,
   migrationSwappedAt: null,

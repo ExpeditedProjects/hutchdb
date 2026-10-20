@@ -145,7 +145,7 @@ async function copyCollection(tx: Executor, c: CollectionRow, log: (line: string
   const uniqueKey = Array.isArray(c.unique_key) ? (c.unique_key as string[]) : [];
   let next: StorageRegistry = registry;
   if (uniqueKey.length > 0) {
-    // The old layout never enforced unique_key; a unique index would reject
+    // The old `records` table never enforced unique_key; a unique index would reject
     // existing duplicates. Leave it unset then (a later on_conflict store
     // reports the duplicates as a 409) and say so.
     const dupes = await tx.execute(sql`

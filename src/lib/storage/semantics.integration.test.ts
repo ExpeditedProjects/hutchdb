@@ -7,7 +7,7 @@ import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
-// Query semantics of the table layout against real Postgres, each checked
+// Query semantics of collection tables against real Postgres, each checked
 // against an in-memory oracle and between a projected/unwound collection
 // and an identical one evaluated over the documents only:
 // - arrays of scalars in filters (Mongo semantics) and indexed honesty;
@@ -115,13 +115,13 @@ function groupValues(v: unknown): unknown[] {
   return [v === undefined ? null : v];
 }
 
-describe.skipIf(!TEST_DB_URL)("table layout query semantics against real Postgres", () => {
+describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
   let testPool: Pool;
   let testDb: NodePgDatabase<typeof schema>;
   let appPool: Pool | undefined;
   let recordsSvc: RecordsService;
   let collectionsSvc: CollectionsService;
-  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_STORAGE_LAYOUT", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
+  const ENV_KEYS = ["HUTCH_DATABASE_URL", "HUTCH_PROJECT_THRESHOLD", "HUTCH_UNWIND_THRESHOLD"] as const;
   const savedEnv = Object.fromEntries(ENV_KEYS.map((k) => [k, process.env[k]]));
 
   function thresholds(project: number, unwind = project) {
@@ -131,7 +131,6 @@ describe.skipIf(!TEST_DB_URL)("table layout query semantics against real Postgre
 
   beforeAll(async () => {
     process.env.HUTCH_DATABASE_URL = TEST_DB_URL;
-    process.env.HUTCH_STORAGE_LAYOUT = "table";
     testPool = new Pool({ connectionString: TEST_DB_URL });
     testDb = drizzle(testPool, { schema });
     const migrationsFolder = fileURLToPath(new URL("../../../drizzle", import.meta.url));
@@ -147,7 +146,6 @@ describe.skipIf(!TEST_DB_URL)("table layout query semantics against real Postgre
   });
 
   beforeEach(async () => {
-    process.env.HUTCH_STORAGE_LAYOUT = "table";
     thresholds(100);
     await testDb.execute(sql`TRUNCATE collections RESTART IDENTITY CASCADE`);
     const tables = await testDb.execute(sql`SELECT tablename FROM pg_tables WHERE schemaname = current_schema() AND tablename LIKE 'hc\_%'`);

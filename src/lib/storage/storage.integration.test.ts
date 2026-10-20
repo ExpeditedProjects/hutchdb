@@ -474,7 +474,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
       expect(plain.indexed).toBe(false);
       expect(plain.reason).toMatch(/no filter, search or sort/);
 
-      // `id` is the document field, as in the shared layout: these documents have none.
+      // `id` is the document field: these documents have none.
       expect((await query(slug, { filter: { id: 1 } })).records).toHaveLength(0);
 
       const recent = await query(slug, { sort: "-created_at", limit: 5 });
@@ -496,16 +496,16 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
     const errored = await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "upsert", records: [{ key: "a", v: 4 }], on_conflict: "error" });
     expect(errored).toMatchObject({ status: 409 });
 
-    // merge is the shared layout's {...existing, ...incoming}, also within one batch.
+    // merge is {...existing, ...incoming}, also within one batch.
     const merged = await store("upsert", [{ key: "a", extra: true }, { key: "d", v: 1 }, { key: "d", w: 2 }], "merge");
     expect((merged as { results: { action: string }[] }).results.map((r) => r.action)).toEqual(["updated", "created"]);
 
-    // Sorting on a data field puts records missing it last, as in the shared layout.
+    // Sorting on a data field puts records missing it last.
     const all = await query(slug, { sort: "key", limit: 10 });
     expect(all.records!.map((r) => r.data)).toEqual([{ key: "a", v: 2, extra: true }, { key: "b", v: 1 }, { key: "c", v: 1 }, { key: "d", v: 1, w: 2 }, { v: 0 }]);
   });
 
-  it("transform, export, stats and truncate work on the table layout", async () => {
+  it("transform, export, stats and truncate work on a collection table", async () => {
     const slug = (await store("misc", [{ a: 1, b: "x" }, { a: 2 }]) as { collection: { slug: string } }).collection.slug;
 
     const renamed = ok(await recordsSvc.transformRecords(slug, USER_ID, { rename_fields: { a: "n" } }));
