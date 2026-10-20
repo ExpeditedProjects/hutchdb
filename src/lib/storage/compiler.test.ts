@@ -303,9 +303,9 @@ describe('compileQuery: sort', () => {
 
   it('in aggregate queries sorts by an alias or group key by ordinal, then limits', () => {
     const { sql } = compile({ groupBy: 'votes.category_id', aggregate: { points: { sum: 'votes.points' } }, sort: '-points', limit: 10 })
-    expect(sql).toMatch(/ORDER BY 2 DESC NULLS LAST, 1 ASC LIMIT \$\d+$/)
+    expect(sql).toMatch(/ORDER BY 2 DESC NULLS LAST, 1 ASC LIMIT \$\d+ OFFSET \$\d+$/)
     expect(compile({ groupBy: 'votes.category_id', aggregate: { points: { sum: 'votes.points' } }, sort: '-points', perRecord: true }).sql)
-      .toMatch(/ORDER BY 3 DESC NULLS LAST, 1 ASC, 2 ASC LIMIT \$\d+$/)
+      .toMatch(/ORDER BY 3 DESC NULLS LAST, 1 ASC, 2 ASC LIMIT \$\d+ OFFSET \$\d+$/)
     expect(sql).toContain('count(*) OVER () AS __total')
     const byKey = compile({ groupBy: 'status', aggregate: { n: 'count' }, sort: 'status' }).sql
     expect(byKey).toMatch(/ORDER BY 1 ASC NULLS LAST LIMIT/)
@@ -732,7 +732,7 @@ describe('compileQuery: limit 0 counts', () => {
   it('an aggregate with limit 0 still reads one row for the group total and reports limit 0', () => {
     const compiled = compileQuery(collection, { groupBy: 'status', limit: 0 })
     expect(compiled.limit).toBe(0)
-    expect(dialect.sqlToQuery(compiled.query).params.at(-1)).toBe(1)
+    expect(dialect.sqlToQuery(compiled.query).params.slice(-2)).toEqual([1, 0])
   })
 
   it('a negative limit is an error', () => {

@@ -507,9 +507,9 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       const groups = new Set(docs.flatMap((d) => d.answers.map((a) => a.is_accepted))).size;
       for (const slug of [projected, plain]) {
         const r = await query(slug, { filter: { owner_user_id: 4 }, fields: ["question_id"], limit: 0 });
-        expect(r).toMatchObject({ records: [], total: matching.length, count: 0, limit: 0, has_more: true, next_offset: 0 });
+        expect(r).toMatchObject({ records: [], total: matching.length, count: 0, limit: 0, has_more: false, next_offset: null });
         const a = await query(slug, { groupBy: "owner_user_id", aggregate: { n: "count" }, limit: 0 });
-        expect(a).toMatchObject({ results: [], total: 17, count: 0, limit: 0 });
+        expect(a).toMatchObject({ results: [], total: 17, count: 0, limit: 0, has_more: false, next_offset: null });
         const nested = await query(slug, { groupBy: "answers.is_accepted", perRecord: true, limit: 0 });
         expect(nested).toMatchObject({ results: [], count: 0, limit: 0 });
         expect(nested.total).toBe(docs.reduce((s, d) => s + new Set(d.answers.map((x) => x.is_accepted)).size, 0));
@@ -600,6 +600,41 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       thresholds(100);
       const imported = ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: "fresh", format: "json", content: JSON.stringify(makeQuestions(120)) })) as Record<string, unknown>;
       expect(imported.storage_note).toMatch(/This batch made fields/);
+    });
+  });
+
+  // ── round 2: null groups sort last in both directions and page like records ──
+
+  describe("null groups and aggregate paging", () => {
+    it("the group with no value sorts last ascending and descending, counts toward total, and offset pages reach it", async () => {
+      const docs = makeQuestions(300);
+      const { projected, plain } = await twin(docs);
+      // Answers without an owner form the null group (k % 4 === 3).
+      const owners = new Map<number | null, number>();
+      for (const d of docs) for (const a of d.answers) owners.set(a.owner?.user_id ?? null, (owners.get(a.owner?.user_id ?? null) ?? 0) + 1);
+      expect(owners.has(null)).toBe(true);
+      const keys = [...owners.keys()].filter((k): k is number => k !== null).sort((a, b) => a - b);
+      for (const slug of [projected, plain]) {
+        for (const [sort, order] of [["answers.owner.user_id", keys], ["-answers.owner.user_id", [...keys].reverse()]] as const) {
+          const seen: unknown[] = [];
+          let offset = 0;
+          for (let page = 0; page < 10; page++) {
+            const r = await query(slug, { groupBy: "answers.owner.user_id", aggregate: { n: "count" }, sort, limit: 4, offset });
+            expect(r.total).toBe(owners.size);
+            seen.push(...r.results!.map((x) => x["answers.owner.user_id"]));
+            if (!r.has_more) {
+              expect(r.next_offset).toBeNull();
+              break;
+            }
+            expect(r.next_offset).toBe(offset + 4);
+            offset = r.next_offset as number;
+          }
+          expect(seen).toEqual([...order, null]);
+        }
+        // A page past the last group still reports the total.
+        const past = await query(slug, { groupBy: "answers.owner.user_id", limit: 5, offset: 1000 });
+        expect(past).toMatchObject({ results: [], total: owners.size, has_more: false, next_offset: null });
+      }
     });
   });
 });

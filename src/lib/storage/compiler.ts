@@ -105,6 +105,9 @@ export type TableAggregateResult = {
   total: number;
   count: number;
   limit: number;
+  offset: number;
+  has_more: boolean;
+  next_offset: number | null;
   /** Aggregates that came back null for some groups because of the field's value types. */
   warnings?: string[];
 } & IndexReport;
@@ -138,6 +141,9 @@ export type CompiledQuery =
   | {
       kind: "aggregate";
       query: SQL;
+      /** The number of groups, for a page past the last group (the query's own count(*) OVER () has no row to ride on). */
+      countQuery: SQL;
+      offset: number;
       /** 0 for a count-only query (limit: 0): the statement still runs with LIMIT 1 to read the group total. */
       limit: number;
       /** Set when rows are per parent record (perRecord), so the parent can be attached. */
@@ -949,6 +955,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
       timeBucket,
       sortKeys: keys,
       limit: clampedLimit,
+      offset: countOnly ? 0 : offset,
       countOnly,
       perRecord: params.perRecord === true,
       scalarArrayKeys: new Set(options.scalarArrayKeys ?? []),
@@ -1023,10 +1030,10 @@ function compileAggregate(
   parsed: ParsedFilter,
   parent: SQL[],
   clauses: Clause[],
-  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; countOnly: boolean; perRecord: boolean; scalarArrayKeys: Set<string> },
+  params: { groupKeys: string[]; aggregate?: AggregateSpec; timeBucket?: string; sortKeys: string[]; limit: number; offset: number; countOnly: boolean; perRecord: boolean; scalarArrayKeys: Set<string> },
 ): CompiledQuery {
   const { registry } = ctx;
-  const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, countOnly, perRecord, scalarArrayKeys } = params;
+  const { groupKeys, aggregate, timeBucket, sortKeys: keys, limit, offset, countOnly, perRecord, scalarArrayKeys } = params;
   const aggs = parseAggregate(aggregate);
 
   // Which nested array (if any) this aggregation runs over.
@@ -1157,11 +1164,17 @@ function compileAggregate(
 
   const groupClause = group.length > 0 ? sql`GROUP BY ${sql.raw(group.join(", "))}` : sql``;
   const orderClause = order.length > 0 ? sql`ORDER BY ${sql.join(order, sql`, `)}` : sql``;
-  const query = sql`SELECT ${sql.join(select, sql`, `)} FROM ${from} WHERE ${sql.join(where, sql` AND `)} ${groupClause} ${orderClause} LIMIT ${limit}`;
+  const body = sql`FROM ${from} WHERE ${sql.join(where, sql` AND `)} ${groupClause}`;
+  const query = sql`SELECT ${sql.join(select, sql`, `)} ${body} ${orderClause} LIMIT ${limit} OFFSET ${offset}`;
+  const countQuery = group.length > 0
+    ? sql`SELECT count(*)::int AS count FROM (SELECT ${sql.join(select, sql`, `)} ${body}) g`
+    : sql`SELECT 1 AS count`;
 
   return {
     kind: "aggregate",
     query,
+    countQuery,
+    offset,
     limit: countOnly ? 0 : limit,
     nested: path && route && perRecord ? { path, route } : null,
     stripPaths: [...new Set([...registry.unwinds.map((u) => u.path), ...(path ? [path] : [])])],
@@ -1477,7 +1490,9 @@ export async function queryTable(collection: Collection, params: TableQueryParam
   if (compiled.kind === "aggregate") {
     const [rows, report] = await Promise.all([db.execute(compiled.query), explain(collection.id, compiled.query, compiled.clauses)]);
     const raw = rows.rows as Record<string, unknown>[];
-    const total = raw.length > 0 ? Number(raw[0].__total) : 0;
+    const total = raw.length > 0 ? Number(raw[0].__total)
+      : compiled.offset > 0 ? ((await db.execute(compiled.countQuery)).rows[0] as { count: number }).count
+      : 0;
     const hidden = new Set(["__total", ...compiled.typeChecks.map((c) => c.column)]);
     const warnings = typeCheckWarnings(compiled.typeChecks, raw);
     let results = compiled.limit === 0 ? [] : raw.map((row) => Object.fromEntries(Object.entries(row).filter(([k]) => !hidden.has(k))));
@@ -1489,14 +1504,27 @@ export async function queryTable(collection: Collection, params: TableQueryParam
       const parents = new Map(fetched.map((r) => [r.id, fieldsGiven || arrayOps.length > 0 ? { ...r, data: shapeData(r.data, params.fields, arrayOps) } : r]));
       results = results.map((r) => ({ ...r, record: parents.get(Number(r.parent_id)) ?? null }));
     }
-    return { results, total, count: results.length, limit: compiled.limit, ...report, ...(warnings.length > 0 ? { warnings } : {}) };
+    // Count-only (limit 0) never pages; otherwise has_more/next_offset page through the groups like records.
+    const hasMore = compiled.limit > 0 && compiled.offset + results.length < total;
+    return {
+      results,
+      total,
+      count: results.length,
+      limit: compiled.limit,
+      offset: compiled.offset,
+      has_more: hasMore,
+      next_offset: hasMore ? compiled.offset + results.length : null,
+      ...report,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    };
   }
 
   const { query, countQuery, limit, offset, fields, nullsLast } = compiled;
   if (compiled.countOnly) {
     const [countRows, report] = await Promise.all([db.execute(countQuery), explain(collection.id, countQuery, compiled.clauses)]);
     const total = (countRows.rows[0] as { count: number }).count;
-    return { records: [], total, count: 0, limit: 0, offset, has_more: offset < total, next_offset: offset < total ? offset : null, ...report };
+    // A count has no pages: has_more is false and there is no next_offset, so a paging loop stops.
+    return { records: [], total, count: 0, limit: 0, offset, has_more: false, next_offset: null, ...report };
   }
   const [rowsResult, report] = await Promise.all([db.execute(query), explain(collection.id, query, compiled.clauses)]);
   const rows = (rowsResult.rows as Parameters<typeof toRecord>[1][]).map((r) => toRecord(collection.id, r));
