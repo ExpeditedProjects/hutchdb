@@ -851,20 +851,21 @@ describe('collection url in mutation responses', () => {
   })
 
   describe('hutch_update_record', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.updateRecord).mockResolvedValue({
         record: { id: 7, data: { name: 'Alice' } },
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_update_record', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 7,
         data: { name: 'Alice' },
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
@@ -886,87 +887,93 @@ describe('collection url in mutation responses', () => {
   })
 
   describe('hutch_set_record_status', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.updateRecordStatus).mockResolvedValue({
         record: { id: 3, status: 'archived' },
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_set_record_status', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 3,
         status: 'archived',
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
   describe('hutch_delete_record', () => {
-    it('includes url because the collection still exists', async () => {
+    it('includes url with the resolved slug because the collection still exists', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(recordService.deleteRecord).mockResolvedValue({
-        record: { id: 9 },
+        deleted: true,
+        id: 9,
+        slug: 'users-1a2b',
       } as never)
 
       const result = await callTool('hutch_delete_record', {
-        slug: 'users',
+        slug: 'Users',
         record_id: 9,
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/users`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/users-1a2b`)
     })
   })
 
   describe('hutch_infer_schema', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(collectionService.inferCollectionSchema).mockResolvedValue({
-        fields: [{ name: 'title', type: 'text' }],
+        schema: { fields: [{ name: 'title', type: 'text' }] },
+        slug: 'notes-1a2b',
       } as never)
 
-      const result = await callTool('hutch_infer_schema', { slug: 'notes' })
+      const result = await callTool('hutch_infer_schema', { slug: 'Notes' })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/notes`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/notes-1a2b`)
     })
   })
 
   describe('hutch_update_schema', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(collectionService.updateFieldDefinition).mockResolvedValue({
         field: { name: 'status', type: 'select' },
+        slug: 'tasks-1a2b',
       } as never)
 
       const result = await callTool('hutch_update_schema', {
-        slug: 'tasks',
+        slug: 'Tasks',
         field: 'status',
         type: 'select',
         options: ['todo', 'done'],
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/tasks`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/tasks-1a2b`)
     })
   })
 
   describe('hutch_create_view', () => {
-    it('includes url with the slug from the input args', async () => {
+    it('includes url with the resolved slug, not the name passed in', async () => {
       createMcpServer('user-1', 'org-test', BASE_URL)
       vi.mocked(createView).mockResolvedValue({
         view: { id: 1, name: 'Table' },
+        slug: 'tasks-1a2b',
       } as never)
 
       const result = await callTool('hutch_create_view', {
-        slug: 'tasks',
+        slug: 'Tasks',
         type: 'table',
       })
 
       const parsed = parseResponseJson(result.content[0].text)
-      expect(parsed.url).toBe(`${BASE_URL}/c/tasks`)
+      expect(parsed.url).toBe(`${BASE_URL}/c/tasks-1a2b`)
     })
   })
 

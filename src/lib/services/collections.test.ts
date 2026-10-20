@@ -273,7 +273,7 @@ describe('updateFieldDefinition', () => {
   it('marks the updated field as not inferred and bumps schema version', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: { ...baseCollection }, role: 'editor' })
     const result = await updateFieldDefinition('bookmarks', 'user-test', 'url', { hidden: true })
-    expect(result).toEqual({ field: expect.objectContaining({ name: 'url', hidden: true, inferred: false }) })
+    expect(result).toEqual({ slug: 'bookmarks', field: expect.objectContaining({ name: 'url', hidden: true, inferred: false }) })
   })
 })
 

@@ -542,6 +542,12 @@ describe.skipIf(!TEST_DB_URL)("table layout query semantics against real Postgre
     expect((ok(await collectionsSvc.describeCollection("Tags", USER_ID)) as { slug: string }).slug).toBe(slug);
     const t = ok(await recordsSvc.transformRecords("tags", USER_ID, { set_field: { field: "seen", value: true } }));
     expect(t.slug).toBe(slug);
+    // Record-level tools report the resolved slug (the MCP layer builds collection URLs from it).
+    const id = (await query("tags", {})).records![0].id;
+    expect((ok(await recordsSvc.updateRecord("tags", USER_ID, id, { tag_id: 1, name: "hiking", seen: true })) as { slug: string }).slug).toBe(slug);
+    expect((ok(await recordsSvc.updateRecordStatus("tags", USER_ID, id, "flagged")) as { slug: string }).slug).toBe(slug);
+    expect((ok(await collectionsSvc.inferCollectionSchema("tags", USER_ID)) as { slug: string }).slug).toBe(slug);
+    expect((ok(await recordsSvc.deleteRecord("tags", USER_ID, id)) as { slug: string }).slug).toBe(slug);
 
     // A second collection whose name differs only in case: the exact name still resolves, "tags" no longer does.
     ok(await collectionsSvc.createCollection(USER_ID, ORG_ID, { name: "TAGS" }));

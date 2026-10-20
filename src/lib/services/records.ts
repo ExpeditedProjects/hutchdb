@@ -550,7 +550,7 @@ export async function updateRecord(slug: string, userId: string, recordId: numbe
   }
 
   revalidateDashboard(slug);
-  return { updated: true, record: updated };
+  return { updated: true, record: updated, slug };
 }
 
 class TransformFailed extends Error {}
@@ -719,7 +719,7 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
   if (!updated) return { error: "Record not found", status: 404 };
 
   revalidateDashboard(slug);
-  return { updated: true, record: updated };
+  return { updated: true, record: updated, slug };
 }
 
 export async function deleteRecord(slug: string, userId: string, recordId: number) {
@@ -731,5 +731,5 @@ export async function deleteRecord(slug: string, userId: string, recordId: numbe
 
   if (!deleted) return { error: "Record not found", status: 404 };
   revalidateDashboard(slug);
-  return { deleted: true, id: recordId };
+  return { deleted: true, id: recordId, slug };
 }

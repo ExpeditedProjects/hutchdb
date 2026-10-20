@@ -297,7 +297,7 @@ export async function inferCollectionSchema(slug: string, userId: string) {
   await db.update(collections).set({ schema: merged, updatedAt: new Date() }).where(eq(collections.id, collection.id));
   revalidateDashboard(slug, "schema");
 
-  return { schema: merged };
+  return { schema: merged, slug };
 }
 
 export async function updateFieldDefinition(
@@ -330,7 +330,7 @@ export async function updateFieldDefinition(
   await db.update(collections).set({ schema, updatedAt: new Date() }).where(eq(collections.id, collection.id));
   revalidateDashboard(slug, "schema");
 
-  return { field: schema.fields[fieldIndex] };
+  return { field: schema.fields[fieldIndex], slug };
 }
 
 export async function addFieldDefinition(

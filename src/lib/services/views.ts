@@ -54,7 +54,7 @@ export async function createView(collectionSlug: string, userId: string, params:
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
-  return { view: created };
+  return { view: created, slug: collectionSlug };
 }
 
 /** Same access rule as createView; the view must belong to collectionSlug. */

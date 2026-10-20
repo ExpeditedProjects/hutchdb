@@ -427,7 +427,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await recordService.updateRecord(slug, userId, record_id, data as Record<string, unknown>);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result.record, url: collectionUrl(slug) });
+      return jsonResponse({ ...result.record, url: collectionUrl(result.slug) });
     }
   );
 
@@ -475,7 +475,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await recordService.deleteRecord(slug, userId, record_id);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      const json = JSON.stringify({ deleted: true, record_id, url: collectionUrl(slug) }, null, 2);
+      const json = JSON.stringify({ deleted: true, record_id, url: collectionUrl(result.slug) }, null, 2);
       return textResponse(`Record ${record_id} deleted.\n\n${json}`);
     }
   );
@@ -494,7 +494,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await collectionService.inferCollectionSchema(slug, userId);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result, url: collectionUrl(slug) });
+      return jsonResponse({ ...result, url: collectionUrl(result.slug) });
     }
   );
 
@@ -518,7 +518,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await collectionService.updateFieldDefinition(slug, userId, field, { type, options, position, hidden });
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result, url: collectionUrl((result as { slug?: string }).slug ?? slug) });
+      return jsonResponse({ ...result, url: collectionUrl(result.slug) });
     }
   );
 
@@ -539,7 +539,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await recordService.updateRecordStatus(slug, userId, record_id, status);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result, url: collectionUrl(slug) });
+      return jsonResponse({ ...result, url: collectionUrl(result.slug) });
     }
   );
 
@@ -590,7 +590,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       });
       if (!result) return collectionNotFound(params.slug);
       if ("error" in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result.view, url: collectionUrl(params.slug) });
+      return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
     }
   );
 

@@ -704,7 +704,7 @@ describe('deleteRecord', () => {
     vi.mocked(softDeleteRecord).mockResolvedValue(true)
     const result = await deleteRecord('users', 'user-test', 5)
     expect(softDeleteRecord).toHaveBeenCalledWith(1, 5)
-    expect(result).toEqual({ deleted: true, id: 5 })
+    expect(result).toEqual({ deleted: true, id: 5, slug: 'users' })
   })
 })
 
