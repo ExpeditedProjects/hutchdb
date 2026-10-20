@@ -694,8 +694,8 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(byPoints.results).toEqual([{ party: "R", "totals.veterans.points": 29, count: 3 }]);
     });
 
-    it("rejects more than 3 group_by keys", async () => {
-      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: ["a", "b", "c", "d"] })).rejects.toThrow(/at most 3 keys/);
+    it("rejects more than 5 group_by keys", async () => {
+      await expect(recordsSvc.queryRecords(slug, USER_ID, { groupBy: ["a", "b", "c", "d", "e", "f"] })).rejects.toThrow(/at most 5 keys/);
     });
 
     it("createRecords return: summary omits the stored records", async () => {

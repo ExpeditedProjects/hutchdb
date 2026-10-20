@@ -466,7 +466,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
 
       const mixed = await query(slug, { groupBy: ["party", "votes.label"], aggregate: { n: "count" }, limit: 1000, record: false, perRecord: true });
       expect(mixed.results![0]).toMatchObject({ parent_id: 1, party: "R", "votes.label": "v0", n: 1 });
-      await expect(query(slug, { groupBy: ["a", "b", "c", "d"] })).rejects.toThrow(/at most 3 keys/);
+      await expect(query(slug, { groupBy: ["a", "b", "c", "d", "e", "f"] })).rejects.toThrow(/at most 5 keys/);
     });
 
     it("counts only indexes that serve a clause the caller wrote", async () => {
