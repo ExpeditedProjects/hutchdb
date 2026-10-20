@@ -2,8 +2,8 @@ import { db } from "@/lib/db";
 import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
-import { type Executor } from "./ddl";
-import { projectionValue, textArray } from "./expression";
+import { toTextArrayLiteral, type Executor } from "./ddl";
+import { projectionValue } from "./expression";
 import { arrayCandidates, inferDecisions, pathsToCount, thresholdsFromEnv, type PendingUnwind, type Thresholds } from "./inference";
 import {
   childTableName,
@@ -153,7 +153,7 @@ export async function hasMisfits(ex: Executor, collectionId: number, projection:
     SELECT EXISTS (
       SELECT 1 FROM ${table}
       WHERE deleted_at IS NULL AND ${projectionValue(projection)} IS NULL
-        AND data #> ${textArray(projectionSegments(projection))}::text[] IS NOT NULL
+        AND data #> ${toTextArrayLiteral(projectionSegments(projection))}::text[] IS NOT NULL
     ) AS mixed`);
   return result.rows[0]?.mixed === true;
 }

@@ -1,4 +1,5 @@
 import { sql, type SQL } from "drizzle-orm";
+import { toTextArrayLiteral } from "./ddl";
 import { ident, MAX_INDEXED_TEXT_BYTES, type Projection } from "./registry";
 
 /**
@@ -18,8 +19,8 @@ import { ident, MAX_INDEXED_TEXT_BYTES, type Projection } from "./registry";
 export function projectionValue(p: Projection, alias?: "t"): SQL {
   if (p.kind !== "expression") return alias ? sql`${sql.raw(alias)}.${ident(p.column)}` : ident(p.column);
   const data = alias ? sql`${sql.raw(alias)}.data` : sql`data`;
-  const json = p.path ? sql`${data} #> ${textArray(p.path)}::text[]` : sql`${data} -> ${p.field}::text`;
-  const text = p.path ? sql`${data} #>> ${textArray(p.path)}::text[]` : sql`${data} ->> ${p.field}::text`;
+  const json = p.path ? sql`${data} #> ${toTextArrayLiteral(p.path)}::text[]` : sql`${data} -> ${p.field}::text`;
+  const text = p.path ? sql`${data} #>> ${toTextArrayLiteral(p.path)}::text[]` : sql`${data} ->> ${p.field}::text`;
   switch (p.type) {
     case "number":
       return sql`(CASE WHEN jsonb_typeof(${json}) = 'number' THEN hc_safe_float8(${json}) END)`;
@@ -30,9 +31,4 @@ export function projectionValue(p: Projection, alias?: "t"): SQL {
     default:
       return sql`(CASE WHEN jsonb_typeof(${json}) = 'string' AND octet_length(${text}) <= ${sql.raw(String(MAX_INDEXED_TEXT_BYTES))} THEN ${text} END)`;
   }
-}
-
-/** A string array as a Postgres array literal, for a bound text[] parameter. */
-export function textArray(values: string[]): string {
-  return `{${values.map((v) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(",")}}`;
 }
