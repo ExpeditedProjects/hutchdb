@@ -117,6 +117,10 @@ const baseCollection = {
   orgDefaultRole: 'viewer',
   layout: 'shared',
   storage: {},
+  migrationState: null,
+  migrationSwappedAt: null,
+  migrationReport: null,
+  migrationError: null,
   createdAt: new Date(),
   updatedAt: new Date(),
 }

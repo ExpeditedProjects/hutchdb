@@ -148,6 +148,12 @@ export const collections = pgTable("collections", {
   // there (projections, unwinds); see src/lib/storage/registry.ts.
   layout: text("layout").notNull().default("shared"),
   storage: jsonb("storage").notNull().default({}),
+  // shared -> table migration bookkeeping (src/lib/storage/migrate.ts).
+  // migrationState is NULL until the job first touches the collection.
+  migrationState: text("migration_state"),
+  migrationSwappedAt: timestamp("migration_swapped_at", { withTimezone: true }),
+  migrationReport: jsonb("migration_report"),
+  migrationError: text("migration_error"),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
