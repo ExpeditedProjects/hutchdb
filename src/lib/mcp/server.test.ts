@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
   registeredTools: new Map<string, (params: unknown) => Promise<unknown>>(),
@@ -385,6 +385,71 @@ describe('query, store and import descriptions', () => {
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: ['chamber', 'party'], aggregate: { n: 'count' }, sort: '-n', limit: 10 })
     expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }))
+  })
+})
+
+describe('descriptions follow HUTCH_STORAGE_LAYOUT', () => {
+  type Shape = Record<string, { description?: string }>
+  const shapeOf = (tool: string) => (registeredConfigs.get(tool)!.inputSchema as { shape: Shape }).shape
+  const descriptionOf = (tool: string) => registeredConfigs.get(tool)!.description as string
+  const snapshot = () => Object.fromEntries([...registeredConfigs.entries()].map(([name, c]) => [
+    name,
+    { description: c.description, inputs: Object.fromEntries(Object.entries((c.inputSchema as { shape?: Shape }).shape ?? {}).map(([k, v]) => [k, v.description])) },
+  ]))
+
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('serves the shared-layout surface when the flag is unset, "shared" or unrecognised', () => {
+    vi.stubEnv('HUTCH_STORAGE_LAYOUT', undefined as unknown as string)
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const unset = snapshot()
+    expect(Object.keys(shapeOf('hutch_query_records'))).not.toContain('record')
+    for (const value of ['shared', 'bogus', '']) {
+      registeredConfigs.clear()
+      vi.stubEnv('HUTCH_STORAGE_LAYOUT', value)
+      createMcpServer('user-1', 'org-test', 'https://example.test')
+      expect(snapshot()).toEqual(unset)
+    }
+  })
+
+  it('describes nested arrays, automatic indexing, indexed/plan and record with the table layout', () => {
+    vi.stubEnv('HUTCH_STORAGE_LAYOUT', 'table')
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/reaches into an array of objects/)
+    expect(query).toMatch(/nested up to two objects deep/)
+    expect(query).toMatch(/at most 16 per collection/)
+    expect(query).toMatch(/treated as a map/)
+    expect(query).toMatch(/`indexed`/)
+    expect(query).toMatch(/`plan`/)
+    expect(query).toMatch(/record: false/)
+    expect(query).toMatch(/include total/)
+    expect(query).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/projected into indexed columns/)
+    expect(descriptionOf('hutch_store_records')).toMatch(/made queryable automatically/)
+    expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
+    expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
+    const shape = shapeOf('hutch_query_records')
+    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'record', 'search', 'slug', 'sort', 'time_bucket'])
+    expect(shape.record.description).toMatch(/omits the embedded parent record/)
+    expect(shape.fields.description).toMatch(/embedded in nested aggregates/)
+    expect(shape.limit.description).toMatch(/max 1000/)
+  })
+
+  it('forwards record only with the table layout', async () => {
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    vi.stubEnv('HUTCH_STORAGE_LAYOUT', 'table')
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', record: false })
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ record: false }))
+
+    vi.stubEnv('HUTCH_STORAGE_LAYOUT', '')
+    registeredTools.clear()
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'status' })
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.not.objectContaining({ record: expect.anything() }))
   })
 })
 
