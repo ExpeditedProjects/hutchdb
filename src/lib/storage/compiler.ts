@@ -846,8 +846,16 @@ function childExprs(unwind: Unwind, key: string): FieldExprs | null {
  * add numbers and count booleans as 1/0 (so sum of a flag is how many are
  * true and avg the share that are).
  */
-function aggregateExpr(op: string, f: FieldExprs): SQL {
+function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
+  const present = sql`${f.jsonb} IS NOT NULL AND ${f.jsonb} <> 'null'::jsonb`;
   switch (op) {
+    case "count":
+      // {"count": "path"}: rows (or elements) in the group with a value at the path.
+      return sql`(count(*) FILTER (WHERE ${present}))::int`;
+    case "first":
+      // Any one value from the group, chosen deterministically: the first
+      // non-null value in row id order (then element order within a record).
+      return sql`(array_agg(${f.jsonb} ORDER BY ${firstOrder}) FILTER (WHERE ${present}))[1]`;
     case "min":
     case "max": {
       const fn = sql.raw(op);
@@ -864,16 +872,27 @@ function aggregateExpr(op: string, f: FieldExprs): SQL {
   }
 }
 
+export const AGGREGATE_SPEC_EXAMPLE = '{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}';
+
+/**
+ * An aggregate spec: alias -> "count" (rows in the group), or {op: field}.
+ * {"count": "path"} counts rows (or array elements) with a non-null value
+ * at the path; {"count": "*"} (or any non-path operand) is "count".
+ */
 function parseAggregate(aggregate: AggregateSpec | undefined): { alias: string; op: string; field: string | null }[] {
   if (!aggregate) return [];
   return Object.entries(aggregate).map(([alias, spec]) => {
-    if (spec === "count" || (isPlainObject(spec) && "count" in spec)) return { alias, op: "count", field: null };
-    const entry = isPlainObject(spec) ? Object.entries(spec)[0] : undefined;
-    if (!entry) {
+    if (spec === "count") return { alias, op: "count", field: null };
+    const entries = isPlainObject(spec) ? Object.entries(spec) : [];
+    if (entries.length !== 1) {
       const label = typeof spec === "string" ? spec : JSON.stringify(spec);
-      throw new Error(`Unsupported aggregation '${label}'. Supported: ${AGGREGATION_OPS}`);
+      throw new Error(`Unsupported aggregation '${label}' for '${alias}'. Each alias takes "count" or one {op: field} with op one of ${AGGREGATION_OPS}, e.g. ${AGGREGATE_SPEC_EXAMPLE}`);
     }
-    const [op, field] = entry;
+    const [op, field] = entries[0];
+    if (op === "count") {
+      return typeof field === "string" && field !== "*" && field !== "" ? (assertPathName(field), { alias, op, field }) : { alias, op, field: null };
+    }
+    if (typeof field !== "string") throw new Error(`Aggregation '${op}' for '${alias}' takes a field name, e.g. {"${op}": "score"}`);
     assertPathName(field);
     return { alias, op, field };
   });
@@ -1006,8 +1025,12 @@ function compileAggregate(
   // touches (group, aggregate and filter) is one of the unwind's columns;
   // otherwise unnest the array. Either way, conditions on the array apply
   // to each element aggregated, not just to the parent.
+  // count-with-path and first read the element's own value, which a child
+  // column does not hold when it has another type (the column is NULL), so
+  // they unnest the array.
+  const readsElementValue = aggs.some((a) => a.field && (a.op === "first" || a.op === "count") && parsePath(registry, ctx.arrayPaths, a.field).kind === "nested");
   const route: "child" | "lateral" | null = !path ? null
-    : unwind && !parsed.unrouted.has(path) && nested.every((r) => r.parsed.rest.length === 1 && unwind.fields.some((f) => f.field === r.parsed.rest[0])) ? "child"
+    : unwind && !parsed.unrouted.has(path) && !readsElementValue && nested.every((r) => r.parsed.rest.length === 1 && unwind.fields.some((f) => f.field === r.parsed.rest[0])) ? "child"
     : "lateral";
 
   const exprsFor = (field: string): FieldExprs => {
@@ -1061,13 +1084,14 @@ function compileAggregate(
   }
   if (aggs.length === 0) add(sql`count(*)::int AS count`, "count", false);
   const typeChecks: { alias: string; op: string; field: string; column: string }[] = [];
+  const firstOrder = route === "lateral" ? sql`t.id, e.ord` : route === "child" ? sql`t.id, c.idx` : sql`t.id`;
   for (const a of aggs) {
-    if (a.op === "count" || !a.field) {
+    if (!a.field) {
       add(sql`count(*)::int AS ${aliasIdent(a.alias)}`, a.alias, false);
       continue;
     }
     const exprs = exprsFor(a.field);
-    add(sql`${aggregateExpr(a.op, exprs)} AS ${aliasIdent(a.alias)}`, a.alias, false);
+    add(sql`${aggregateExpr(a.op, exprs, firstOrder)} AS ${aliasIdent(a.alias)}`, a.alias, false);
     if ((a.op === "sum" || a.op === "avg") && !exprs.typed) {
       const column = `__type_${typeChecks.length}`;
       select.push(sql`min(jsonb_typeof(${exprs.jsonb})) FILTER (WHERE jsonb_typeof(${exprs.jsonb}) IN ('string', 'array', 'object')) AS ${sql.raw(`"${column}"`)}`);

@@ -367,8 +367,8 @@ describe('compileQuery: group_by with several keys', () => {
     expect(mixed).toContain(`NULLIF(to_jsonb(c."p_label"), 'null'::jsonb) AS "votes.label"`)
   })
 
-  it('rejects more than three keys and keys on different arrays', () => {
-    expect(() => compile({ groupBy: ['a', 'b', 'c', 'd'] })).toThrow(/at most 3 keys/)
+  it('rejects more than five keys and keys on different arrays', () => {
+    expect(() => compile({ groupBy: ['a', 'b', 'c', 'd', 'e', 'f'] })).toThrow(/at most 5 keys/)
     expect(() => compileQuery(collection, { groupBy: ['votes.label', 'items.sku'] }, { arrayPaths: ['items'] })).toThrow(/one nested array/)
   })
 })
@@ -679,5 +679,39 @@ describe('compileQuery: $or / $and', () => {
     expect(() => compile({ filter: { $or: [] } })).toThrow(/non-empty array of filters/)
     expect(() => compile({ filter: { $or: { price: 1 } } })).toThrow(/non-empty array of filters/)
     expect(() => compile({ filter: { $and: [1] } })).toThrow(/non-empty array of filters/)
+  })
+})
+
+describe('compileQuery: count of a path, first, group_by keys', () => {
+  it('"count" counts rows; {"count": path} counts rows with a non-null value there; {"count": "*"} is count', () => {
+    const { sql } = compile({ groupBy: 'status', aggregate: { rows: 'count', star: { count: '*' }, priced: { count: 'price' } } })
+    expect(sql).toContain('count(*)::int AS "rows"')
+    expect(sql).toContain('count(*)::int AS "star"')
+    expect(sql).toContain(`(count(*) FILTER (WHERE t.data->$`)
+    expect(sql).toMatch(/IS NOT NULL AND t\.data->\$\d+::text <> 'null'::jsonb\)\)::int AS "priced"/)
+  })
+
+  it('{"count": path} and first on an unwound array read the element itself (lateral), not the child column', () => {
+    const counted = compile({ groupBy: 'status', aggregate: { n: { count: 'votes.points' } } }).sql
+    expect(counted).toContain('jsonb_array_elements(')
+    expect(counted).not.toContain('"hc_12__votes" c JOIN')
+    const summed = compile({ groupBy: 'status', aggregate: { n: { sum: 'votes.points' } } }).sql
+    expect(summed).toContain('"hc_12__votes" c JOIN')
+  })
+
+  it('first takes the first non-null value in row id (then element) order', () => {
+    expect(compile({ groupBy: 'status', aggregate: { p: { first: 'price' } } }).sql).toMatch(/\(array_agg\(t\.data->\$\d+::text ORDER BY t\.id\) FILTER \(WHERE .* <> 'null'::jsonb\)\)\[1\] AS "p"/)
+    expect(compile({ groupBy: 'votes.label', aggregate: { p: { first: 'votes.points' } } }).sql).toContain('ORDER BY t.id, e.ord)')
+  })
+
+  it('rejects specs with no op, several ops, or a non-string field', () => {
+    expect(() => compile({ aggregate: { x: { sum: 'price', max: 'price' } } })).toThrow(/one \{op: field\}.*e\.g\. \{"rows": "count"/)
+    expect(() => compile({ aggregate: { x: 'total' } })).toThrow(/Unsupported aggregation 'total' for 'x'/)
+    expect(() => compile({ aggregate: { x: { sum: 3 } } as never })).toThrow(/takes a field name/)
+  })
+
+  it('takes up to 5 group_by keys', () => {
+    expect(compile({ groupBy: ['a', 'b', 'c', 'd', 'e'] }).sql).toContain('GROUP BY 1, 2, 3, 4, 5')
+    expect(() => compile({ groupBy: ['a', 'b', 'c', 'd', 'e', 'f'] })).toThrow(/at most 5 keys/)
   })
 })

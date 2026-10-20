@@ -241,7 +241,7 @@ export type QueryParams = {
   limitCap?: number;
 };
 
-export const MAX_GROUP_BY_KEYS = 3;
+export const MAX_GROUP_BY_KEYS = 5;
 
 export const FILTER_OPERATORS = ["$gt", "$gte", "$lt", "$lte", "$ne", "$in", "$nin", "$exists", "$contains"] as const;
 
@@ -256,7 +256,7 @@ export function isOperatorSpec(value: unknown): value is Record<string, unknown>
   return keys.length > 0 && keys.every((k) => k.startsWith("$"));
 }
 
-export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg";
+export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg, first";
 
 export function normalizeGroupBy(groupBy: string | string[] | undefined): string[] {
   if (Array.isArray(groupBy)) {

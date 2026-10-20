@@ -127,8 +127,9 @@ describe('normalizeGroupBy', () => {
     expect(normalizeGroupBy(['a', 'b.c', 'd.e.f'])).toEqual(['a', 'b.c', 'd.e.f'])
   })
 
-  it('rejects more than 3 keys and invalid names', () => {
-    expect(() => normalizeGroupBy(['a', 'b', 'c', 'd'])).toThrow(/at most 3 keys/)
+  it('rejects more than 5 keys and invalid names', () => {
+    expect(normalizeGroupBy(['a', 'b', 'c', 'd', 'e'])).toHaveLength(5)
+    expect(() => normalizeGroupBy(['a', 'b', 'c', 'd', 'e', 'f'])).toThrow(/at most 5 keys/)
     expect(() => normalizeGroupBy(['a', "b'; --"])).toThrow(/Invalid field name/)
   })
 })

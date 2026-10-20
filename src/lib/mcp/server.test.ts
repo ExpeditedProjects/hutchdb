@@ -350,17 +350,29 @@ describe('query, store and import descriptions', () => {
     expect(description).toMatch(/dotted paths of any depth: "a\.b\.c" reaches into nested objects/)
     expect(description).toMatch(/aggregate aliases and group_by keys and limit applies after sorting/)
     expect(description).toMatch(/include total/)
-    expect(description).toMatch(/array of up to 3 keys/)
+    expect(description).toMatch(/array of up to 5 keys/)
     expect(description).toMatch(/unknown sort field, or one no record in the collection has, is an error/)
     expect(shapeOf('hutch_query_records').sort.description).toMatch(/dotted object path .*aggregate alias or group_by key/)
   })
 
-  it('accepts group_by as a string or up to 3 keys', () => {
+  it('accepts group_by as a string or up to 5 keys', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const groupBy = shapeOf('hutch_query_records').group_by
     expect(groupBy.safeParse('status').success).toBe(true)
-    expect(groupBy.safeParse(['a', 'b.c', 'd']).success).toBe(true)
-    expect(groupBy.safeParse(['a', 'b', 'c', 'd']).success).toBe(false)
+    expect(groupBy.safeParse(['a', 'b.c', 'd', 'e', 'f']).success).toBe(true)
+    expect(groupBy.safeParse(['a', 'b', 'c', 'd', 'e', 'f']).success).toBe(false)
+  })
+
+  it('gives the aggregate spec an explicit example, count of a path, first, and what an array filter does to aggregated elements', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const aggregate = shapeOf('hutch_query_records').aggregate.description!
+    expect(aggregate).toContain('{"rows": "count", "voters": {"count": "votes.bill_id"}, "points": {"sum": "votes.points.veterans"}, "name": {"first": "name"}}')
+    expect(aggregate).toMatch(/counts only those with a non-null value/)
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/also restricts which elements are aggregated/)
+    expect(query).toContain('{"filter": {"votes.category": "veterans"}, "group_by": "name"')
+    expect(query).toMatch(/"count" counts every row in the group/)
+    expect(shapeOf('hutch_query_records').group_by.description).toContain('{"first": "name"}')
   })
 
   it('states the 16 MB request body limit on store and import', () => {

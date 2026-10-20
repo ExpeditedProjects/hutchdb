@@ -403,4 +403,96 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       }
     });
   });
+
+  // ── 3/4. {"count": path}, first, five group_by keys ───────────────────────
+
+  describe("aggregates: count of a path, first, five keys", () => {
+    const legs = makeLegislators(150);
+    const KEYS = ["bioguide_id", "name", "party", "state", "chamber"] as const;
+
+    /** The veterans board computed in JS: elements kept by `keep`, nulls (no values) sorted last. */
+    function board(keep: (v: Vote) => boolean) {
+      return legs
+        .map((l) => {
+          const votes = l.votes.filter(keep);
+          const vet = votes.filter((v) => "veterans" in v.points);
+          return {
+            bioguide_id: l.bioguide_id, name: l.name, party: l.party, state: l.state, chamber: l.chamber,
+            points: vet.length > 0 ? vet.reduce((s, v) => s + v.points.veterans, 0) : null,
+            possible: vet.length > 0 ? vet.reduce((s, v) => s + v.possible.veterans, 0) : null,
+            votes_counted: vet.length,
+            rows: votes.length,
+            first_bill: votes[0]?.bill_id ?? null,
+          };
+        })
+        .filter((r) => r.rows > 0)
+        .sort((a, b) => (a.points === null ? 1 : 0) - (b.points === null ? 1 : 0) || (b.points ?? 0) - (a.points ?? 0) || (a.bioguide_id < b.bioguide_id ? -1 : 1));
+    }
+
+    const params = (filter?: Record<string, unknown>): QueryParams => ({
+      ...(filter ? { filter } : {}),
+      groupBy: [...KEYS],
+      aggregate: {
+        points: { sum: "votes.points.veterans" },
+        possible: { sum: "votes.possible.veterans" },
+        votes_counted: { count: "votes.points.veterans" },
+        rows: "count",
+        first_bill: { first: "votes.bill_id" },
+      },
+      sort: "-points,bioguide_id",
+      limit: 1000,
+    });
+
+    const normalize = (r: QueryResult) =>
+      r.results!.map((x) => ({ ...x, points: x.points === null ? null : Number(x.points), possible: x.possible === null ? null : Number(x.possible) }));
+
+    it("the dollarvote board with five group keys: a filter on the array restricts the elements; count of a path counts only elements that have it", async () => {
+      const { projected, plain } = await twin(legs as unknown as Record<string, unknown>[]);
+      const filtered = board((v) => "veterans" in v.points);
+      const unfiltered = board(() => true);
+      // Without the filter, rows counts every vote and votes_counted only the scored ones (the acceptance run's 330 vs 24).
+      expect(unfiltered.some((r) => r.rows > r.votes_counted)).toBe(true);
+      for (const slug of [projected, plain]) {
+        const a = await query(slug, params({ "votes.points.veterans": { $exists: true } }));
+        expect(a.total).toBe(filtered.length);
+        expect(normalize(a)).toEqual(filtered);
+        const b = await query(slug, params());
+        expect(b.total).toBe(unfiltered.length);
+        expect(normalize(b)).toEqual(unfiltered);
+      }
+    });
+
+    it("first carries a pass-through column deterministically: the earliest-stored record's value", async () => {
+      const { projected, plain } = await twin(legs as unknown as Record<string, unknown>[]);
+      const expected = ["D", "I", "R"].map((party) => ({ party, n: legs.filter((l) => l.party === party).length, name: legs.find((l) => l.party === party)!.name }));
+      for (const slug of [projected, plain]) {
+        const r = await query(slug, { groupBy: "party", aggregate: { n: "count", name: { first: "name" } }, sort: "party" });
+        expect(r.results).toEqual(expected);
+      }
+    });
+
+    it("count of a path through an unwound array matches the documents, projected or not", async () => {
+      const docs = makeQuestions(300);
+      const { projected, plain } = await twin(docs);
+      expect((await registry(projected)).unwinds.map((u) => u.path)).toContain("answers");
+      const expected = [...new Set(docs.map((d) => d.meta.site))].sort().map((site) => {
+        const answers = docs.filter((d) => d.meta.site === site).flatMap((d) => d.answers);
+        return { "meta.site": site, all: answers.length, owned: answers.filter((a) => a.owner).length, first_id: answers[0].answer_id };
+      });
+      for (const slug of [projected, plain]) {
+        const r = await query(slug, {
+          filter: { "answers.answer_id": { $exists: true } },
+          groupBy: "meta.site",
+          aggregate: { all: "count", owned: { count: "answers.owner" }, first_id: { first: "answers.answer_id" } },
+          sort: "meta.site",
+        });
+        expect(r.results).toEqual(expected);
+      }
+    });
+
+    it("six group_by keys is an error naming the limit", async () => {
+      const { projected } = await twin(legs.slice(0, 5) as unknown as Record<string, unknown>[]);
+      await expect(query(projected, { groupBy: [...KEYS, "votes.vote"] })).rejects.toThrow(/at most 5 keys/);
+    });
+  });
 });
