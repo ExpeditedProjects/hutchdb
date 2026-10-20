@@ -1,10 +1,10 @@
 import { sql, type SQL } from "drizzle-orm";
 import {
-  childTableName,
   collectionTableName,
   ident,
   identLiteral,
   indexName,
+  isChildTableNameFor,
   pgType,
   triggerName,
   type Projection,
@@ -91,7 +91,7 @@ export async function addProjection(ex: Executor, collectionId: number, projecti
 export async function addUnwind(ex: Executor, collectionId: number, unwind: Unwind): Promise<void> {
   const parent = collectionTableName(collectionId);
   const child = unwind.table;
-  if (child !== childTableName(collectionId, unwind.path)) {
+  if (!isChildTableNameFor(collectionId, unwind.path, child)) {
     throw new Error(`Unwind table '${child}' does not match path '${unwind.path}'`);
   }
 

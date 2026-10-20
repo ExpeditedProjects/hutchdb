@@ -3,80 +3,129 @@ import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { addProjection, addUnwind, toTextArrayLiteral, type Executor } from "./ddl";
-import { arrayCandidates, inferDecisions, thresholdsFromEnv, type PendingUnwind, type Thresholds } from "./inference";
+import { arrayCandidates, inferDecisions, pathsToCount, thresholdsFromEnv, type PendingUnwind, type Thresholds } from "./inference";
 import {
+  childTableName,
   collectionTableName,
   ident,
   projectionKey,
   projectionSegments,
   readRegistry,
   valueFitsType,
+  type FailedDdl,
   type Projection,
   type StorageRegistry,
   type Unwind,
 } from "./registry";
 
 /**
+ * How long a projection or unwind whose DDL failed is left alone before a
+ * write tries it again, so a failing ALTER (a lock it can't get, a value
+ * the cast rejects) doesn't run, and fail, on every write.
+ */
+export const DDL_RETRY_BACKOFF_MS = 60 * 60 * 1000;
+
+/** How long projection/unwind DDL waits for a lock on the collection table before failing. */
+const DDL_LOCK_TIMEOUT = "2s";
+
+export type ApplyOptions = {
+  /** Retry failed DDL now instead of after DDL_RETRY_BACKOFF_MS (the cutover's re-run). */
+  retryFailed?: boolean;
+};
+
+/**
  * Run inference for a batch that just landed in a collection
  * and apply each decision in its own transaction, updating the registry as
  * it goes. `docs` are the documents as stored (after a merge, the merged
  * documents). One failed decision never blocks the others or the
- * evaluated_rows count: an unwind that fails is recorded as pending with
- * the error, and retried by the next write. Failures here must never fail
- * the write that triggered them: callers wrap this in try/catch and log.
+ * evaluated_rows count: a failure is logged, recorded in `failed_ddl`
+ * (an unwind also gets a pending entry with a generic reason), and not
+ * retried for DDL_RETRY_BACKOFF_MS. Failures here must never fail the
+ * write that triggered them: callers wrap this in try/catch and log.
  */
 export async function applyInference(
   collection: { id: number; storage: unknown },
   docs: Record<string, unknown>[],
   thresholds: Thresholds = thresholdsFromEnv(),
+  options: ApplyOptions = {},
 ): Promise<StorageRegistry> {
   const table = ident(collectionTableName(collection.id));
+  const now = Date.now();
   let registry = await loadRegistry(collection.id);
 
   const [{ count }] = (await db.execute(sql`SELECT count(*)::int AS count FROM ${table} WHERE deleted_at IS NULL`)).rows as { count: number }[];
   const rowCount = count;
 
   // Element totals across the collection, only for paths this batch makes
-  // candidates — one SQL aggregate per path instead of scanning in JS.
+  // candidates — one SQL aggregate per path, a bounded number per batch.
+  const candidates = arrayCandidates(docs);
   const elementCounts: Record<string, number> = {};
-  for (const candidate of arrayCandidates(docs)) {
-    if (registry.unwinds.some((u) => u.path === candidate.path)) continue;
+  for (const path of pathsToCount(candidates, registry)) {
     const [{ total }] = (await db.execute(sql`
-      SELECT coalesce(sum(jsonb_array_length(data->${candidate.path}::text)), 0)::int AS total
+      SELECT coalesce(sum(jsonb_array_length(data->${path}::text)), 0)::int AS total
       FROM ${table}
-      WHERE deleted_at IS NULL AND jsonb_typeof(data->${candidate.path}::text) = 'array'`)).rows as { total: number }[];
-    elementCounts[candidate.path] = total;
+      WHERE deleted_at IS NULL AND jsonb_typeof(data->${path}::text) = 'array'`)).rows as { total: number }[];
+    elementCounts[path] = total;
   }
 
   const decisions = inferDecisions({ collectionId: collection.id, docs, registry, rowCount, elementCounts, thresholds });
   const pending: PendingUnwind[] = [...decisions.pending];
+  const backingOff = (kind: FailedDdl["kind"], key: string) => {
+    if (options.retryFailed) return undefined;
+    const failure = (registry.failed_ddl ?? []).find((f) => f.kind === kind && f.key === key);
+    const at = failure ? Date.parse(failure.at) : NaN;
+    return Number.isFinite(at) && now - at < DDL_RETRY_BACKOFF_MS ? failure : undefined;
+  };
 
   for (const unwind of decisions.unwinds) {
+    const failed = backingOff("unwind", unwind.path);
+    if (failed) {
+      pending.push({ path: unwind.path, reason: unwindFailedReason(unwind.path, failed.at) });
+      continue;
+    }
     try {
       registry = await applyUnwind(collection.id, unwind);
     } catch (err) {
       console.error(`[storage] unwind of '${unwind.path}' failed for collection ${collection.id}`, err);
-      pending.push({ path: unwind.path, reason: `unwinding '${unwind.path}' failed (${errorMessage(err)}); it is retried after the next write.` });
+      const at = new Date(now).toISOString();
+      registry = await recordFailure(collection.id, { kind: "unwind", key: unwind.path, at });
+      pending.push({ path: unwind.path, reason: unwindFailedReason(unwind.path, at) });
     }
   }
   for (const projection of decisions.projections) {
+    if (backingOff("projection", projectionKey(projection))) continue;
     try {
       registry = await applyProjection(collection.id, projection);
     } catch (err) {
       console.error(`[storage] projection of '${projection.field}' failed for collection ${collection.id}`, err);
+      registry = await recordFailure(collection.id, { kind: "projection", key: projectionKey(projection), at: new Date(now).toISOString() });
     }
   }
 
-  const evaluated = new Set([...arrayCandidates(docs).map((c) => c.path), ...pending.map((p) => p.path)]);
+  const evaluated = new Set([...candidates.map((c) => c.path), ...pending.map((p) => p.path)]);
   registry = await finishBatch(collection.id, docs.length, evaluated, pending);
   return registry;
 }
 
-function errorMessage(err: unknown): string {
-  const cause = (err as { cause?: unknown }).cause;
-  const e = cause instanceof Error ? cause : err;
-  const message = e instanceof Error ? e.message : String(e);
-  return message.split("\n")[0].slice(0, 200);
+/** The pending reason for a failed unwind: generic, never driver or SQL text (that goes to the log). */
+function unwindFailedReason(path: string, at: string): string {
+  const retry = new Date(Date.parse(at) + DDL_RETRY_BACKOFF_MS).toISOString();
+  return `unwinding '${path}' failed at ${at}; a write after ${retry} tries again.`;
+}
+
+/** Record (or refresh) a failed DDL attempt in the registry. */
+async function recordFailure(collectionId: number, failure: FailedDdl): Promise<StorageRegistry> {
+  return updateRegistry(collectionId, async (registry) => ({
+    ...registry,
+    failed_ddl: [...(registry.failed_ddl ?? []).filter((f) => !(f.kind === failure.kind && f.key === failure.key)), failure],
+  }));
+}
+
+/** The registry without a failed_ddl entry for (kind, key), after that DDL succeeded. */
+function clearFailure(registry: StorageRegistry, kind: FailedDdl["kind"], key: string): StorageRegistry {
+  const rest = (registry.failed_ddl ?? []).filter((f) => !(f.kind === kind && f.key === key));
+  const { failed_ddl: _old, ...without } = registry;
+  return rest.length > 0 ? { ...without, failed_ddl: rest } : without;
 }
 
 async function loadRegistry(collectionId: number): Promise<StorageRegistry> {
@@ -107,8 +156,10 @@ export async function updateRegistry(
 }
 
 async function applyProjection(collectionId: number, projection: Projection): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (registry, tx) => {
-    if (registry.projections.some((p) => projectionKey(p) === projectionKey(projection))) return null;
+  return updateRegistry(collectionId, async (current, tx) => {
+    if (current.projections.some((p) => projectionKey(p) === projectionKey(projection))) return null;
+    await tx.execute(sql`SET LOCAL lock_timeout = ${sql.raw(`'${DDL_LOCK_TIMEOUT}'`)}`);
+    const registry = clearFailure(current, "projection", projectionKey(projection));
     const column = registry.projections.some((p) => p.column === projection.column)
       ? `${projection.column}_${registry.projections.length}`
       : projection.column;
@@ -183,13 +234,18 @@ async function setMixed(collectionId: number, keys: Set<string>): Promise<void> 
 }
 
 async function applyUnwind(collectionId: number, unwind: Unwind): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (registry, tx) => {
-    if (registry.unwinds.some((u) => u.path === unwind.path)) return null;
+  return updateRegistry(collectionId, async (current, tx) => {
+    if (current.unwinds.some((u) => u.path === unwind.path)) return null;
+    await tx.execute(sql`SET LOCAL lock_timeout = ${sql.raw(`'${DDL_LOCK_TIMEOUT}'`)}`);
+    const registry = clearFailure(current, "unwind", unwind.path);
+    // Another writer may have unwound a path whose table name this one
+    // would collide with since inference picked it.
+    const entry: Unwind = { ...unwind, table: childTableName(collectionId, unwind.path, registry) };
     // The trigger and backfill read the unwind from collections.storage, so
     // the registry row is written before the DDL runs (same transaction).
-    const next = { ...registry, unwinds: [...registry.unwinds, unwind] };
+    const next = { ...registry, unwinds: [...registry.unwinds, entry] };
     await tx.update(collections).set({ storage: next }).where(eq(collections.id, collectionId));
-    await addUnwind(tx, collectionId, unwind);
+    await addUnwind(tx, collectionId, entry);
     return next;
   });
 }

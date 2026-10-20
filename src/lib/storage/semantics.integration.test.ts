@@ -511,10 +511,167 @@ describe.skipIf(!TEST_DB_URL)("query semantics against real Postgres", () => {
       await store("broken", docs);
       const reg = await registry(slug);
       expect(reg.unwinds).toEqual([]);
-      expect(reg.pending_unwinds).toEqual([{ path: "lines", reason: expect.stringMatching(/^unwinding 'lines' failed \(.+\); it is retried after the next write\.$/) }]);
+      expect(reg.pending_unwinds).toEqual([{ path: "lines", reason: expect.stringMatching(/^unwinding 'lines' failed at \S+; a write after \S+ tries again\.$/) }]);
+      expect(reg.failed_ddl).toEqual([{ kind: "unwind", key: "lines", at: expect.any(String) }]);
       expect(reg.evaluated_rows).toBe(121);
       expect(reg.projections.map((p) => p.field)).toContain("n");
       expect((await query(slug, { filter: { "lines.item_id": 5 } })).total).toBe(1);
+
+      // The reason describe returns is generic: the driver's text went to the log.
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { not_unwound: { path: string; reason: string }[] } };
+      expect(described.storage.not_unwound).toEqual(reg.pending_unwinds);
+      expect(JSON.stringify(described.storage.not_unwound)).not.toMatch(/relation|exists|constraint|column|ERROR|hc_\d+__lines/i);
+
+      // Within the backoff the next write does not try again, even though it would succeed now.
+      await testDb.execute(sql`DROP TABLE ${sql.identifier(`hc_${id}__lines`)}`);
+      await store("broken", [{ n: 500, lines: [{ item_id: 500 }] }]);
+      const waiting = await registry(slug);
+      expect(waiting.unwinds).toEqual([]);
+      expect(waiting.pending_unwinds).toEqual(reg.pending_unwinds);
+      expect(waiting.failed_ddl).toEqual(reg.failed_ddl);
+
+      // Once it has passed, a write retries, and success clears the failure.
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{failed_ddl,0,at}', to_jsonb((now() - interval '2 hours')::text)) WHERE id = ${id}`);
+      await store("broken", [{ n: 501, lines: [{ item_id: 501 }] }]);
+      const retried = await registry(slug);
+      expect(retried.unwinds.map((u) => u.path)).toEqual(["lines"]);
+      expect(retried.failed_ddl).toBeUndefined();
+      expect(retried.pending_unwinds).toBeUndefined();
+      expect((await query(slug, { filter: { "lines.item_id": 5 } })).total).toBe(1);
+    });
+
+    it("a projection whose ALTER can't get its lock fails within the lock timeout and is not retried by every write", async () => {
+      const slug = await store("locked", [{ seed: 1 }]);
+      const id = (await collectionRow(slug)).id;
+      const blocker = await testPool.connect();
+      let elapsed = 0;
+      try {
+        // A reader holding ACCESS SHARE blocks ALTER TABLE (ACCESS EXCLUSIVE), not inserts.
+        await blocker.query("BEGIN");
+        await blocker.query(`SELECT 1 FROM hc_${id} LIMIT 1`);
+        const started = performance.now();
+        await store("locked", Array.from({ length: 120 }, (_, i) => ({ n: i })));
+        elapsed = performance.now() - started;
+      } finally {
+        await blocker.query("ROLLBACK");
+        blocker.release();
+      }
+      // lock_timeout (2s), not the 5s statement timeout, ended the wait.
+      expect(elapsed).toBeLessThan(4500);
+      const failed = await registry(slug);
+      expect(failed.projections.map((p) => p.field)).not.toContain("n");
+      expect(failed.failed_ddl).toEqual([{ kind: "projection", key: JSON.stringify(["n"]), at: expect.any(String) }]);
+
+      // Nothing blocks it now, but the backoff holds.
+      await store("locked", [{ n: 1000 }]);
+      expect((await registry(slug)).projections.map((p) => p.field)).not.toContain("n");
+
+      await testDb.execute(sql`UPDATE collections SET storage = jsonb_set(storage, '{failed_ddl,0,at}', to_jsonb((now() - interval '2 hours')::text)) WHERE id = ${id}`);
+      await store("locked", [{ n: 1001 }]);
+      const done = await registry(slug);
+      expect(done.projections.map((p) => p.field)).toContain("n");
+      expect(done.failed_ddl).toBeUndefined();
+    }, 20_000);
+
+    it("unwinds two arrays whose names differ only in case into separate child tables", async () => {
+      const docs = Array.from({ length: 120 }, (_, i) => ({ key: i, Items: [{ k: i % 7 }], items: [{ k: i % 5 }, { k: 9 }] }));
+      const { projected, plain } = await twin(docs);
+      const reg = await registry(projected);
+      expect(reg.unwinds.map((u) => u.path).sort()).toEqual(["Items", "items"]);
+      expect(new Set(reg.unwinds.map((u) => u.table)).size).toBe(2);
+      for (const u of reg.unwinds) {
+        const [{ n }] = (await testDb.execute(sql`SELECT count(*)::int AS n FROM ${sql.identifier(u.table)}`)).rows as { n: number }[];
+        expect(n).toBe(docs.reduce((t, d) => t + (d[u.path as "Items" | "items"]).length, 0));
+      }
+      for (const params of [
+        { filter: { "Items.k": 3 }, sort: "key", limit: 1000 },
+        { filter: { "items.k": 3 }, sort: "key", limit: 1000 },
+        { groupBy: "Items.k", aggregate: { n: "count" }, limit: 100 },
+        { groupBy: "items.k", aggregate: { n: "count" }, limit: 100 },
+      ] as QueryParams[]) {
+        const [a, b] = await Promise.all([query(projected, params), query(plain, params)]);
+        if (a.records) expect(a.records.map((r) => r.data)).toEqual(b.records!.map((r) => r.data));
+        else expect(a.results).toEqual(b.results);
+        expect((a.records ?? a.results)!.length).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  describe("projections and unwinds stay in step with writes that rewrite documents", () => {
+    it("a transform that writes another type under a projected nested path marks it mixed, and sorts match the documents", async () => {
+      const docs = Array.from({ length: 200 }, (_, i) => ({ k: i, m: { v: i } }));
+      const { projected, plain } = await twin(docs);
+      expect((await registry(projected)).projections.find((p) => p.field === "m.v")).toMatchObject({ type: "number" });
+      expect((await registry(projected)).projections.find((p) => p.field === "m.v")?.mixed).toBeUndefined();
+      for (const slug of [projected, plain]) {
+        const t = ok(await recordsSvc.transformRecords(slug, USER_ID, { set_field: { field: "m", value: { v: "late" }, filter: { k: { $lt: 30 } } } }));
+        expect(t.updated).toBe(30);
+      }
+      expect((await registry(projected)).projections.find((p) => p.field === "m.v")).toMatchObject({ mixed: true });
+      const keys = (r: QueryResult) => r.records!.map((x) => (x.data as { k: number }).k);
+      for (const sort of ["-m.v", "m.v"]) {
+        const [a, b] = await Promise.all([query(projected, { sort, limit: 1000 }), query(plain, { sort, limit: 1000 })]);
+        expect(keys(a)).toEqual(keys(b));
+        expect(keys(a)).toHaveLength(200);
+      }
+    });
+
+    it("keeps unwound child rows in sync through upserts, transforms and imports", async () => {
+      const line = (i: number, j: number) => ({ sku: `s${(i + j) % 6}`, qty: (i * j) % 4 });
+      const docs = Array.from({ length: 120 }, (_, i) => ({ key: i, name: `o${i}`, lines: Array.from({ length: 1 + (i % 3) }, (_, j) => line(i, j)) }));
+      const { projected, plain } = await twin(docs);
+      const reg = await registry(projected);
+      expect(reg.unwinds.map((u) => u.path)).toEqual(["lines"]);
+      const childTable = reg.unwinds[0].table;
+      const projectedId = (await collectionRow(projected)).id;
+      for (const slug of [projected, plain]) ok(await collectionsSvc.updateCollection(slug, USER_ID, { unique_key: ["key"] }));
+
+      const check = async (step: string) => {
+        const [{ n: child }] = (await testDb.execute(sql`SELECT count(*)::int AS n FROM ${sql.identifier(childTable)}`)).rows as { n: number }[];
+        const [{ n: live }] = (await testDb.execute(sql`
+          SELECT coalesce(sum(jsonb_array_length(data->'lines')), 0)::int AS n FROM ${sql.identifier(`hc_${projectedId}`)}
+          WHERE deleted_at IS NULL AND jsonb_typeof(data->'lines') = 'array'`)).rows as { n: number }[];
+        expect(child, `${step}: child rows`).toBe(live);
+        for (const params of [
+          { filter: { "lines.sku": "s2" }, sort: "key", limit: 1000 },
+          { filter: { "lines.qty": { $gt: 1 } }, sort: "key", limit: 1000 },
+          { groupBy: "lines.sku", aggregate: { n: "count", q: { sum: "lines.qty" } }, limit: 100 },
+        ] as QueryParams[]) {
+          const [a, b] = await Promise.all([query(projected, params), query(plain, params)]);
+          if (a.records) expect(a.records.map((r) => r.data), `${step}: ${JSON.stringify(params)}`).toEqual(b.records!.map((r) => r.data));
+          else expect(a.results, `${step}: ${JSON.stringify(params)}`).toEqual(b.results);
+        }
+      };
+      await check("initial");
+
+      // Replace upsert: a larger document replaces the old one wholesale.
+      const replaced = Array.from({ length: 20 }, (_, i) => ({ key: i, name: `r${i}`, lines: Array.from({ length: 4 }, (_, j) => line(i + 50, j)) }));
+      for (const slug of [projected, plain]) await store(slug, replaced);
+      await check("replace upsert");
+
+      // Merge upsert, one key twice in the same batch (the later one wins).
+      const merged = [
+        { key: 30, lines: [line(1, 1)] },
+        { key: 31, extra: true },
+        { key: 30, lines: [line(2, 2), line(3, 3), line(4, 4)] },
+      ];
+      for (const slug of [projected, plain]) await store(slug, merged, "merge");
+      await check("merge upsert");
+
+      // Transforms: new elements written over the array, then the array renamed away on all.
+      for (const slug of [projected, plain]) ok(await recordsSvc.transformRecords(slug, USER_ID, { set_field: { field: "lines", value: [line(9, 9), line(8, 8)], filter: { key: { $lt: 10 } } } }));
+      await check("transform set_field on the array");
+      for (const slug of [projected, plain]) ok(await recordsSvc.transformRecords(slug, USER_ID, { rename_fields: { lines: "old_lines" } }));
+      await check("transform rename of the array");
+      for (const slug of [projected, plain]) ok(await recordsSvc.transformRecords(slug, USER_ID, { rename_fields: { old_lines: "lines" } }));
+      await check("transform rename back");
+      for (const slug of [projected, plain]) ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["lines"] }));
+      await check("transform removing the array");
+
+      // Import (JSON), upserting on the key.
+      const imported = Array.from({ length: 15 }, (_, i) => ({ key: i * 3, name: `i${i}`, lines: Array.from({ length: 1 + (i % 4) }, (_, j) => line(i, j)) }));
+      for (const slug of [projected, plain]) ok(await recordsSvc.importRecords(USER_ID, ORG_ID, { collection: slug, format: "json", content: JSON.stringify(imported) }));
+      await check("import");
     });
   });
 

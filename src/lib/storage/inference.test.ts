@@ -8,6 +8,9 @@ import {
   thresholdsFromEnv,
   MAX_PROJECTED_TEXT,
   MAX_PROJECTIONS,
+  MAX_UNWINDS,
+  MAX_ARRAY_COUNTS_PER_BATCH,
+  pathsToCount,
   type InferenceInput,
 } from './inference'
 import {
@@ -128,8 +131,18 @@ describe('declareFields', () => {
   })
 
   it('declares strict YYYY-MM-DD strings as date, anything else as text', () => {
-    expect(declareFields(docs(10, (i) => ({ d: `2026-01-0${i}` })))[0].type).toBe('date')
-    expect(declareFields(docs(10, (i) => ({ d: `2026-01-0${i}T10:00:00Z` })))[0].type).toBe('text')
+    expect(declareFields(docs(10, (i) => ({ d: `2026-01-${String(i + 1).padStart(2, "0")}` })))[0].type).toBe('date')
+    expect(declareFields(docs(10, (i) => ({ d: `2026-01-${String(i + 1).padStart(2, "0")}T10:00:00Z` })))[0].type).toBe('text')
+  })
+
+  it('declares a date only when every text value is a real calendar date', () => {
+    // "2024-02-30" is YYYY-MM-DD but no date: the date column would hold
+    // NULL for it and the new projection would start out mixed.
+    const batch = docs(100, (i) => ({ d: i === 7 ? '2024-02-30' : `2024-01-${String((i % 28) + 1).padStart(2, '0')}`, nested: { d: i === 7 ? '2024-02-30' : '2024-01-01' } }))
+    expect(declareFields(batch).find((f) => f.field === 'd')?.type).toBe('text')
+    expect(declareNestedFields(batch).find((f) => f.field === 'nested.d')?.type).toBe('text')
+    const valid = docs(100, (i) => ({ d: `2024-02-${String((i % 29) + 1).padStart(2, '0')}` }))
+    expect(declareFields(valid)[0].type).toBe('date')
   })
 })
 
@@ -372,5 +385,53 @@ describe('long text and pending unwinds', () => {
     const registry: StorageRegistry = { ...EMPTY_REGISTRY, unwinds: [{ path: 'votes', table: 'hc_1__votes', fields: [], reason: 'r' }] }
     const batch = docs(20, (i) => ({ votes: [{ k: i }] }))
     expect(inferDecisions(input({ docs: batch, registry, rowCount: 20, elementCounts: { votes: 40 } })).pending).toEqual([])
+  })
+})
+
+describe('unwind caps', () => {
+  const unwound = (n: number) => Array.from({ length: n }, (_, k) => ({ path: `u${k}`, table: `hc_7__u${k}`, fields: [], reason: '' }))
+
+  it(`creates at most MAX_UNWINDS (${MAX_UNWINDS}) unwinds per collection`, () => {
+    const registry: StorageRegistry = { ...EMPTY_REGISTRY, unwinds: unwound(MAX_UNWINDS - 1) }
+    const batch = docs(10, () => ({ a: [{ k: 1 }], b: [{ k: 2 }] }))
+    const d = inferDecisions(input({ docs: batch, registry, rowCount: 10, elementCounts: { a: 500, b: 500 } }))
+    expect(d.unwinds.map((u) => u.path)).toEqual(['a'])
+    expect(d.pending).toEqual([{ path: 'b', reason: `the collection already has ${MAX_UNWINDS} unwound arrays, the most it gets.` }])
+  })
+
+  it('counts elements for a bounded number of candidates per batch, none at the cap', () => {
+    const keys = Array.from({ length: 10 }, (_, k) => `arr${k}`)
+    const batch = docs(10, () => Object.fromEntries(keys.map((k) => [k, [{ k: 1 }]])))
+    const candidates = arrayCandidates(batch)
+    expect(candidates).toHaveLength(10)
+    const paths = pathsToCount(candidates, EMPTY_REGISTRY)
+    expect(paths).toHaveLength(MAX_ARRAY_COUNTS_PER_BATCH)
+    expect(pathsToCount(candidates, { ...EMPTY_REGISTRY, unwinds: unwound(MAX_UNWINDS) })).toEqual([])
+    // Already-unwound paths are never counted again.
+    expect(pathsToCount(candidates, { ...EMPTY_REGISTRY, unwinds: [{ path: 'arr0', table: 'hc_7__arr0', fields: [], reason: '' }] })).not.toContain('arr0')
+
+    // Candidates that were not counted get a pending entry, not an unwind.
+    const counts = Object.fromEntries(paths.map((p) => [p, 0]))
+    const d = inferDecisions(input({ docs: batch, rowCount: 10, elementCounts: counts }))
+    const notCounted = d.pending.filter((p) => p.reason.includes('was not counted'))
+    expect(notCounted.map((p) => p.path).sort()).toEqual(keys.filter((k) => !paths.includes(k)).sort())
+  })
+})
+
+describe('child table names', () => {
+  it('gives paths that sanitize alike different tables', () => {
+    const batch = docs(10, () => ({ Items: [{ k: 1 }], items: [{ k: 2 }] }))
+    const d = inferDecisions(input({ docs: batch, rowCount: 10, elementCounts: { Items: 500, items: 500 } }))
+    const tables = d.unwinds.map((u) => u.table)
+    expect(tables).toHaveLength(2)
+    expect(new Set(tables).size).toBe(2)
+    expect(tables).toEqual(expect.arrayContaining(['hc_7__items', 'hc_7__items_2']))
+  })
+
+  it('avoids a name an existing unwind of another path already uses', () => {
+    const registry: StorageRegistry = { ...EMPTY_REGISTRY, unwinds: [{ path: 'Items', table: 'hc_7__items', fields: [], reason: '' }] }
+    expect(childTableName(7, 'items', registry)).toBe('hc_7__items_2')
+    expect(childTableName(7, 'Items', registry)).toBe('hc_7__items')
+    expect(childTableName(7, 'items')).toBe('hc_7__items')
   })
 })

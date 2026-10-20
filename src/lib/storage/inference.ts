@@ -4,6 +4,7 @@ import {
   findPathProjection,
   findProjection,
   findUnwind,
+  isStrictDate,
   uniqueColumnName,
   type Projection,
   type ProjectionType,
@@ -36,9 +37,16 @@ import {
  *   The element count is the collection's running total (counted in SQL
  *   after each batch), so an array that crosses the threshold over several
  *   batches is unwound by the batch that crosses it. Creating an unwind
- *   also projects the parent's declared fields. An array that is not
+ *   also projects the parent's declared fields. At most MAX_UNWINDS per
+ *   collection, and one batch counts elements for at most
+ *   MAX_ARRAY_COUNTS_PER_BATCH new candidates. An array that is not
  *   unwound gets a pending entry saying why (below the threshold, too few
- *   documents hold it, mixed element shapes, no declarable element key).
+ *   documents hold it, mixed element shapes, no declarable element key, the
+ *   cap, not counted yet).
+ * - date: a text field is declared a date only when every one of its text
+ *   values in the batch is a real calendar date (isStrictDate, what the
+ *   date column accepts), so a new date column is never mixed by the batch
+ *   that declared it.
  * - long text (any value over MAX_PROJECTED_TEXT characters in the batch)
  *   is prose, not a key: it is never declared, so it gets no column and no
  *   btree (whose entries are limited to about 2.7 KB).
@@ -47,6 +55,13 @@ import {
 export const PRESENCE_RATIO = 0.9;
 export const TYPE_RATIO = 0.95;
 export const MAX_PROJECTIONS = 16;
+/** Most unwound arrays (child tables) per collection. */
+export const MAX_UNWINDS = 16;
+/**
+ * Most array candidates one batch counts elements for (one full-table
+ * aggregate each, in apply.ts); the rest are counted by a later write.
+ */
+export const MAX_ARRAY_COUNTS_PER_BATCH = 4;
 export const DEFAULT_PROJECT_THRESHOLD = 10_000;
 export const DEFAULT_UNWIND_THRESHOLD = 10_000;
 
@@ -95,8 +110,6 @@ export type Decisions = {
   pending: PendingUnwind[];
 };
 
-const STRICT_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
-
 function scalarType(value: unknown): ProjectionType | null {
   switch (typeof value) {
     case "number": return Number.isFinite(value) ? "number" : null;
@@ -106,28 +119,53 @@ function scalarType(value: unknown): ProjectionType | null {
   }
 }
 
+/** Presence and JSON types of one field across a batch. */
+type FieldTally = { present: number; types: Map<string, number>; dates: number; longText: boolean };
+
+function tallyValue(stats: Map<string, FieldTally>, id: string, value: unknown): FieldTally {
+  let stat = stats.get(id);
+  if (!stat) {
+    stat = { present: 0, types: new Map(), dates: 0, longText: false };
+    stats.set(id, stat);
+  }
+  stat.present++;
+  const type = scalarType(value) ?? (Array.isArray(value) ? "array" : "object");
+  stat.types.set(type, (stat.types.get(type) ?? 0) + 1);
+  if (type === "text" && isStrictDate(value)) stat.dates++;
+  if (type === "text" && (value as string).length > MAX_PROJECTED_TEXT) stat.longText = true;
+  return stat;
+}
+
+/**
+ * The type a field is declared as: the scalar type of >= TYPE_RATIO of its
+ * values, never long text, and date when every text value is a calendar
+ * date. Null when it is not declared.
+ */
+function dominantType(stat: FieldTally): ProjectionType | null {
+  let dominant: ProjectionType | null = null;
+  for (const [type, count] of stat.types) {
+    if (count / stat.present >= TYPE_RATIO && (type === "number" || type === "text" || type === "boolean")) {
+      dominant = type;
+    }
+  }
+  if (!dominant || (dominant === "text" && stat.longText)) return null;
+  if (dominant === "text" && stat.dates === stat.types.get("text")) return "date";
+  return dominant;
+}
+
 /**
  * Declared fields of a set of objects, in descending presence order. Keys
  * containing NUL can't be stored by Postgres and are never declared.
  */
 export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] {
   if (docs.length === 0) return [];
-  const stats = new Map<string, { present: number; types: Map<string, number>; dates: number; longText: boolean }>();
+  const stats = new Map<string, FieldTally>();
 
   for (const doc of docs) {
     if (!isPlainObject(doc)) continue;
     for (const [key, value] of Object.entries(doc)) {
       if (value === null || value === undefined || key.includes("\0")) continue;
-      let stat = stats.get(key);
-      if (!stat) {
-        stat = { present: 0, types: new Map(), dates: 0, longText: false };
-        stats.set(key, stat);
-      }
-      stat.present++;
-      const type = scalarType(value) ?? (Array.isArray(value) ? "array" : "object");
-      stat.types.set(type, (stat.types.get(type) ?? 0) + 1);
-      if (type === "text" && STRICT_DATE_RE.test(value as string)) stat.dates++;
-      if (type === "text" && (value as string).length > MAX_PROJECTED_TEXT) stat.longText = true;
+      tallyValue(stats, key, value);
     }
   }
 
@@ -135,21 +173,12 @@ export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] 
   for (const [field, stat] of stats) {
     const presence = stat.present / docs.length;
     if (presence < PRESENCE_RATIO) continue;
-    let dominant: ProjectionType | null = null;
-    for (const [type, count] of stat.types) {
-      if (count / stat.present >= TYPE_RATIO && (type === "number" || type === "text" || type === "boolean")) {
-        dominant = type;
-      }
-    }
-    if (!dominant || (dominant === "text" && stat.longText)) continue;
-    if (dominant === "text" && stat.dates / (stat.types.get("text") ?? 1) >= TYPE_RATIO) dominant = "date";
-    declared.push({ field, type: dominant, presence });
+    const type = dominantType(stat);
+    if (type) declared.push({ field, type, presence });
   }
   declared.sort((a, b) => b.presence - a.presence || a.field.localeCompare(b.field));
   return declared;
 }
-
-type PathStat = { path: string[]; present: number; types: Map<string, number>; dates: number; longText: boolean };
 
 /**
  * Declared nested object scalars of a batch: paths of 2..MAX_PATH_DEPTH
@@ -160,7 +189,8 @@ type PathStat = { path: string[]; present: number; types: Map<string, number>; d
  */
 export function declareNestedFields(docs: Record<string, unknown>[]): DeclaredField[] {
   if (docs.length === 0) return [];
-  const stats = new Map<string, PathStat>();
+  const stats = new Map<string, FieldTally>();
+  const paths = new Map<string, string[]>();
   // Distinct keys seen under each object path, to recognise maps.
   const keysUnder = new Map<string, Set<string>>();
 
@@ -180,16 +210,8 @@ export function declareNestedFields(docs: Record<string, unknown>[]): DeclaredFi
         continue;
       }
       const id = path.join(".");
-      let stat = stats.get(id);
-      if (!stat) {
-        stat = { path, present: 0, types: new Map(), dates: 0, longText: false };
-        stats.set(id, stat);
-      }
-      stat.present++;
-      const type = scalarType(value) ?? (Array.isArray(value) ? "array" : "object");
-      stat.types.set(type, (stat.types.get(type) ?? 0) + 1);
-      if (type === "text" && STRICT_DATE_RE.test(value as string)) stat.dates++;
-      if (type === "text" && (value as string).length > MAX_PROJECTED_TEXT) stat.longText = true;
+      if (!paths.has(id)) paths.set(id, path);
+      tallyValue(stats, id, value);
     }
   };
 
@@ -209,17 +231,11 @@ export function declareNestedFields(docs: Record<string, unknown>[]): DeclaredFi
 
   const declared: DeclaredField[] = [];
   for (const [field, stat] of stats) {
+    const path = paths.get(field)!;
     const presence = stat.present / docs.length;
-    if (presence < PRESENCE_RATIO || underMap(stat.path)) continue;
-    let dominant: ProjectionType | null = null;
-    for (const [type, count] of stat.types) {
-      if (count / stat.present >= TYPE_RATIO && (type === "number" || type === "text" || type === "boolean")) {
-        dominant = type;
-      }
-    }
-    if (!dominant || (dominant === "text" && stat.longText)) continue;
-    if (dominant === "text" && stat.dates / (stat.types.get("text") ?? 1) >= TYPE_RATIO) dominant = "date";
-    declared.push({ field, path: stat.path, type: dominant, presence });
+    if (presence < PRESENCE_RATIO || underMap(path)) continue;
+    const type = dominantType(stat);
+    if (type) declared.push({ field, path, type, presence });
   }
   declared.sort((a, b) => b.presence - a.presence || a.path!.length - b.path!.length || a.field.localeCompare(b.field));
   return declared;
@@ -288,13 +304,30 @@ export function surveyArrays(docs: Record<string, unknown>[]): { candidates: Arr
   return { candidates, rejected };
 }
 
+/**
+ * The candidate paths of a batch whose collection-wide element totals
+ * apply.ts counts (one full-table aggregate each): not unwound yet, at
+ * most MAX_ARRAY_COUNTS_PER_BATCH, none once the collection has
+ * MAX_UNWINDS unwinds. inferDecisions gives the others a pending entry.
+ */
+export function pathsToCount(candidates: ArrayCandidate[], registry: StorageRegistry): string[] {
+  if (registry.unwinds.length >= MAX_UNWINDS) return [];
+  return candidates
+    .filter((c) => !findUnwind(registry, c.path))
+    .slice(0, MAX_ARRAY_COUNTS_PER_BATCH)
+    .map((c) => c.path);
+}
+
 export type InferenceInput = {
   collectionId: number;
   docs: Record<string, unknown>[];
   registry: StorageRegistry;
   /** Live rows in the collection after this batch landed. */
   rowCount: number;
-  /** Total elements under each candidate path across the whole collection. */
+  /**
+   * Total elements under each candidate path across the whole collection;
+   * a candidate without an entry was not counted (pathsToCount).
+   */
   elementCounts: Record<string, number>;
   thresholds: Thresholds;
 };
@@ -314,7 +347,15 @@ export function inferDecisions(input: InferenceInput): Decisions {
   const unwinds: Unwind[] = [];
   for (const candidate of survey.candidates) {
     if (findUnwind(registry, candidate.path)) continue;
-    const total = elementCounts[candidate.path] ?? 0;
+    if (registry.unwinds.length + unwinds.length >= MAX_UNWINDS) {
+      pending.push({ path: candidate.path, reason: `the collection already has ${MAX_UNWINDS} unwound arrays, the most it gets.` });
+      continue;
+    }
+    if (!Object.hasOwn(elementCounts, candidate.path)) {
+      pending.push({ path: candidate.path, reason: `'${candidate.path}' was not counted after the last batch (at most ${MAX_ARRAY_COUNTS_PER_BATCH} arrays are counted per write); a later write counts it.` });
+      continue;
+    }
+    const total = elementCounts[candidate.path];
     if (total < thresholds.unwind) {
       pending.push({ path: candidate.path, reason: `'${candidate.path}' holds ${total} elements across the collection; it is unwound at ${thresholds.unwind}.` });
       continue;
@@ -327,7 +368,7 @@ export function inferDecisions(input: InferenceInput): Decisions {
     });
     unwinds.push({
       path: candidate.path,
-      table: childTableName(collectionId, candidate.path),
+      table: childTableName(collectionId, candidate.path, { unwinds: [...registry.unwinds, ...unwinds] }),
       fields,
       reason: `'${candidate.path}' is an array of objects in ${pct(candidate.presence)} of documents and holds ${total} elements across the collection (threshold ${thresholds.unwind}).`,
     });

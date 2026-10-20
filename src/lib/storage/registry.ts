@@ -57,11 +57,19 @@ export type StorageRegistry = {
   /** Arrays of objects that are not unwound yet, each with the latest reason (below threshold, mixed shapes, a failed attempt, ...). */
   pending_unwinds?: { path: string; reason: string }[];
   /**
+   * Projection/unwind DDL that failed, by projectionKey (projections) or
+   * path (unwinds), with when; not retried until DDL_RETRY_BACKOFF_MS has
+   * passed (apply.ts). The failure detail goes to the server log only.
+   */
+  failed_ddl?: FailedDdl[];
+  /**
    * Set by `npm run storage:cutover` once the collection's rows were copied
    * from the old `records` table and verified; a re-run skips it.
    */
   cutover?: CutoverMark;
 };
+
+export type FailedDdl = { kind: "projection" | "unwind"; key: string; at: string };
 
 export type CutoverMark = {
   at: string;
@@ -69,6 +77,13 @@ export type CutoverMark = {
   rows: number;
   /** Sorted md5 over the copied documents. */
   data_md5: string;
+  /**
+   * id-ordered md5 over each copied row's id, data, status and deleted_at
+   * (cutover.ts contentFingerprint); --drop-records recomputes it over
+   * `records` and refuses on a mismatch. Absent on marks written before it
+   * existed.
+   */
+  row_md5?: string;
   /** When inference ran over the copied rows. */
   inferred_at?: string;
 };
@@ -84,6 +99,7 @@ export function readRegistry(raw: unknown): StorageRegistry {
     evaluated_rows: typeof r.evaluated_rows === "number" ? r.evaluated_rows : 0,
     ...(Array.isArray(r.unique_key) ? { unique_key: r.unique_key } : {}),
     ...(Array.isArray(r.pending_unwinds) ? { pending_unwinds: r.pending_unwinds } : {}),
+    ...(Array.isArray(r.failed_ddl) ? { failed_ddl: r.failed_ddl } : {}),
     ...(r.cutover && typeof r.cutover === "object" ? { cutover: r.cutover } : {}),
   };
 }
@@ -138,8 +154,24 @@ export function collectionTableName(collectionId: number): string {
   return `hc_${collectionId}`;
 }
 
-export function childTableName(collectionId: number, path: string): string {
-  return `${collectionTableName(collectionId)}__${sanitizeIdentifier(path)}`;
+/**
+ * Child table name for an unwound path: hc_<id>__<sanitized path>, or, when
+ * another unwind in `registry` already uses that name (paths "Items" and
+ * "items" sanitize alike), the first free hc_<id>__<sanitized path>_<n>.
+ */
+export function childTableName(collectionId: number, path: string, registry?: Pick<StorageRegistry, "unwinds">): string {
+  const base = `${collectionTableName(collectionId)}__${sanitizeIdentifier(path)}`;
+  const taken = new Set((registry?.unwinds ?? []).filter((u) => u.path !== path).map((u) => u.table));
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${base}_${n}`)) n++;
+  return `${base}_${n}`;
+}
+
+/** Whether `table` is a name childTableName could give `path` (with or without a suffix). */
+export function isChildTableNameFor(collectionId: number, path: string, table: string): boolean {
+  const base = childTableName(collectionId, path);
+  return table === base || (table.startsWith(`${base}_`) && /^[1-9][0-9]*$/.test(table.slice(base.length + 1)));
 }
 
 /** Index name for (table, column), shortened with a hash when too long. */
@@ -193,7 +225,6 @@ export function isStrictDate(value: unknown): value is string {
   return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === value;
 }
 
-/** Whether a JSON value lands in a projection column of `type` (else the column is NULL). */
 /**
  * Longest string (UTF-8 bytes) a text column holds; longer ones are NULL in
  * the column, like a value of another type. Mirrors the guard in the
@@ -202,6 +233,7 @@ export function isStrictDate(value: unknown): value is string {
  */
 export const MAX_INDEXED_TEXT_BYTES = 2000;
 
+/** Whether a JSON value lands in a projection column of `type` (else the column is NULL). */
 export function valueFitsType(type: ProjectionType, value: unknown): boolean {
   switch (type) {
     case "number": return typeof value === "number" && Number.isFinite(value);
