@@ -367,6 +367,22 @@ describe('query, store and import descriptions', () => {
     expect(descriptionOf('hutch_store_records')).toMatch(/says so in storage_note/)
   })
 
+  it('documents the response shape, array_sort/array_limit/array_totals, dotted fields, booleans in sums, null groups and what inference indexes', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const query = descriptionOf('hutch_query_records')
+    expect(query).toMatch(/a records query returns `records`.*a group_by\/aggregate query returns `results`/)
+    expect(query).toContain('{"array_sort": {"answers": "-score,creation_date"}, "array_limit": {"answers": 10}}')
+    expect(query).toMatch(/array_totals/)
+    expect(query).toContain('["title", "answers.answer_id", "answers.score"]')
+    expect(query).toMatch(/sum and avg count booleans as 1 \(true\) and 0 \(false\)/)
+    expect(query).toMatch(/limit: 0 means count only/)
+    expect(query).toMatch(/null come last in both directions/)
+    expect(query).not.toMatch(/first key/)
+    expect(query).toMatch(/every scalar key present in most of its elements/)
+    expect(query).toMatch(/GIN index on the documents serves equality/)
+    expect(descriptionOf('hutch_describe_collection')).toMatch(/storage\.indexes/)
+  })
+
   it('documents limit: 0 as count-only', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     expect(shapeOf('hutch_query_records').limit.description).toMatch(/limit: 0 only counts: the response has total and no records/)

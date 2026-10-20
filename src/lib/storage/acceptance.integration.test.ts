@@ -575,6 +575,22 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       expect(described.fields.every((f) => f.distinctCountEstimate === undefined)).toBe(true);
     });
 
+    it("lists every index that can serve a query, including the GIN on the documents, and each exists", async () => {
+      const docs = makeQuestions(300);
+      const slug = await store("questions", docs);
+      const described = ok(await collectionsSvc.describeCollection(slug, USER_ID)) as { storage: { indexes: { index: string; on: string; serves: string }[] } };
+      const names = described.storage.indexes.map((i) => i.index);
+      const id = (await collectionRow(slug)).id;
+      expect(names[0]).toBe(`hc_${id}_data_gin_idx`);
+      expect(described.storage.indexes[0].serves).toMatch(/\{"tags": "hiking"\}/);
+      expect(names).toContain(`hc_${id}_created_at_idx`);
+      const reg = await registry(slug);
+      expect(names.length).toBe(2 + reg.projections.length + reg.unwinds.reduce((n, u) => n + u.fields.length, 0));
+      const existing = await testDb.execute(sql`SELECT indexname FROM pg_indexes WHERE tablename LIKE ${`hc_${id}%`}`);
+      const present = new Set((existing.rows as { indexname: string }[]).map((r) => r.indexname));
+      for (const name of names) expect(present.has(name), name).toBe(true);
+    });
+
     it("larger collections get pg_stats estimates for indexed fields, labelled as estimates", async () => {
       const docs = makeQuestions(1200);
       const slug = await store("questions", docs);
@@ -599,6 +615,7 @@ describe.skipIf(!TEST_DB_URL)("acceptance-run cases against real Postgres", () =
       const second = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: docs.slice(50), return: "summary" })) as Record<string, unknown>;
       expect(second.storage_note).toMatch(/^This batch made fields .*'owner_user_id'.* queryable as indexed columns and unwound 'answers' into a queryable table .* took \d+ ms of this write/);
       expect(second.summary).toContain(second.storage_note as string);
+      expect(first.use).toBe(`Pass slug "${(first.collection as { slug: string }).slug}" to other tools for this collection; its name "Questions" works too.`);
       const third = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection: "questions", records: makeQuestions(3), return: "summary" })) as Record<string, unknown>;
       expect(third.storage_note).toBeUndefined();
       // Import passes it through too.

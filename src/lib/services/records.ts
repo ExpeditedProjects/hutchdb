@@ -165,7 +165,7 @@ export async function createRecords(userId: string, organizationId: string, para
 
   const saved = buildSaveSummary(collection.name, results, collectionWasCreated);
   const summary = storageNote ? `${saved}${/[.)]$/.test(saved) ? "" : "."} ${storageNote}` : saved;
-  const note = storageNote ? { storage_note: storageNote } : {};
+  const note = { ...slugNote(collection), ...(storageNote ? { storage_note: storageNote } : {}) };
 
   if (returnMode === "summary") {
     return {
@@ -194,6 +194,11 @@ export async function createRecords(userId: string, organizationId: string, para
     summary,
     ...note,
   };
+}
+
+/** Which identifier other tools take for this collection: the slug, and the exact name works too. */
+export function slugNote(collection: { name: string; slug: string }): { use: string } {
+  return { use: `Pass slug "${collection.slug}" to other tools for this collection; its name "${collection.name}" works too.` };
 }
 
 /**
@@ -484,6 +489,7 @@ export async function importRecords(userId: string, organizationId: string, para
     updated?: number;
     skipped?: number;
     summary?: string;
+    use?: string;
     storage_note?: string;
   };
 
@@ -495,6 +501,7 @@ export async function importRecords(userId: string, organizationId: string, para
     ...counts,
     ...(returnMode === "records" && bulk.results ? { results: bulk.results } : {}),
     summary: bulk.summary,
+    ...(bulk.use ? { use: bulk.use } : {}),
     ...(bulk.storage_note ? { storage_note: bulk.storage_note } : {}),
   };
 }
