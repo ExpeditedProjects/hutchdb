@@ -640,7 +640,7 @@ describe('query, store and import descriptions', () => {
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
     const aggregate = { revenue: { sum: { $multiply: ['items.qty', 'items.price'] } } }
     await registeredTools.get('hutch_query_records')!({ slug: 's', time_bucket: { field: 'ts', unit: 'day' }, aggregate })
-    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ timeBucket: { field: 'ts', unit: 'day' }, aggregate }))
+    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ timeBucket: { field: 'ts', unit: 'day' }, aggregate }), expect.anything())
   })
 })
 
