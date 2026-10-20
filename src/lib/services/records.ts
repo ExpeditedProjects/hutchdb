@@ -19,7 +19,7 @@ import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
 import { limitQueryOutput, truncateStrings, type OutputLimits } from "./output-limits";
-import { classifyDbError, describeDbError, formatTimeout, isDatabaseError } from "@/lib/db/errors";
+import { classifyDbError, describeDbError, formatTimeout, isDatabaseError, statementTimeoutMs } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -523,6 +523,14 @@ export async function importRecords(userId: string, organizationId: string, para
  * candidates, so the merged top `limit` is exact. Matches are grouped by
  * collection, groups in the order of their best match, and every record
  * keeps its collection's name and slug.
+ *
+ * One collection that cannot answer in time (a large one whose full-text
+ * index is missing or not built yet reads every document) must not fail
+ * the whole call: each collection's search runs under its own timeout of
+ * half the statement timeout, none starts after the statement timeout has
+ * elapsed since the call began, and the collections that timed out or
+ * were not reached are named in not_searched with incomplete: true, while
+ * the others' matches are returned.
  */
 export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
@@ -536,10 +544,26 @@ export async function searchGlobal(userId: string, search: string, limit: number
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
   for (const coll of accessible) queueDueIndexBuild(coll);
+  const budgetMs = statementTimeoutMs();
+  const perCollectionMs = Math.max(1, Math.floor(budgetMs / 2));
+  const deadline = Date.now() + budgetMs;
+  const missed = new Map<number, string>();
   // Bounded concurrency; results are concatenated in collection order, as
   // the serial loop did, so the stable sort below ranks ties the same way.
-  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) =>
-    (await tableRows.searchRecords(coll.id, search, clampedLimit)).map((row) => ({ coll, row })));
+  const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) => {
+    const remaining = deadline - Date.now();
+    if (remaining < SEARCH_MIN_SLICE_MS) {
+      missed.set(coll.id, "not searched: the time for this call ran out before its turn");
+      return [];
+    }
+    try {
+      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs: Math.min(perCollectionMs, remaining) })).map((row) => ({ coll, row }));
+    } catch (err) {
+      if (classifyDbError(err) !== "timeout") throw err;
+      missed.set(coll.id, searchTimeoutReason(coll.storage));
+      return [];
+    }
+  });
   const candidates = perCollection.flat();
   const time = (d: Date | null) => d?.getTime() ?? 0;
   candidates.sort((a, b) =>
@@ -576,7 +600,31 @@ export async function searchGlobal(userId: string, search: string, limit: number
     return { collection: g.collection, matches: records.length, records };
   });
 
-  return { search, results, ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}) };
+  const notSearched = accessible.filter((c) => missed.has(c.id)).map((c) => ({ collection: { name: c.name, slug: c.slug }, reason: missed.get(c.id)! }));
+  return {
+    search,
+    results,
+    ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}),
+    ...(notSearched.length > 0
+      ? {
+        incomplete: true,
+        not_searched: notSearched,
+        note: `${notSearched.length} of ${accessible.length} collections did not answer in time, so any matches in them are missing: ${notSearched.map((n) => `'${n.collection.name}'`).join(", ")}. To search one of them, use hutch_query_records with search on that collection (add a filter to narrow it).`,
+      }
+      : {}),
+  };
+}
+
+/** Collections not started with less than this left of the call's time are reported as not searched. */
+const SEARCH_MIN_SLICE_MS = 50;
+
+/** Why a collection's search ran out of time, from its search index state. */
+function searchTimeoutReason(storage: unknown): string {
+  const build = readRegistry(storage).search_index?.build;
+  if (!build) return "timed out: it has no full-text index, so searching it reads every document";
+  if (build.state === "pending" || build.state === "building") return "timed out: its full-text index is still being built, so searching it reads every document";
+  if (build.state === "failed") return "timed out: building its full-text index failed, so searching it reads every document";
+  return "timed out although its full-text index is ready (the server may be busy)";
 }
 
 export async function truncateRecords(slug: string, userId: string) {

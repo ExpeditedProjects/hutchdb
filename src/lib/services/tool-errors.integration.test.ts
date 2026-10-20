@@ -161,6 +161,34 @@ describe.skipIf(!TEST_DB_URL)("database errors and validation, real Postgres", (
     expect(result).toEqual({ error: expect.stringMatching(/^Invalid set_field\.filter: Unsupported filter operator '\$regex'/), status: 400 });
   });
 
+  type GlobalSearch = { results: { collection: { slug: string }; records: { data: { n: number } }[] }[]; incomplete?: boolean; not_searched?: { collection: { name: string; slug: string }; reason: string }[]; note?: string };
+
+  it("hutch_search returns the matches of the collections that answered and names the one that timed out", async () => {
+    const fast = await seed("Fast Notes", [{ text: "zebra crossing", n: 1 }, { text: "giraffe", n: 2 }]);
+    const slow = await seed("Slow Notes", [{ text: "zebra stripes", n: 3 }]);
+    const started = Date.now();
+    const result = await whileLocked(slow.id, () => recordsSvc.searchGlobal(USER_ID, "zebra", 10)) as unknown as GlobalSearch;
+    const elapsed = Date.now() - started;
+    expect(result.results.map((g) => g.collection.slug)).toEqual([fast.slug]);
+    expect(result.results[0].records.map((r) => r.data.n)).toEqual([1]);
+    expect(result.incomplete).toBe(true);
+    expect(result.not_searched).toEqual([{ collection: { name: "Slow Notes", slug: slow.slug }, reason: expect.stringMatching(/^timed out: it has no full-text index/) }]);
+    expect(result.note).toMatch(/^1 of 2 collections did not answer in time, so any matches in them are missing: 'Slow Notes'\. To search one of them, use hutch_query_records with search/);
+    for (const leak of LEAKS) expect(JSON.stringify(result)).not.toMatch(leak);
+    // Each collection gets half the statement timeout (400ms here), not all of it.
+    expect(elapsed).toBeLessThan(380);
+  });
+
+  it("hutch_search is complete, with no note, when every collection answers", async () => {
+    await seed("Fast Notes", [{ text: "zebra crossing", n: 1 }]);
+    await seed("Slow Notes", [{ text: "zebra stripes", n: 3 }]);
+    const result = await recordsSvc.searchGlobal(USER_ID, "zebra", 10) as unknown as GlobalSearch;
+    expect(result.results).toHaveLength(2);
+    expect(result).not.toHaveProperty("incomplete");
+    expect(result).not.toHaveProperty("not_searched");
+    expect(result).not.toHaveProperty("note");
+  });
+
   it("storageTimeoutHint names indexes that failed or are still building, and is silent when all are ready", async () => {
     const { slug, id } = await seed("articles_hint", [{ title: "A" }]);
     expect(await collectionsSvc.storageTimeoutHint(slug, USER_ID)).toBeUndefined();

@@ -462,8 +462,15 @@ export type SearchMatch = TableRecord & { rank: number };
  * Full-text matches for hutch_search, best first: by ts_rank, then newest.
  * `rank` lets matches from several collections be merged in one order.
  */
-export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db }: RowOptions = {}): Promise<SearchMatch[]> {
-  const result = await tx.execute(searchRecordsQuery(collectionId, search, limit));
+export async function searchRecords(collectionId: number, search: string, limit: number, { tx = db, timeoutMs }: RowOptions & { timeoutMs?: number } = {}): Promise<SearchMatch[]> {
+  // With timeoutMs, the statement runs under that (shorter) timeout:
+  // SET LOCAL in a transaction of its own (a savepoint in a passed one).
+  const result = timeoutMs === undefined
+    ? await tx.execute(searchRecordsQuery(collectionId, search, limit))
+    : await tx.transaction(async (inner) => {
+      await inner.execute(sql`SELECT set_config('statement_timeout', ${String(Math.max(1, Math.round(timeoutMs)))}, true)`);
+      return inner.execute(searchRecordsQuery(collectionId, search, limit));
+    });
   return (result.rows as (RawRow & { rank: number | string })[]).map((r) => ({ ...toRecord(collectionId, r), rank: Number(r.rank) }));
 }
 
