@@ -532,6 +532,18 @@ export async function importRecords(userId: string, organizationId: string, para
  * were not reached are named in not_searched with incomplete: true, while
  * the others' matches are returned.
  */
+/**
+ * Time limits for hutch_search: each collection gets half the statement
+ * timeout, and none starts after the whole timeout has passed.
+ * HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off, and then
+ * no collection gets a limit either.
+ */
+export function searchTimeLimits(now: number): { perCollectionMs: number | undefined; deadline: number } {
+  if (Number(process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS) === 0) return { perCollectionMs: undefined, deadline: Infinity };
+  const budgetMs = statementTimeoutMs();
+  return { perCollectionMs: Math.max(1, Math.floor(budgetMs / 2)), deadline: now + budgetMs };
+}
+
 export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
@@ -544,9 +556,7 @@ export async function searchGlobal(userId: string, search: string, limit: number
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
   for (const coll of accessible) queueDueIndexBuild(coll);
-  const budgetMs = statementTimeoutMs();
-  const perCollectionMs = Math.max(1, Math.floor(budgetMs / 2));
-  const deadline = Date.now() + budgetMs;
+  const { perCollectionMs, deadline } = searchTimeLimits(Date.now());
   const missed = new Map<number, string>();
   // Bounded concurrency; results are concatenated in collection order, as
   // the serial loop did, so the stable sort below ranks ties the same way.
@@ -557,7 +567,7 @@ export async function searchGlobal(userId: string, search: string, limit: number
       return [];
     }
     try {
-      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs: Math.min(perCollectionMs, remaining) })).map((row) => ({ coll, row }));
+      return (await tableRows.searchRecords(coll.id, search, clampedLimit, { timeoutMs: perCollectionMs === undefined ? undefined : Math.min(perCollectionMs, remaining) })).map((row) => ({ coll, row }));
     } catch (err) {
       if (classifyDbError(err) !== "timeout") throw err;
       missed.set(coll.id, searchTimeoutReason(coll.storage));

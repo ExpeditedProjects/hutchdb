@@ -115,6 +115,7 @@ import {
   exportRecords,
   importRecords,
   storageChangeNote,
+  searchTimeLimits,
 } from './records'
 import {
   findCollectionByNameInOrg,
@@ -987,5 +988,27 @@ describe('storageChangeNote', () => {
     }
     const note = storageChangeNote(base, after)!
     expect(note).toBe("This batch queued indexes on fields 'score', 'owner.id', unwinding 'answers' into a queryable table (so filters and aggregates on its elements can use indexes), a full-text index for search. Indexes are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until one is ready, queries return the same results without it.")
+  })
+})
+
+describe('searchTimeLimits', () => {
+  const saved = process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS
+  const restore = () => {
+    if (saved === undefined) delete process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS
+    else process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = saved
+  }
+
+  it('gives each collection half the statement timeout and ends the call after all of it', () => {
+    process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = '3000'
+    try {
+      expect(searchTimeLimits(1_000)).toEqual({ perCollectionMs: 1500, deadline: 4_000 })
+    } finally { restore() }
+  })
+
+  it('sets no limit when HUTCH_DB_STATEMENT_TIMEOUT_MS=0 turns the database timeout off', () => {
+    process.env.HUTCH_DB_STATEMENT_TIMEOUT_MS = '0'
+    try {
+      expect(searchTimeLimits(1_000)).toEqual({ perCollectionMs: undefined, deadline: Infinity })
+    } finally { restore() }
   })
 })
