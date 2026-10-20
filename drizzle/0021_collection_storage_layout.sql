@@ -6,7 +6,9 @@ ALTER TABLE "collections" ADD COLUMN "storage" jsonb NOT NULL DEFAULT '{}';
 --> statement-breakpoint
 -- Guarded casts used by projection columns. Generated columns must never
 -- throw (a bad value would reject the whole document), so overflow and
--- invalid dates become NULL instead of errors.
+-- invalid dates become NULL instead of errors, and so does text over 2000
+-- bytes (MAX_INDEXED_TEXT_BYTES in src/lib/storage/registry.ts): a btree
+-- index entry tops out near 2.7 KB, and a longer value would fail the write.
 CREATE OR REPLACE FUNCTION hc_safe_float8(v jsonb) RETURNS float8
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 BEGIN
@@ -36,7 +38,7 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     WHEN 'date' THEN
       format('CASE WHEN jsonb_typeof(%s->%L) = ''string'' AND (%s->>%L) ~ ''^\d{4}-\d{2}-\d{2}$'' THEN hc_safe_date(%s->>%L) END', src, key, src, key, src, key)
     ELSE
-      format('CASE WHEN jsonb_typeof(%s->%L) = ''string'' THEN %s->>%L END', src, key, src, key)
+      format('CASE WHEN jsonb_typeof(%s->%L) = ''string'' AND octet_length(%s->>%L) <= 2000 THEN %s->>%L END', src, key, src, key, src, key)
   END
 $$;
 --> statement-breakpoint
@@ -68,7 +70,7 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     WHEN 'date' THEN
       format('CASE WHEN jsonb_typeof(%s #> %L::text[]) = ''string'' AND (%s #>> %L::text[]) ~ ''^\d{4}-\d{2}-\d{2}$'' THEN hc_safe_date(%s #>> %L::text[]) END', src, path, src, path, src, path)
     ELSE
-      format('CASE WHEN jsonb_typeof(%s #> %L::text[]) = ''string'' THEN %s #>> %L::text[] END', src, path, src, path)
+      format('CASE WHEN jsonb_typeof(%s #> %L::text[]) = ''string'' AND octet_length(%s #>> %L::text[]) <= 2000 THEN %s #>> %L::text[] END', src, path, src, path, src, path)
   END
 $$;
 --> statement-breakpoint

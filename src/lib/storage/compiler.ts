@@ -216,8 +216,10 @@ function columnCondition(column: SQL, type: ProjectionType, op: string | null, o
   if (Object.hasOwn(COMPARISONS, op)) {
     // The document route rejects a boolean operand, and compares dates as
     // text: a non-date string ("2026-01-01T10:00") still compares there, so
-    // a date column only stands in for it while no such value exists.
-    if (type === "boolean" || (type === "date" && mixed)) return null;
+    // a date column only stands in for it while no such value exists. A
+    // text column is NULL for over-long strings, which still compare in the
+    // document, so it too only answers ranges while it has no misfits.
+    if (type === "boolean" || ((type === "date" || type === "text") && mixed)) return null;
     return literalMatches(type, operand) ? sql`${column} ${sql.raw(COMPARISONS[op])} ${typedLiteral(type, operand)}` : null;
   }
   if (op === "$ne") {
@@ -526,7 +528,9 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
       raw[rest.join(".")] = value;
       nestedRaw.set(path, raw);
       for (const cond of entries(value)) {
-        const routed = unwind && column ? columnCondition(sql`c.${ident(column.column)}`, column.type, cond.op, cond.operand) : null;
+        // Child columns carry no misfit flag; a text one may be NULL for an
+        // over-long string, so it never answers a range.
+        const routed = unwind && column ? columnCondition(sql`c.${ident(column.column)}`, column.type, cond.op, cond.operand, column.type === "text") : null;
         if (routed && unwind && column) {
           const group = child.get(path) ?? { unwind, conditions: [] };
           group.conditions.push(routed);

@@ -25,9 +25,10 @@ export type Projection = {
   reason: string;
   /**
    * Sticky: some live document has held a value at this field that is not
-   * of `type` (including JSON null). The column is NULL for those, so the
-   * compiler stops using it for sorts and date ranges, where it would order
-   * them differently from the document; filters stay exact either way.
+   * of `type` (including JSON null, and text over MAX_INDEXED_TEXT_BYTES).
+   * The column is NULL for those, so the compiler stops using it for sorts
+   * and for date and text ranges, where it would order them differently
+   * from the document; filters stay exact either way.
    */
   mixed?: boolean;
 };
@@ -193,11 +194,19 @@ export function isStrictDate(value: unknown): value is string {
 }
 
 /** Whether a JSON value lands in a projection column of `type` (else the column is NULL). */
+/**
+ * Longest string (UTF-8 bytes) a text column holds; longer ones are NULL in
+ * the column, like a value of another type. Mirrors the guard in the
+ * hc_cast_expr / hc_cast_path_expr SQL functions (migration 0021): a btree
+ * index entry tops out near 2.7 KB.
+ */
+export const MAX_INDEXED_TEXT_BYTES = 2000;
+
 export function valueFitsType(type: ProjectionType, value: unknown): boolean {
   switch (type) {
     case "number": return typeof value === "number" && Number.isFinite(value);
     case "boolean": return typeof value === "boolean";
-    case "text": return typeof value === "string";
+    case "text": return typeof value === "string" && Buffer.byteLength(value, "utf8") <= MAX_INDEXED_TEXT_BYTES;
     case "date": return isStrictDate(value);
   }
 }

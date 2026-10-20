@@ -333,6 +333,73 @@ describe.skipIf(!TEST_DB_URL)("table layout query semantics against real Postgre
     });
   });
 
+  it("an over-long string in a projected text field is stored and queried like the document path", async () => {
+    const docs = makeAnswers(300).map((d) => ({ ...d, title: `t-${d.answer_id % 50}` }));
+    const { projected, plain } = await twin(docs);
+    const before = await registry(projected);
+    expect(before.projections.find((p) => p.field === "title")).toMatchObject({ type: "text" });
+    expect(before.projections.find((p) => p.field === "title")?.mixed).toBeUndefined();
+    expect(before.unwinds.find((u) => u.path === "tag_list")?.fields.find((f) => f.field === "tag")?.type).toBe("text");
+
+    // 10 KB that does not compress: well past the ~2.7 KB btree entry
+    // limit of the column's index (a repeated character would compress under it).
+    let seed = 7;
+    const noise = Array.from({ length: 10 * 1024 }, () => {
+      seed = (seed * 1103515245 + 12345) % 2147483648;
+      return String.fromCharCode(97 + (seed % 26));
+    }).join("");
+    const long = `t-zz${noise}needle`;
+    const longDoc = { ...makeAnswers(1, 1000)[0], title: long, tag_list: [{ tag: long, score: 1 }, { tag: "snow", score: 2 }] };
+    await store("projected", [longDoc]);
+    await store("plain", [longDoc]);
+    const all = [...docs, longDoc];
+    expect((await registry(projected)).projections.find((p) => p.field === "title")?.mixed).toBe(true);
+
+    const FILTERS: Record<string, unknown>[] = [
+      { title: long },
+      { title: "t-3" },
+      { title: { $contains: "needle" } },
+      { title: { $contains: "T-1" } },
+      { title: { $in: [long, "t-7"] } },
+      { title: { $ne: "t-3" } },
+      { title: { $nin: [long] } },
+      { title: { $exists: true } },
+      { "tag_list.tag": long },
+      { "tag_list.tag": { $contains: "needle" } },
+    ];
+    // The oracle walks objects only; an array-of-objects path matches when some element does.
+    const oracle = (d: (typeof all)[number], filter: Record<string, unknown>) => {
+      const [field, spec] = Object.entries(filter)[0];
+      if (!field.startsWith("tag_list.")) return matches(d, filter);
+      return d.tag_list.some((t) => matches({ tag: t.tag }, { tag: spec }));
+    };
+    for (const filter of FILTERS) {
+      const params = { filter, sort: "answer_id", limit: 1000 };
+      const [a, b] = await Promise.all([query(projected, params), query(plain, params)]);
+      const expected = all.filter((d) => oracle(d, filter)).map((d) => d.answer_id);
+      expect(ids(a), `${JSON.stringify(filter).slice(0, 80)}: projected vs oracle`).toEqual(expected);
+      expect(ids(b), `${JSON.stringify(filter).slice(0, 80)}: documents vs oracle`).toEqual(expected);
+    }
+    // Ranges and sorts compare as text in Postgres' collation: the projected
+    // collection must agree with the document-only one.
+    for (const params of [
+      { filter: { title: { $gt: "t-4" } }, sort: "answer_id", limit: 1000 },
+      { filter: { title: { $lte: "t-zz" } }, sort: "answer_id", limit: 1000 },
+      { filter: { "tag_list.tag": { $gt: "t" } }, sort: "answer_id", limit: 1000 },
+      { sort: ["title", "answer_id"], limit: 1000 },
+      { sort: ["-title", "answer_id"], limit: 1000 },
+    ] as QueryParams[]) {
+      const [a, b] = await Promise.all([query(projected, params), query(plain, params)]);
+      expect(ids(a), JSON.stringify(params)).toEqual(ids(b));
+      expect(a.total).toBe(b.total);
+    }
+    const [ga, gb] = await Promise.all([
+      query(projected, { groupBy: "title", aggregate: { n: "count" }, sort: ["-n", "title"], limit: 5 }),
+      query(plain, { groupBy: "title", aggregate: { n: "count" }, sort: ["-n", "title"], limit: 5 }),
+    ]);
+    expect(ga.results).toEqual(gb.results);
+  });
+
   describe("group_by on arrays", () => {
     it("groups an array of scalars per element (a tag board without a join collection)", async () => {
       const docs = makeAnswers(300);
