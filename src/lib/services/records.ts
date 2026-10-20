@@ -17,6 +17,7 @@ import { applyInference, markMixedProjections, recheckMixedProjections, updateRe
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
+import { limitQueryOutput, truncateStrings, type OutputLimits } from "./output-limits";
 import { classifyDbError, describeDbError, formatTimeout, isDatabaseError } from "@/lib/db/errors";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
@@ -342,11 +343,17 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
+/**
+ * With `limits` (the MCP tool passes them), long strings are cut and an
+ * oversized page is cut short with has_more/next_offset continuing it;
+ * without, the result is returned whole.
+ */
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>, limits?: OutputLimits) {
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
-  return queryTable(access.collection, params);
+  const result = await queryTable(access.collection, params);
+  return limits ? limitQueryOutput(result, limits) : result;
 }
 
 const EXPORT_DEFAULT_LIMIT = 1000;
@@ -512,7 +519,7 @@ export async function importRecords(userId: string, organizationId: string, para
  * collection, groups in the order of their best match, and every record
  * keeps its collection's name and slug.
  */
-export async function searchGlobal(userId: string, search: string, limit: number = 10) {
+export async function searchGlobal(userId: string, search: string, limit: number = 10, limits: OutputLimits = {}) {
   if (!userId) return { search, results: [] };
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
 
@@ -552,13 +559,18 @@ export async function searchGlobal(userId: string, search: string, limit: number
     });
   }
 
-  const results = Array.from(grouped.values()).map((g) => ({
-    collection: g.collection,
-    matches: g.records.length,
-    records: g.records,
-  }));
+  let truncatedStrings = 0;
+  const results = Array.from(grouped.values()).map((g) => {
+    // Long strings in each match's data are cut when the caller set a cap.
+    const records = g.records.map((r) => {
+      const { value, truncated } = truncateStrings(r.data, limits.maxStringLength ?? 0);
+      truncatedStrings += truncated;
+      return truncated > 0 ? { ...r, data: value } : r;
+    });
+    return { collection: g.collection, matches: records.length, records };
+  });
 
-  return { search, results };
+  return { search, results, ...(truncatedStrings > 0 ? { truncated_strings: truncatedStrings } : {}) };
 }
 
 export async function truncateRecords(slug: string, userId: string) {

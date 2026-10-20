@@ -7,6 +7,7 @@ import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
 import { MCP_MAX_REQUEST_BODY_BYTES, MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
 import { DESCRIBE_FIELDS_PAGE } from "@/lib/describe";
+import { DEFAULT_MAX_STRING_LENGTH, MAX_PAGE_CHARS } from "@/lib/services/output-limits";
 import { classifyDbError, describeDbError, isDatabaseError } from "@/lib/db/errors";
 
 /**
@@ -58,6 +59,8 @@ const FILTER_DESCRIPTION =
 // Field paging shared by hutch_describe_collection and hutch_get_collection.
 const FIELDS_OFFSET_DESCRIPTION = `Skip this many fields (default 0): each call lists at most ${DESCRIBE_FIELDS_PAGE}; pass the response's fields_next_offset for the next page.`;
 const FIELD_PREFIX_DESCRIPTION = "Only list fields whose name starts with this (case-sensitive), e.g. \"voltage\" for voltage_0, voltage_1, ...";
+
+const MAX_STRING_LENGTH_DESCRIPTION = `Cut string values longer than this many characters (default ${DEFAULT_MAX_STRING_LENGTH}) in returned records, ending them with "…[truncated: N more chars; pass max_string_length: 0 for full values]"; the response's truncated_strings counts them. 0 returns full values. hutch_export_records never truncates.`;
 
 function textResponse(text: string): McpToolResponse {
   return { content: [{ type: "text", text }] };
@@ -276,7 +279,8 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         created_after: z.string().optional().describe("Filter records created after this ISO date (e.g. \"2026-07-01\" or \"2026-07-01T12:00:00Z\")"),
         created_before: z.string().optional().describe("Filter records created before this ISO date (e.g. \"2026-07-18\")"),
         limit: z.number().optional().describe("Max records (or groups, with group_by/aggregate) to return (default 50, max 1000). limit: 0 only counts: the response has total and no records — the number of matching records, or of groups for an aggregate."),
-        offset: z.number().optional().describe("Offset for pagination, for records and for aggregate groups alike: follow next_offset while has_more is true."),
+        offset: z.number().optional().describe(`Offset for pagination, for records and for aggregate groups alike: follow next_offset while has_more is true. A page whose JSON would exceed ${MAX_PAGE_CHARS.toLocaleString("en-US")} characters returns fewer rows than limit, with page_note, has_more and next_offset set to continue.`),
+        max_string_length: z.number().int().min(0).optional().describe(MAX_STRING_LENGTH_DESCRIPTION),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
@@ -297,7 +301,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         offset: params.offset,
         record: params.record,
         perRecord: params.per_record,
-      });
+      }, { maxStringLength: params.max_string_length ?? DEFAULT_MAX_STRING_LENGTH, maxPageChars: MAX_PAGE_CHARS });
       if (!result) return collectionNotFound(params.slug);
       return jsonResponse(result);
     }
@@ -311,11 +315,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       inputSchema: z.object({
         search: z.string().describe("What to search for — matches against all fields in all collections"),
         limit: z.number().optional().describe("Max results in total across all collections (default 10, max 50), most relevant first, then newest; results are grouped by collection and each record carries its collection slug"),
+        max_string_length: z.number().int().min(0).optional().describe(MAX_STRING_LENGTH_DESCRIPTION),
       }),
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
-      const result = await recordService.searchGlobal(userId, params.search, params.limit);
+      const result = await recordService.searchGlobal(userId, params.search, params.limit, { maxStringLength: params.max_string_length ?? DEFAULT_MAX_STRING_LENGTH });
       return jsonResponse(result);
     }
   );

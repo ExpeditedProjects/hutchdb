@@ -166,8 +166,8 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
       { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
-      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
-      { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'search'] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'max_string_length', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'max_string_length', 'search'] },
       { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
       { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
       { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
@@ -425,6 +425,33 @@ describe('field paging on describe and get_collection', () => {
   })
 })
 
+describe('string cap and page budget', () => {
+  it('asks the service for a 2,000-char string cap and a 200K page budget by default', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ records: [] } as never)
+    await registeredTools.get('hutch_query_records')!({ slug: 'articles' })
+    expect(recordService.queryRecords).toHaveBeenCalledWith('articles', 'user-1', expect.any(Object), { maxStringLength: 2000, maxPageChars: 200_000 })
+  })
+
+  it('forwards max_string_length: 0 (no cap) to query and search', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ records: [] } as never)
+    vi.mocked(recordService.searchGlobal).mockResolvedValue({ search: 'q', results: [] } as never)
+    await registeredTools.get('hutch_query_records')!({ slug: 'articles', max_string_length: 0 })
+    expect(recordService.queryRecords).toHaveBeenCalledWith('articles', 'user-1', expect.any(Object), { maxStringLength: 0, maxPageChars: 200_000 })
+    await registeredTools.get('hutch_search')!({ search: 'q' })
+    expect(recordService.searchGlobal).toHaveBeenLastCalledWith('user-1', 'q', undefined, { maxStringLength: 2000 })
+    await registeredTools.get('hutch_search')!({ search: 'q', max_string_length: 0 })
+    expect(recordService.searchGlobal).toHaveBeenLastCalledWith('user-1', 'q', undefined, { maxStringLength: 0 })
+  })
+
+  it('does not cap export', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const inputKeys = Object.keys((registeredConfigs.get('hutch_export_records')!.inputSchema as { shape: Record<string, unknown> }).shape)
+    expect(inputKeys).not.toContain('max_string_length')
+  })
+})
+
 describe('tool input schemas and descriptions', () => {
   it('caps import content at 10MB in the zod schema (mirrors the service-level cap)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
@@ -557,7 +584,7 @@ describe('query, store and import descriptions', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: ['chamber', 'party'], aggregate: { n: 'count' }, sort: '-n', limit: 10 })
-    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }))
+    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }), expect.any(Object))
   })
 })
 
@@ -585,7 +612,7 @@ describe('storage-aware descriptions', () => {
     expect(descriptionOf('hutch_import_records')).toMatch(/JSON records can be nested documents/)
     expect(descriptionOf('hutch_store_records')).toContain('limited to 16 MB')
     const shape = shapeOf('hutch_query_records')
-    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
+    expect(Object.keys(shape).sort()).toEqual(['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'max_string_length', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'])
     expect(shape.record.description).toMatch(/omits the embedded parent record/)
     // fields reach into arrays of objects; array_sort/array_limit order and cut embedded arrays.
     expect(shape.fields.description).toMatch(/sibling paths combine/)
@@ -613,14 +640,14 @@ describe('storage-aware descriptions', () => {
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
     createMcpServer('user-1', 'org-test', 'https://example.test')
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', per_record: true, sort: ['-n', 'votes.vote'] })
-    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ perRecord: true, sort: ['-n', 'votes.vote'] }))
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ perRecord: true, sort: ['-n', 'votes.vote'] }), expect.any(Object))
   })
 
   it('forwards record to the service', async () => {
     vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
     createMcpServer('user-1', 'org-test', 'https://example.test')
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: 'votes.vote', record: false })
-    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ record: false }))
+    expect(recordService.queryRecords).toHaveBeenLastCalledWith('s', 'user-1', expect.objectContaining({ record: false }), expect.any(Object))
   })
 })
 
@@ -697,7 +724,7 @@ describe('query_records tool', () => {
     expect(recordService.queryRecords).toHaveBeenCalledWith('products', 'user-1', expect.objectContaining({
       filter: { price: { $gte: 10 }, status: 'active' },
       fields: ['title', 'price'],
-    }))
+    }), expect.any(Object))
   })
 })
 

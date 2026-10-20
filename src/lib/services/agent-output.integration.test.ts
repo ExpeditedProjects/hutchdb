@@ -157,4 +157,64 @@ describe.skipIf(!TEST_DB_URL)("bounded tool output, real Postgres", () => {
       expect(mixed.reason).not.toMatch(/100%/);
     });
   });
+
+  describe("long strings and big pages in query and search output", () => {
+    const body = (i: number) => `article ${i} quantum ` + "lorem ipsum ".repeat(1000); // ~12K chars
+
+    it("cuts strings over 2,000 chars with a marker by default; max_string_length 0 returns them whole; export stays lossless", async () => {
+      const { slug } = await seed("articles_long", [{ title: "A", body: body(1) }, { title: "B", body: body(2) }]);
+      const capped = await recordsSvc.queryRecords(slug, USER_ID, { sort: "title" }, { maxStringLength: 2000, maxPageChars: 200_000 }) as { records: { data: { title: string; body: string } }[]; truncated_strings?: number };
+      expect(capped.truncated_strings).toBe(2);
+      const full = body(1);
+      expect(capped.records[0].data.title).toBe("A");
+      expect(capped.records[0].data.body).toBe(full.slice(0, 2000) + `…[truncated: ${full.length - 2000} more chars; pass max_string_length: 0 for full values]`);
+
+      const whole = await recordsSvc.queryRecords(slug, USER_ID, { sort: "title" }, { maxStringLength: 0, maxPageChars: 200_000 }) as { records: { data: { body: string } }[]; truncated_strings?: number };
+      expect(whole.records[0].data.body).toBe(full);
+      expect(whole.truncated_strings).toBeUndefined();
+
+      const unlimited = await recordsSvc.queryRecords(slug, USER_ID, { sort: "title" }) as { records: { data: { body: string } }[] };
+      expect(unlimited.records[0].data.body).toBe(full);
+
+      const exported = await recordsSvc.exportRecords(slug, USER_ID, { sort: "title" }) as { content: string };
+      expect((JSON.parse(exported.content) as { data?: { body: string }; body?: string }[]).map((r) => r.data?.body ?? r.body)).toContain(full);
+    });
+
+    it("cuts a page over 200K chars short, and following next_offset returns every record exactly once", async () => {
+      const recs = Array.from({ length: 30 }, (_, i) => ({ n: i, body: body(i) }));
+      const { slug } = await seed("articles_page", recs);
+      const seen: number[] = [];
+      let offset: number | null = 0;
+      let first: { count: number; page_note?: string; has_more: boolean } | undefined;
+      while (offset !== null) {
+        const page = await recordsSvc.queryRecords(slug, USER_ID, { sort: "n", limit: 50, offset }, { maxStringLength: 0, maxPageChars: 200_000 }) as { records: { data: { n: number } }[]; count: number; has_more: boolean; next_offset: number | null; total: number; page_note?: string };
+        first ??= page;
+        expect(page.total).toBe(30);
+        expect(JSON.stringify(page.records).length).toBeLessThanOrEqual(200_000);
+        seen.push(...page.records.map((r) => r.data.n));
+        offset = page.next_offset;
+      }
+      expect(first!.count).toBeLessThan(30);
+      expect(first!.has_more).toBe(true);
+      expect(first!.page_note).toMatch(/to keep the response under 200,000 characters/);
+      expect(seen).toEqual(Array.from({ length: 30 }, (_, i) => i));
+    });
+
+    it("cuts long strings in aggregate rows and per_record records too", async () => {
+      const { slug } = await seed("articles_agg", [{ g: "x", body: body(1) }]);
+      const agg = await recordsSvc.queryRecords(slug, USER_ID, { groupBy: "g", aggregate: { b: { first: "body" } } }, { maxStringLength: 100, maxPageChars: 200_000 }) as unknown as { results: { b: string }[]; truncated_strings?: number };
+      expect(agg.results[0].b).toMatch(/^article 1 quantum .{82}…\[truncated: \d+ more chars/);
+      expect(agg.truncated_strings).toBe(1);
+    });
+
+    it("hutch_search cuts long strings in matches", async () => {
+      await seed("articles_search", [{ title: "Q", body: body(7) }]);
+      const found = await recordsSvc.searchGlobal(USER_ID, "quantum", 10, { maxStringLength: 2000 }) as unknown as { results: { records: { data: { title: string; body: string } }[] }[]; truncated_strings?: number };
+      expect(found.results[0].records[0].data.title).toBe("Q");
+      expect(found.results[0].records[0].data.body).toMatch(/…\[truncated: \d+ more chars; pass max_string_length: 0 for full values\]$/);
+      expect(found.truncated_strings).toBe(1);
+      const whole = await recordsSvc.searchGlobal(USER_ID, "quantum", 10) as unknown as { results: { records: { data: { body: string } }[] }[]; truncated_strings?: number };
+      expect(whole.results[0].records[0].data.body).toBe(body(7));
+    });
+  });
 });
