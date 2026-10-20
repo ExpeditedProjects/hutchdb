@@ -86,7 +86,7 @@ export async function describeCollection(collectionId: number, totalRecords: num
       name,
       type: inferredType || primaryType,
       frequency: Math.round(frequency * 100) / 100,
-      sampleValues: stat.values.slice(0, 3),
+      sampleValues: stat.values.slice(0, 3).map((v) => truncateSample(v)),
     };
 
     if (types.length > 1) {
@@ -119,6 +119,36 @@ export async function describeCollection(collectionId: number, totalRecords: num
   fields.sort((a, b) => b.frequency - a.frequency || a.name.localeCompare(b.name));
 
   return fields;
+}
+
+/** Longest sample string describe returns; longer ones end in an ellipsis. */
+export const MAX_SAMPLE_STRING = 200;
+/** Array elements and object keys a sample keeps before summarizing the rest. */
+const MAX_SAMPLE_ITEMS = 3;
+const MAX_SAMPLE_DEPTH = 3;
+
+/**
+ * A sample value small enough to show: strings over MAX_SAMPLE_STRING are
+ * cut with an ellipsis, arrays keep their first few elements plus a
+ * "… N more" marker, objects their first few keys plus a "…" key, and
+ * anything nested deeper than MAX_SAMPLE_DEPTH becomes "…".
+ */
+export function truncateSample(value: unknown, depth = 0): unknown {
+  if (typeof value === "string") {
+    return value.length > MAX_SAMPLE_STRING ? `${value.slice(0, MAX_SAMPLE_STRING)}…` : value;
+  }
+  if (value === null || typeof value !== "object") return value;
+  if (depth >= MAX_SAMPLE_DEPTH) return "…";
+  if (Array.isArray(value)) {
+    const kept = value.slice(0, MAX_SAMPLE_ITEMS).map((v) => truncateSample(v, depth + 1));
+    return value.length > MAX_SAMPLE_ITEMS ? [...kept, `… ${value.length - MAX_SAMPLE_ITEMS} more`] : kept;
+  }
+  const keys = Object.keys(value);
+  const limit = depth === 0 ? Math.max(MAX_SAMPLE_ITEMS, 8) : MAX_SAMPLE_ITEMS;
+  const out: Record<string, unknown> = {};
+  for (const k of keys.slice(0, limit)) out[k] = truncateSample((value as Record<string, unknown>)[k], depth + 1);
+  if (keys.length > limit) out["…"] = `${keys.length - limit} more keys`;
+  return out;
 }
 
 function inferSingleType(value: unknown): string {

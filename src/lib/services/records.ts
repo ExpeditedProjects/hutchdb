@@ -1,11 +1,12 @@
 import { db } from "@/lib/db";
 import { collections, collectionMembers } from "@/lib/db/schema";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg, QueryParams } from "@/lib/db/queries";
+import { createCollectionWithOwner, findCollectionByNameInOrg, findCollectionByNameInsensitiveInOrg, findCollectionBySlugInOrg } from "@/lib/db/queries";
 import { slugify, uniqueSlug, titleCase } from "@/lib/slugify";
 import { eq, and, sql, type SQL } from "drizzle-orm";
 import { revalidateDashboard } from "@/lib/revalidation";
 import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, CollectionSchema } from "@/lib/schema-inference";
 import { seedAutoViews } from "./views";
+import { findAccessibleCollection } from "./resolve";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
 import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
@@ -14,7 +15,7 @@ import { collectionTableName, ident, readRegistry } from "@/lib/storage/registry
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
 import * as tableRows from "@/lib/storage/rows";
-import { queryTable } from "@/lib/storage/compiler";
+import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
 
 async function reinferCollectionSchema(collectionId: number, existingSchema: CollectionSchema | null) {
   try {
@@ -126,6 +127,9 @@ export async function createRecords(userId: string, organizationId: string, para
   const stored = await storeInTable(collection, recordsToInsert, onConflict, collectionWasCreated);
   if ("error" in stored) return stored;
   const results = stored.results;
+  // The documents as stored (merged documents after an on_conflict merge),
+  // which inference evaluates.
+  const storedDocs = results.map((r) => r.record.data).filter(isPlainObject);
 
   // Auto-infer schema if records contain fields not yet in the schema
   const existingSchema = collection.schema as CollectionSchema | null;
@@ -140,8 +144,8 @@ export async function createRecords(userId: string, organizationId: string, para
   // Storage inference (projections, unwinds) runs after every successful
   // write. It must never fail the write.
   try {
-    await markMixedProjections(collection.id, recordsToInsert);
-    await applyInference(collection, recordsToInsert);
+    await markMixedProjections(collection.id, storedDocs);
+    await applyInference(collection, storedDocs);
   } catch (err) {
     console.error(`[storage] inference failed for collection ${collection.id}`, err);
   }
@@ -294,7 +298,7 @@ function buildSaveSummary(
 }
 
 export async function listRecords(slug: string, userId: string, limit: number = 50, offset: number = 0) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
 
@@ -307,12 +311,12 @@ export async function listRecords(slug: string, userId: string, limit: number = 
   return { records: recs, total, limit: clampedLimit, offset };
 }
 
-function runQuery(collection: CollectionRow, params: Omit<QueryParams, "collectionId">) {
+function runQuery(collection: CollectionRow, params: TableQueryParams) {
   return queryTable(collection, params);
 }
 
-export async function queryRecords(slug: string, userId: string, params: Omit<QueryParams, 'collectionId' | 'limitCap'>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+export async function queryRecords(slug: string, userId: string, params: Omit<TableQueryParams, 'limitCap'>) {
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
   return runQuery(access.collection, params);
@@ -336,12 +340,14 @@ export async function exportRecords(slug: string, userId: string, params: {
   format?: "json" | "csv";
   filter?: Record<string, unknown>;
   search?: string;
-  sort?: string;
+  sort?: string | string[];
   fields?: string[];
   limit?: number;
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
 
   const format = params.format ?? "json";
   const limit = Math.min(Math.max(params.limit ?? EXPORT_DEFAULT_LIMIT, 1), EXPORT_MAX_LIMIT);
@@ -508,8 +514,10 @@ export async function searchGlobal(userId: string, search: string, limit: number
 }
 
 export async function truncateRecords(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   await tableRows.softDeleteAll(collection.id);
@@ -518,8 +526,10 @@ export async function truncateRecords(slug: string, userId: string) {
 }
 
 export async function updateRecord(slug: string, userId: string, recordId: number, data: Record<string, unknown>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
   const updated = await tableRows.updateRecordData(collection.id, recordId, data);
 
@@ -550,8 +560,10 @@ export async function transformRecords(slug: string, userId: string, params: {
   rename_fields?: Record<string, string>;
   set_field?: { field: string; value: unknown; filter?: Record<string, unknown> };
 }) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const { remove_fields, rename_fields, set_field } = params;
 
   const hasOperation =
@@ -635,12 +647,20 @@ export async function transformRecords(slug: string, userId: string, params: {
         const { field, value, filter } = set_field;
         const overlay = JSON.stringify({ [field]: value });
         if (filter && Object.keys(filter).length > 0) {
-          await run("set_field", sql`UPDATE ${target}
-              SET data = data || ${overlay}::jsonb,
+          // The full query filter language (operators, dotted paths, array
+          // elements), as in hutch_query_records.
+          let where: SQL;
+          try {
+            where = await tableFilterWhere(collection, filter);
+          } catch (err) {
+            console.error(`transformRecords set_field filter failed for collection ${collection.id}`, err);
+            throw new TransformFailed();
+          }
+          await run("set_field", sql`UPDATE ${target} AS t
+              SET data = t.data || ${overlay}::jsonb,
                   updated_at = now()
-              WHERE data @> ${JSON.stringify(filter)}::jsonb
-              AND deleted_at IS NULL
-              RETURNING id`);
+              WHERE ${where}
+              RETURNING t.id`);
         } else {
           await run("set_field", sql`UPDATE ${target}
               SET data = data || ${overlay}::jsonb,
@@ -690,8 +710,10 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
     return { error: `Invalid status. Must be one of: ${RECORD_STATUSES.join(", ")}`, status: 400 };
   }
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const updated = await tableRows.setRecordStatus(access.collection.id, recordId, status);
 
   if (!updated) return { error: "Record not found", status: 404 };
@@ -701,8 +723,10 @@ export async function updateRecordStatus(slug: string, userId: string, recordId:
 }
 
 export async function deleteRecord(slug: string, userId: string, recordId: number) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const deleted = await tableRows.softDeleteRecord(access.collection.id, recordId);
 
   if (!deleted) return { error: "Record not found", status: 404 };

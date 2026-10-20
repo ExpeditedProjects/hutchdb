@@ -255,6 +255,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
         groupBy: "votes.category_id",
         aggregate: { pts: { sum: "votes.points" } },
         limit: 1000,
+        perRecord: true,
       });
       const oracle = big.filter((d) => d.id < 100).flatMap((d) => {
         const by = new Map<number, number>();
@@ -272,6 +273,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
         groupBy: "votes.category_id",
         aggregate: { pts: { sum: "votes.points" }, n: "count", best: { max: "votes.points" } },
         limit: 1000,
+        perRecord: true,
       });
 
       const oracle = docs
@@ -308,7 +310,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
         small.filter((d) => d.votes.some((v) => v.category_id === 1)).map((d) => d.id),
       );
 
-      const agg = await query(s2, { groupBy: "votes.category_id", aggregate: { pts: { sum: "votes.points" } } });
+      const agg = await query(s2, { groupBy: "votes.category_id", aggregate: { pts: { sum: "votes.points" } }, perRecord: true });
       const oracle = small.flatMap((d) => {
         const by = new Map<number, number>();
         for (const v of d.votes) by.set(v.category_id, (by.get(v.category_id) ?? 0) + v.points);
@@ -345,7 +347,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
       const category = docs[10].votes[0].category_id;
       const nested = await query(slug, { filter: { "votes.category_id": category }, limit: 100 });
       expect(nested.records!.map((r) => r.id)).not.toContain(victim.id);
-      const agg = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, limit: 1000 });
+      const agg = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, limit: 1000, perRecord: true });
       expect(agg.results!.map((r) => r.parent_id)).not.toContain(victim.id);
       expect((await collectionsSvc.describeCollection(slug, USER_ID))!.recordCount).toBe(59);
     });
@@ -408,6 +410,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
         aggregate: { pts: { sum: "votes.points.veterans" }, n: "count" },
         sort: "-pts",
         limit: 5,
+        perRecord: true,
       });
       const oracle = legs
         .map((d, id) => ({ id: id + 1, hits: d.votes.filter((v) => v.category_id === 1) }))
@@ -424,12 +427,12 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
     });
 
     it("applies fields to the embedded record and record: false omits it", async () => {
-      const withFields = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, fields: ["name", "totals"], limit: 3 });
+      const withFields = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, fields: ["name", "totals"], limit: 3, perRecord: true });
       const rec = withFields.results![0].record as { data: Record<string, unknown> };
       expect(Object.keys(rec.data).sort()).toEqual(["name", "totals"]);
       expect((rec.data.totals as Leg["totals"]).veterans).toBeDefined();
 
-      const without = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, record: false, limit: 3 });
+      const without = await query(slug, { groupBy: "votes.category_id", aggregate: { n: "count" }, record: false, limit: 3, perRecord: true });
       expect(without.results![0]).not.toHaveProperty("record");
       expect(without.results![0]).toHaveProperty("parent_id");
     });
@@ -441,7 +444,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
       expect(filtered.indexed).toBe(false);
       expect(filtered.reason).toMatch(/filter on votes.points.veterans \(\$gte\)/);
 
-      const agg = await query(slug, { groupBy: "votes.category_id", aggregate: { v: { sum: "votes.points.veterans" } }, limit: 1000, record: false });
+      const agg = await query(slug, { groupBy: "votes.category_id", aggregate: { v: { sum: "votes.points.veterans" } }, limit: 1000, record: false, perRecord: true });
       const oracle = legs.flatMap((d, id) => {
         const by = new Map<number, number>();
         for (const v of d.votes) by.set(v.category_id, (by.get(v.category_id) ?? 0) + v.points.veterans);
@@ -452,7 +455,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
     });
 
     it("groups by several keys named after the keys", async () => {
-      const agg = await query(slug, { groupBy: ["votes.category_id", "votes.label"], aggregate: { n: "count" }, filter: { party: "D" }, limit: 1000, record: false });
+      const agg = await query(slug, { groupBy: ["votes.category_id", "votes.label"], aggregate: { n: "count" }, filter: { party: "D" }, limit: 1000, record: false, perRecord: true });
       const oracle = legs.flatMap((d, id) => {
         if (d.party !== "D") return [];
         return d.votes
@@ -461,7 +464,7 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
       });
       expect(agg.results).toEqual(oracle);
 
-      const mixed = await query(slug, { groupBy: ["party", "votes.label"], aggregate: { n: "count" }, limit: 1000, record: false });
+      const mixed = await query(slug, { groupBy: ["party", "votes.label"], aggregate: { n: "count" }, limit: 1000, record: false, perRecord: true });
       expect(mixed.results![0]).toMatchObject({ parent_id: 1, party: "R", "votes.label": "v0", n: 1 });
       await expect(query(slug, { groupBy: ["a", "b", "c", "d"] })).rejects.toThrow(/at most 3 keys/);
     });

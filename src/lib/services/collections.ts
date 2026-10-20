@@ -2,7 +2,8 @@ import { db } from "@/lib/db";
 import { collections, collectionMembers, organizations, user, type CollectionRole } from "@/lib/db/schema";
 import { alias } from "drizzle-orm/pg-core";
 import { eq, and, sql, desc } from "drizzle-orm";
-import { createCollectionWithOwner, findAccessibleCollectionBySlug } from "@/lib/db/queries";
+import { createCollectionWithOwner } from "@/lib/db/queries";
+import { findAccessibleCollection } from "./resolve";
 import { describeCollection as describeCollectionFields } from "@/lib/describe";
 import { uniqueSlug } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
@@ -228,7 +229,7 @@ export async function createCollection(userId: string, organizationId: string, p
 }
 
 export async function getCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
   const collection = access.collection;
 
@@ -240,8 +241,10 @@ export async function getCollection(slug: string, userId: string) {
 }
 
 export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
+  const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const dbUpdates: Record<string, unknown> = { updatedAt: new Date() };
@@ -267,8 +270,10 @@ export async function updateCollection(slug: string, userId: string, updates: Re
 }
 
 export async function deleteCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "owner");
+  const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
 
   await db.transaction(async (tx) => {
     await dropCollectionTable(tx, access.collection.id);
@@ -279,8 +284,10 @@ export async function deleteCollection(slug: string, userId: string) {
 }
 
 export async function inferCollectionSchema(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const inferred = await inferSchema(collection.id);
@@ -299,8 +306,10 @@ export async function updateFieldDefinition(
   fieldName: string,
   updates: Partial<Pick<FieldDefinition, "type" | "options" | "position" | "hidden">>
 ) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const schema = (collection.schema as CollectionSchema) || { fields: [], version: 0, lastInferredAt: "" };
@@ -337,8 +346,10 @@ export async function addFieldDefinition(
     return { error: `Field name must be ${MAX_FIELD_NAME_LENGTH} characters or fewer`, status: 400 };
   }
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collectionId = access.collection.id;
 
   // Lock the row so concurrent addFieldDefinition / addFieldOption calls can't
@@ -392,8 +403,10 @@ export async function addFieldOption(
   if ("error" in validated) return validated;
   const trimmed = validated.value;
 
-  const access = await findAccessibleCollectionBySlug(slug, userId, "editor");
+  const access = await findAccessibleCollection(slug, userId, "editor");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collectionId = access.collection.id;
 
   // Fast path: skip the row lock when the cached snapshot already contains the
@@ -461,8 +474,10 @@ const STATS_MAX_FIELDS = 50;
  * fill rates for top-level keys (most common first, capped at 50).
  */
 export async function getCollectionStats(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const [summaryResult, statusResult, fieldResult] = await tableRows.collectionStats(collection.id, STATS_MAX_FIELDS);
@@ -503,8 +518,10 @@ export async function getCollectionStats(slug: string, userId: string) {
 }
 
 export async function describeCollection(slug: string, userId: string) {
-  const access = await findAccessibleCollectionBySlug(slug, userId, "viewer");
+  const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
+  // The argument may be the collection's name; continue with its slug.
+  slug = access.collection.slug;
   const collection = access.collection;
 
   const recordCount = await tableRows.countRecords(collection.id);
@@ -537,5 +554,7 @@ async function describeStorage(collection: { id: number; storage: unknown }) {
       rows: counts[u.table] ?? 0,
       reason: u.reason,
     })),
+    // Arrays of objects that are not unwound yet, and why.
+    not_unwound: registry.pending_unwinds ?? [],
   };
 }

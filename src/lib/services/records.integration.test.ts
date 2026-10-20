@@ -690,7 +690,8 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       ].sort((a, b) => b.n - a.n || a.chamber.localeCompare(b.chamber) || a.party.localeCompare(b.party)));
 
       const byPoints = await groups({ groupBy: ["party", "totals.veterans.points"], sort: "-count", limit: 1 });
-      expect(byPoints.results).toEqual([{ party: "R", "totals.veterans.points": "29", count: 3 }]);
+      // Group keys keep their JSON type.
+      expect(byPoints.results).toEqual([{ party: "R", "totals.veterans.points": 29, count: 3 }]);
     });
 
     it("rejects more than 3 group_by keys", async () => {

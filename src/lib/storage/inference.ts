@@ -33,7 +33,15 @@ import {
  * - unwind: a top-level key holding an array of objects in >= PRESENCE_RATIO
  *   of documents whose element keys pass the same declare rule, once the
  *   collection holds UNWIND_THRESHOLD elements under that key; depth one.
- *   Creating an unwind also projects the parent's declared fields.
+ *   The element count is the collection's running total (counted in SQL
+ *   after each batch), so an array that crosses the threshold over several
+ *   batches is unwound by the batch that crosses it. Creating an unwind
+ *   also projects the parent's declared fields. An array that is not
+ *   unwound gets a pending entry saying why (below the threshold, too few
+ *   documents hold it, mixed element shapes, no declarable element key).
+ * - long text (any value over MAX_PROJECTED_TEXT characters in the batch)
+ *   is prose, not a key: it is never declared, so it gets no column and no
+ *   btree (whose entries are limited to about 2.7 KB).
  */
 
 export const PRESENCE_RATIO = 0.9;
@@ -58,6 +66,9 @@ export function thresholdsFromEnv(env: Record<string, string | undefined> = proc
 /** Keys in a nested path that can be projected: two levels of object nesting. */
 export const MAX_PATH_DEPTH = 3;
 
+/** Longest text value a declared text field may hold in a batch. */
+export const MAX_PROJECTED_TEXT = 256;
+
 /** A path segment queries can address (the dotted-path syntax allows only these). */
 const PATH_SEGMENT_RE = /^[a-zA-Z0-9_]+$/;
 
@@ -74,9 +85,14 @@ export type ArrayCandidate = {
   batchElements: number;
 };
 
+/** An array of objects that is not unwound (yet), and why. */
+export type PendingUnwind = { path: string; reason: string };
+
 export type Decisions = {
   projections: Projection[];
   unwinds: Unwind[];
+  /** Arrays of objects seen in this batch that were not unwound, with the reason. */
+  pending: PendingUnwind[];
 };
 
 const STRICT_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -96,7 +112,7 @@ function scalarType(value: unknown): ProjectionType | null {
  */
 export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] {
   if (docs.length === 0) return [];
-  const stats = new Map<string, { present: number; types: Map<string, number>; dates: number }>();
+  const stats = new Map<string, { present: number; types: Map<string, number>; dates: number; longText: boolean }>();
 
   for (const doc of docs) {
     if (!isPlainObject(doc)) continue;
@@ -104,13 +120,14 @@ export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] 
       if (value === null || value === undefined || key.includes("\0")) continue;
       let stat = stats.get(key);
       if (!stat) {
-        stat = { present: 0, types: new Map(), dates: 0 };
+        stat = { present: 0, types: new Map(), dates: 0, longText: false };
         stats.set(key, stat);
       }
       stat.present++;
       const type = scalarType(value) ?? (Array.isArray(value) ? "array" : "object");
       stat.types.set(type, (stat.types.get(type) ?? 0) + 1);
       if (type === "text" && STRICT_DATE_RE.test(value as string)) stat.dates++;
+      if (type === "text" && (value as string).length > MAX_PROJECTED_TEXT) stat.longText = true;
     }
   }
 
@@ -124,7 +141,7 @@ export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] 
         dominant = type;
       }
     }
-    if (!dominant) continue;
+    if (!dominant || (dominant === "text" && stat.longText)) continue;
     if (dominant === "text" && stat.dates / (stat.types.get("text") ?? 1) >= TYPE_RATIO) dominant = "date";
     declared.push({ field, type: dominant, presence });
   }
@@ -132,7 +149,7 @@ export function declareFields(docs: Record<string, unknown>[]): DeclaredField[] 
   return declared;
 }
 
-type PathStat = { path: string[]; present: number; types: Map<string, number>; dates: number };
+type PathStat = { path: string[]; present: number; types: Map<string, number>; dates: number; longText: boolean };
 
 /**
  * Declared nested object scalars of a batch: paths of 2..MAX_PATH_DEPTH
@@ -165,13 +182,14 @@ export function declareNestedFields(docs: Record<string, unknown>[]): DeclaredFi
       const id = path.join(".");
       let stat = stats.get(id);
       if (!stat) {
-        stat = { path, present: 0, types: new Map(), dates: 0 };
+        stat = { path, present: 0, types: new Map(), dates: 0, longText: false };
         stats.set(id, stat);
       }
       stat.present++;
       const type = scalarType(value) ?? (Array.isArray(value) ? "array" : "object");
       stat.types.set(type, (stat.types.get(type) ?? 0) + 1);
       if (type === "text" && STRICT_DATE_RE.test(value as string)) stat.dates++;
+      if (type === "text" && (value as string).length > MAX_PROJECTED_TEXT) stat.longText = true;
     }
   };
 
@@ -199,7 +217,7 @@ export function declareNestedFields(docs: Record<string, unknown>[]): DeclaredFi
         dominant = type;
       }
     }
-    if (!dominant) continue;
+    if (!dominant || (dominant === "text" && stat.longText)) continue;
     if (dominant === "text" && stat.dates / (stat.types.get("text") ?? 1) >= TYPE_RATIO) dominant = "date";
     declared.push({ field, path: stat.path, type: dominant, presence });
   }
@@ -213,31 +231,61 @@ function isArrayOfObjects(value: unknown): value is Record<string, unknown>[] {
 
 /** Top-level keys that hold an array of objects in enough of the batch. */
 export function arrayCandidates(docs: Record<string, unknown>[]): ArrayCandidate[] {
-  if (docs.length === 0) return [];
-  const byPath = new Map<string, { present: number; elements: Record<string, unknown>[] }>();
+  return surveyArrays(docs).candidates;
+}
+
+/**
+ * Arrays of objects in a batch: the candidates for unwinding, and the
+ * arrays that hold objects but fail the rule, with the reason.
+ */
+export function surveyArrays(docs: Record<string, unknown>[]): { candidates: ArrayCandidate[]; rejected: PendingUnwind[] } {
+  if (docs.length === 0) return { candidates: [], rejected: [] };
+  const byPath = new Map<string, { present: number; mixed: number; elements: Record<string, unknown>[] }>();
   for (const doc of docs) {
     if (!isPlainObject(doc)) continue;
     for (const [key, value] of Object.entries(doc)) {
-      if (key.includes("\0") || !isArrayOfObjects(value)) continue;
+      if (key.includes("\0") || !Array.isArray(value)) continue;
+      const objects = value.filter(isPlainObject);
+      // Arrays of scalars are not unwound (the GIN serves them); only
+      // arrays holding objects are tracked.
+      const mixed = objects.length > 0 && objects.length < value.length;
+      if (!isArrayOfObjects(value) && !mixed) continue;
       let entry = byPath.get(key);
       if (!entry) {
-        entry = { present: 0, elements: [] };
+        entry = { present: 0, mixed: 0, elements: [] };
         byPath.set(key, entry);
       }
-      entry.present++;
-      entry.elements.push(...value);
+      if (mixed) entry.mixed++;
+      else {
+        entry.present++;
+        entry.elements.push(...value);
+      }
     }
   }
   const candidates: ArrayCandidate[] = [];
+  const rejected: PendingUnwind[] = [];
   for (const [path, entry] of byPath) {
+    if (entry.present === 0 && entry.mixed === 0) continue;
+    if (entry.elements.length === 0 && entry.mixed === 0) continue; // only empty arrays so far
     const presence = entry.present / docs.length;
-    if (presence < PRESENCE_RATIO) continue;
+    if (presence < PRESENCE_RATIO) {
+      rejected.push({
+        path,
+        reason: entry.mixed > 0
+          ? `'${path}' mixes objects with other values in ${entry.mixed} of ${docs.length} documents of the last batch, so it is an array of objects in only ${pct(presence)} of them (needs ${pct(PRESENCE_RATIO)}).`
+          : `'${path}' is an array of objects in only ${pct(presence)} of the last batch's documents (needs ${pct(PRESENCE_RATIO)}).`,
+      });
+      continue;
+    }
     const fields = declareFields(entry.elements);
-    if (fields.length === 0) continue;
+    if (fields.length === 0) {
+      rejected.push({ path, reason: `no key of '${path}''s elements is a short scalar present in ${pct(PRESENCE_RATIO)} of elements with one type, so there is nothing to index.` });
+      continue;
+    }
     candidates.push({ path, presence, fields, batchElements: entry.elements.length });
   }
   candidates.sort((a, b) => b.presence - a.presence || a.path.localeCompare(b.path));
-  return candidates;
+  return { candidates, rejected };
 }
 
 export type InferenceInput = {
@@ -260,13 +308,17 @@ export function inferDecisions(input: InferenceInput): Decisions {
   // Top-level fields first: they identify and group parent records (and
   // nested aggregates resolve them); nested paths take the room left.
   const declared = [...declareFields(docs), ...declareNestedFields(docs)];
-  const candidates = arrayCandidates(docs);
+  const survey = surveyArrays(docs);
+  const pending: PendingUnwind[] = survey.rejected.filter((r) => !findUnwind(registry, r.path));
 
   const unwinds: Unwind[] = [];
-  for (const candidate of candidates) {
+  for (const candidate of survey.candidates) {
     if (findUnwind(registry, candidate.path)) continue;
     const total = elementCounts[candidate.path] ?? 0;
-    if (total < thresholds.unwind) continue;
+    if (total < thresholds.unwind) {
+      pending.push({ path: candidate.path, reason: `'${candidate.path}' holds ${total} elements across the collection; it is unwound at ${thresholds.unwind}.` });
+      continue;
+    }
     const taken: string[] = [];
     const fields: UnwindField[] = candidate.fields.slice(0, MAX_PROJECTIONS).map((f) => {
       const column = uniqueColumnName(f.field, taken);
@@ -302,7 +354,7 @@ export function inferDecisions(input: InferenceInput): Decisions {
     }
   }
 
-  return { projections, unwinds };
+  return { projections, unwinds, pending };
 }
 
 function pct(ratio: number): string {

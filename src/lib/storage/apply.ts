@@ -3,7 +3,7 @@ import { collections } from "@/lib/db/schema";
 import { eq, sql } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { addProjection, addUnwind, toTextArrayLiteral, type Executor } from "./ddl";
-import { arrayCandidates, inferDecisions, thresholdsFromEnv, type Thresholds } from "./inference";
+import { arrayCandidates, inferDecisions, thresholdsFromEnv, type PendingUnwind, type Thresholds } from "./inference";
 import {
   collectionTableName,
   ident,
@@ -19,8 +19,11 @@ import {
 /**
  * Run inference for a batch that just landed in a layout='table' collection
  * and apply each decision in its own transaction, updating the registry as
- * it goes. Failures here must never fail the write that triggered them:
- * callers wrap this in try/catch and log.
+ * it goes. `docs` are the documents as stored (after a merge, the merged
+ * documents). One failed decision never blocks the others or the
+ * evaluated_rows count: an unwind that fails is recorded as pending with
+ * the error, and retried by the next write. Failures here must never fail
+ * the write that triggered them: callers wrap this in try/catch and log.
  */
 export async function applyInference(
   collection: { id: number; storage: unknown },
@@ -46,16 +49,34 @@ export async function applyInference(
   }
 
   const decisions = inferDecisions({ collectionId: collection.id, docs, registry, rowCount, elementCounts, thresholds });
+  const pending: PendingUnwind[] = [...decisions.pending];
 
   for (const unwind of decisions.unwinds) {
-    registry = await applyUnwind(collection.id, unwind);
+    try {
+      registry = await applyUnwind(collection.id, unwind);
+    } catch (err) {
+      console.error(`[storage] unwind of '${unwind.path}' failed for collection ${collection.id}`, err);
+      pending.push({ path: unwind.path, reason: `unwinding '${unwind.path}' failed (${errorMessage(err)}); it is retried after the next write.` });
+    }
   }
   for (const projection of decisions.projections) {
-    registry = await applyProjection(collection.id, projection);
+    try {
+      registry = await applyProjection(collection.id, projection);
+    } catch (err) {
+      console.error(`[storage] projection of '${projection.field}' failed for collection ${collection.id}`, err);
+    }
   }
 
-  registry = await bumpEvaluatedRows(collection.id, docs.length);
+  const evaluated = new Set([...arrayCandidates(docs).map((c) => c.path), ...pending.map((p) => p.path)]);
+  registry = await finishBatch(collection.id, docs.length, evaluated, pending);
   return registry;
+}
+
+function errorMessage(err: unknown): string {
+  const cause = (err as { cause?: unknown }).cause;
+  const e = cause instanceof Error ? cause : err;
+  const message = e instanceof Error ? e.message : String(e);
+  return message.split("\n")[0].slice(0, 200);
 }
 
 async function loadRegistry(collectionId: number): Promise<StorageRegistry> {
@@ -173,9 +194,17 @@ async function applyUnwind(collectionId: number, unwind: Unwind): Promise<Storag
   });
 }
 
-async function bumpEvaluatedRows(collectionId: number, n: number): Promise<StorageRegistry> {
-  return updateRegistry(collectionId, async (registry) => ({
-    ...registry,
-    evaluated_rows: registry.evaluated_rows + n,
-  }));
+/**
+ * Count the batch in evaluated_rows and refresh pending_unwinds: entries
+ * for the paths this batch evaluated are replaced, others kept, and any
+ * path that is unwound now is dropped.
+ */
+async function finishBatch(collectionId: number, n: number, evaluated: Set<string>, pending: PendingUnwind[]): Promise<StorageRegistry> {
+  return updateRegistry(collectionId, async (registry) => {
+    const unwound = new Set(registry.unwinds.map((u) => u.path));
+    const kept = (registry.pending_unwinds ?? []).filter((p) => !evaluated.has(p.path));
+    const next = [...kept, ...pending].filter((p) => !unwound.has(p.path)).sort((a, b) => a.path.localeCompare(b.path));
+    const { pending_unwinds: _old, ...rest } = registry;
+    return { ...rest, evaluated_rows: registry.evaluated_rows + n, ...(next.length > 0 ? { pending_unwinds: next } : {}) };
+  });
 }
