@@ -365,6 +365,22 @@ describe.skipIf(!TEST_DB_URL)("collection tables against real Postgres", () => {
     });
   });
 
+  it("dropping a collection's tables leaves collections whose id starts with the same digits", async () => {
+    const { createCollectionTable, dropCollectionTable } = await import("./ddl");
+    for (const id of [1, 10, 100, 1234]) await createCollectionTable(testDb, id);
+    for (const child of ["hc_1__votes", "hc_10__votes"]) {
+      await testDb.execute(sql`CREATE TABLE ${sql.identifier(child)} (id bigint)`);
+    }
+
+    await dropCollectionTable(testDb, 1);
+
+    expect(await tableExists("hc_1")).toBe(false);
+    expect(await tableExists("hc_1__votes")).toBe(false);
+    for (const name of ["hc_10", "hc_10__votes", "hc_100", "hc_1234"]) {
+      expect(await tableExists(name), name).toBe(true);
+    }
+  });
+
   describe("sorting, deeper paths, multi-key group_by and slim records", () => {
     type Leg = { name: string; party: string; totals: { veterans: { points: number; votes: number } }; votes: { category_id: number; label: string; points: { veterans: number } }[] };
     let slug: string;

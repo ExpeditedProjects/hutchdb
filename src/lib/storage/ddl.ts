@@ -45,11 +45,12 @@ export async function createCollectionTable(ex: Executor, collectionId: number):
 
 export async function dropCollectionTable(ex: Executor, collectionId: number): Promise<void> {
   // DROP ... CASCADE only removes the child tables' FK constraints, so the
-  // unwind tables (hc_<id>__*) are dropped by name first.
+  // unwind tables (hc_<id>__*) are dropped by name first. starts_with, not
+  // LIKE: "_" is a LIKE wildcard, so hc_1__% would also match hc_100.
   const parent = collectionTableName(collectionId);
   const children = await ex.execute(sql`
     SELECT tablename FROM pg_tables
-    WHERE schemaname = current_schema() AND tablename LIKE ${`${parent}\_\_%`}`);
+    WHERE schemaname = current_schema() AND starts_with(tablename, ${`${parent}__`})`);
   for (const row of children.rows as { tablename: string }[]) {
     await ex.execute(sql`DROP TABLE IF EXISTS ${ident(row.tablename)} CASCADE`);
   }
