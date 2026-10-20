@@ -446,6 +446,28 @@ describe('query, store and import descriptions', () => {
     await registeredTools.get('hutch_query_records')!({ slug: 's', group_by: ['chamber', 'party'], aggregate: { n: 'count' }, sort: '-n', limit: 10 })
     expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ groupBy: ['chamber', 'party'], sort: '-n', limit: 10 }))
   })
+
+  it('accepts time_bucket on a data field, documents $size, expressions and created_at as insert time, and forwards them', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const shape = shapeOf('hutch_query_records')
+    expect(shape.time_bucket.safeParse('day').success).toBe(true)
+    expect(shape.time_bucket.safeParse({ field: 'ts', unit: 'day' }).success).toBe(true)
+    expect(shape.time_bucket.safeParse({ unit: 'day' }).success).toBe(false)
+    expect(shape.time_bucket.description).toMatch(/\{"field": "ts", "unit": "day"\}.*UTC/)
+    expect(shape.time_bucket.description).toMatch(/buckets by created_at, when the record was stored/)
+    expect(shape.sort.description).toMatch(/to sort by a date in your data, name its field/)
+    expect(shape.filter.description).toContain('{"members": {"$size": {"$gt": 30}}}')
+    expect(shape.aggregate.description).toContain('{"revenue": {"sum": {"$multiply": ["items.qty", "items.price"]}}}')
+    expect(shape.aggregate.description).toMatch(/\$divide \(by zero gives null\)/)
+    expect(shape.group_by.description).toMatch(/null in every group.*`warnings`/)
+    const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
+    expect(McpServer.lastOptions?.instructions).toMatch(/\$contains, \$size/)
+
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [], total: 0 } as never)
+    const aggregate = { revenue: { sum: { $multiply: ['items.qty', 'items.price'] } } }
+    await registeredTools.get('hutch_query_records')!({ slug: 's', time_bucket: { field: 'ts', unit: 'day' }, aggregate })
+    expect(recordService.queryRecords).toHaveBeenCalledWith('s', 'user-1', expect.objectContaining({ timeBucket: { field: 'ts', unit: 'day' }, aggregate }))
+  })
 })
 
 describe('storage-aware descriptions', () => {
