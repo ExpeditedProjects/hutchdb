@@ -1138,9 +1138,9 @@ function compileAggregate(
         const accepted = [...ordinals.keys()].filter((k) => k !== "parent_id");
         throw new Error(`Invalid sort field '${field}' for an aggregate query — sort accepts an aggregate alias or a group_by key here (${accepted.join(", ")})`);
       }
+      // An aggregate sort orders computed groups: no index serves it, so it is not a clause for `indexed`/`reason`.
       first.push(sql`${sql.raw(String(ordinal))} ${dir} NULLS LAST`);
       chosen.push(ordinal);
-      clauses.push({ label: `sort on ${field}`, indexes: [] });
     }
     order = [...first, ...order.filter((_, i) => !chosen.includes(defaultOrder[i]))];
   }
@@ -1245,11 +1245,19 @@ export function summarizePlan(root: PlanNode, tablePrefix: string, clauses: Clau
   const plan = !scan ? root["Node Type"]
     : viaIndex ? `${scan["Node Type"]} using ${viaIndex} on ${scan["Relation Name"]}, serving none of the query's clauses`
     : `${scan["Node Type"]} on ${scan["Relation Name"]}`;
-  const notes = [...new Set(clauses.flatMap((c) => (c.note ? [c.note] : [])))];
-  const how = viaIndex ? `${viaIndex} only supplied row order or the live-row check, and the clauses were evaluated over the stored documents` : "evaluated over the stored documents";
+  const notes = [...new Set(clauses.flatMap((c) => (c.note ? [c.note] : [])))].map((n) => ` ${n}.`).join("");
+  // Name what an index could have served separately from what no index
+  // can serve, so the reason never suggests an index for the latter.
+  const servable = clauses.filter((c) => c.indexes.length > 0).map((c) => c.label);
+  const unservable = clauses.filter((c) => c.indexes.length === 0).map((c) => c.label);
+  const parts: string[] = [];
+  if (servable.length > 0) parts.push(`No index served ${servable.join(", ")}`);
+  if (unservable.length > 0) parts.push(`no index can serve ${unservable.join(", ")}`);
+  const how = viaIndex ? `${viaIndex} only supplied row order or the live-row check, and the clauses were evaluated over the stored documents` : "the clauses were evaluated over the stored documents";
+  const lead = parts.join("; ");
   const reason = clauses.length === 0
-    ? "The query has no filter, search or sort to serve; rows were read in storage order."
-    : `No index served ${clauses.map((c) => c.label).join(", ")}; ${how}.${notes.map((n) => ` ${n}.`).join("")}`;
+    ? "The query has no filter, search or sort an index could serve; rows were read in storage order."
+    : `${lead.charAt(0).toUpperCase()}${lead.slice(1)}; ${how}.${notes}`;
   return { indexed: false, plan, reason };
 }
 

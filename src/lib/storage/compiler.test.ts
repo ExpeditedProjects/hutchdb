@@ -233,7 +233,7 @@ describe('summarizePlan', () => {
     const report = summarizePlan(plan, 'hc_12', [{ label: 'sort on totals.veterans.points', indexes: [] }])
     expect(report.indexed).toBe(false)
     expect(report.plan).toBe('Bitmap Heap Scan on hc_12')
-    expect(report.reason).toMatch(/No index served sort on totals.veterans.points/)
+    expect(report.reason).toMatch(/No index can serve sort on totals.veterans.points/)
     // The same index does count when the caller filtered on the unique key.
     expect(summarizePlan(plan, 'hc_12', [{ label: 'filter on slug', indexes: ['hc_12_uk'] }]).indexed).toBe(true)
   })
@@ -737,5 +737,23 @@ describe('compileQuery: limit 0 counts', () => {
 
   it('a negative limit is an error', () => {
     expect(() => compileQuery(collection, { limit: -1 })).toThrow(/0 or more/)
+  })
+})
+
+describe('indexed reason wording', () => {
+  it('names clauses an index could have served apart from those none can serve', () => {
+    const plan = { 'Node Type': 'Seq Scan', 'Relation Name': 'hc_12' }
+    const report = summarizePlan(plan, 'hc_12', [
+      { label: 'filter on price', indexes: ['hc_12_p_price_idx'] },
+      { label: 'filter on title ($contains)', indexes: [] },
+    ])
+    expect(report.reason).toBe('No index served filter on price; no index can serve filter on title ($contains); the clauses were evaluated over the stored documents.')
+  })
+
+  it('an aggregate sort is not a clause, so the reason never suggests an index for it', () => {
+    const compiled = compileQuery(collection, { groupBy: 'status', aggregate: { n: 'count' }, sort: '-n' })
+    expect(compiled.clauses).toEqual([])
+    const report = summarizePlan({ 'Node Type': 'Seq Scan', 'Relation Name': 'hc_12' }, 'hc_12', compiled.clauses)
+    expect(report.reason).not.toMatch(/sort on/)
   })
 })
