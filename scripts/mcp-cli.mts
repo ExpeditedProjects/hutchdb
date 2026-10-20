@@ -5,10 +5,15 @@
 //   npx tsx scripts/mcp-cli.mts call <tool> '<json args>'
 //   npx tsx scripts/mcp-cli.mts call <tool> @args.json
 //
+// stdout is always pure JSON (pipe it to jq); human-readable lines go to stderr:
+// `call` prints a write tool's summary line on stderr and its JSON on stdout,
+// `list` prints the readable listing on stderr and the tools as JSON on stdout.
+//
 // Env: MCP_URL (default http://localhost:3111/api/mcp), MCP_API_KEY (optional bearer).
 // JSON-RPC / SSE handling adapted from scripts/smoke.ts.
 
 import { readFileSync } from "node:fs";
+import { splitToolText } from "../src/lib/mcp/cli-output";
 
 const MCP_URL = process.env.MCP_URL ?? "http://localhost:3111/api/mcp";
 const API_KEY = process.env.MCP_API_KEY;
@@ -127,13 +132,15 @@ async function listTools(namesOnly: boolean): Promise<void> {
   const listed = await rpc("tools/list");
   const tools = (listed.tools ?? []) as ToolInfo[];
   for (const tool of tools) {
-    console.log(tool.name);
+    console.error(tool.name);
     if (namesOnly) continue;
     const description = (tool.description ?? "").trim();
-    if (description) console.log(description.replace(/^/gm, "  "));
-    console.log(`  input: ${compactSchema(tool.inputSchema)}`);
-    console.log();
+    if (description) console.error(description.replace(/^/gm, "  "));
+    console.error(`  input: ${compactSchema(tool.inputSchema)}`);
+    console.error();
   }
+  const json = namesOnly ? tools.map((t) => t.name) : tools.map((t) => ({ name: t.name, description: t.description, input: compactSchema(t.inputSchema) }));
+  console.log(JSON.stringify(json, null, 2));
 }
 
 function parseArgs(raw: string | undefined): Record<string, unknown> {
@@ -159,7 +166,9 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<vo
     console.error(text);
     process.exit(1);
   }
-  console.log(text);
+  const { human, json } = splitToolText(text);
+  if (human) console.error(human);
+  if (json !== null) console.log(json);
 }
 
 async function main(): Promise<void> {
