@@ -94,7 +94,15 @@ describe.skipIf(!TEST_DB_URL)("per-collection storage against real Postgres", ()
 
   async function store(collection: string, recs: Record<string, unknown>[]): Promise<string> {
     const result = ok(await recordsSvc.createRecords(USER_ID, ORG_ID, { collection, records: recs, return: "summary" }));
+    // Writes only queue index builds; run the background builder as the MCP route's after() would.
+    await settle();
     return (result as { collection: { slug: string } }).collection.slug;
+  }
+
+  /** What the MCP route runs after a response: build every queued index and unwind. */
+  async function settle() {
+    const { buildPendingIndexes } = await import("./builder");
+    await buildPendingIndexes();
   }
 
   async function collectionRow(slug: string) {

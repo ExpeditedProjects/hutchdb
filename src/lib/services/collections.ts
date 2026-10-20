@@ -11,7 +11,8 @@ import { inferSchema, mergeSchema, CollectionSchema, FieldDefinition, isSelectab
 import { DEFAULT_RECORD_STATUS, FIELD_NAME_RE, MAX_FIELD_NAME_LENGTH } from "@/lib/constants";
 import { validateTrimmedLength } from "@/lib/validation";
 import { seedAutoViews } from "./views";
-import { queryIndexes, readRegistry } from "@/lib/storage/registry";
+import { queryIndexes, readRegistry, type IndexBuild } from "@/lib/storage/registry";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import { dropCollectionTable } from "@/lib/storage/ddl";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
@@ -537,22 +538,35 @@ export async function describeCollection(slug: string, userId: string) {
   };
 }
 
+/** An entry's build state for describe: ready unless still pending, building or failed (with a generic reason). */
+function buildState(build: IndexBuild | undefined) {
+  if (!build || build.state === "ready") return { state: "ready" as const };
+  return {
+    state: build.state,
+    ...(build.state === "failed" ? { error: build.error, retry_after: build.retry_after } : {}),
+  };
+}
+
 /**
  * What inference has created for a collection: projected fields and
- * unwound arrays with their reasons and child row counts.
+ * unwound arrays with their reasons, build states and child row counts.
  */
 async function describeStorage(collection: { id: number; storage: unknown }) {
+  queueDueIndexBuild(collection);
   const registry = readRegistry(collection.storage);
-  const counts = await tableRows.childTableCounts(registry.unwinds.map((u) => u.table));
+  const ready = registry.unwinds.filter((u) => !u.build || u.build.state === "ready");
+  const counts = await tableRows.childTableCounts(ready.map((u) => u.table));
   return {
     evaluated_rows: registry.evaluated_rows,
-    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason })),
+    projections: registry.projections.map((p) => ({ field: p.field, type: p.type, reason: p.reason, ...buildState(p.build) })),
     unwinds: registry.unwinds.map((u) => ({
       path: u.path,
       fields: u.fields.map((f) => ({ field: f.field, type: f.type })),
       rows: counts[u.table] ?? 0,
       reason: u.reason,
+      ...buildState(u.build),
     })),
+    ...(registry.search_index ? { search_index: { reason: registry.search_index.reason, ...buildState(registry.search_index.build) } } : {}),
     // Arrays of objects that are not unwound yet, and why.
     not_unwound: registry.pending_unwinds ?? [],
     // Every index that can serve a query, including the GIN on the documents.

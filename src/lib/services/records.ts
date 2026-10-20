@@ -14,6 +14,7 @@ import { isPlainObject } from "@/lib/validation";
 import { readRegistry, type StorageRegistry } from "@/lib/storage/registry";
 import { collectionTableExists, createCollectionTable, setUniqueKey } from "@/lib/storage/ddl";
 import { applyInference, markMixedProjections, recheckMixedProjections, updateRegistry } from "@/lib/storage/apply";
+import { queueDueIndexBuild } from "@/lib/storage/build-queue";
 import * as tableRows from "@/lib/storage/rows";
 import { COLLECTION_QUERY_CONCURRENCY, mapLimit } from "@/lib/map-limit";
 import { queryTable, tableFilterWhere, type TableQueryParams } from "@/lib/storage/compiler";
@@ -142,15 +143,16 @@ export async function createRecords(userId: string, organizationId: string, para
     await db.update(collections).set({ updatedAt: new Date() }).where(eq(collections.id, collection.id));
   }
 
-  // Storage inference (projections, unwinds) runs after every successful
-  // write. It must never fail the write.
+  // Storage inference (projections, unwinds, search index) runs after every
+  // successful write and only queues builds; they run in the background
+  // after the response (build-queue.ts). It must never fail the write.
   let storageNote: string | undefined;
   try {
     const before = readRegistry(collection.storage);
     await markMixedProjections(collection.id, storedDocs);
-    const started = Date.now();
     const after = await applyInference(collection, storedDocs);
-    storageNote = storageChangeNote(before, after, Date.now() - started);
+    storageNote = storageChangeNote(before, after);
+    queueDueIndexBuild({ id: collection.id, storage: after });
   } catch (err) {
     console.error(`[storage] inference failed for collection ${collection.id}`, err);
   }
@@ -203,18 +205,20 @@ export function slugNote(collection: { name: string; slug: string }): { use: str
 }
 
 /**
- * What this write's inference added — fields made queryable as indexed
- * columns, arrays unwound into child tables — and that building them is
- * why the write took longer. Undefined when it added nothing.
+ * What this write's inference queued — fields to index, arrays to unwind
+ * into child tables, the full-text search index — and that they are built
+ * in the background. Undefined when it queued nothing.
  */
-export function storageChangeNote(before: StorageRegistry, after: StorageRegistry, ms: number): string | undefined {
+export function storageChangeNote(before: StorageRegistry, after: StorageRegistry): string | undefined {
   const projected = after.projections.filter((p) => !before.projections.some((b) => b.column === p.column)).map((p) => p.field);
   const unwound = after.unwinds.filter((u) => !before.unwinds.some((b) => b.path === u.path)).map((u) => u.path);
-  if (projected.length === 0 && unwound.length === 0) return undefined;
+  const search = after.search_index !== undefined && before.search_index === undefined;
+  if (projected.length === 0 && unwound.length === 0 && !search) return undefined;
   const parts: string[] = [];
-  if (projected.length > 0) parts.push(`made ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")} queryable as indexed ${projected.length === 1 ? "column" : "columns"}`);
-  if (unwound.length > 0) parts.push(`unwound ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can now use indexes)`);
-  return `This batch ${parts.join(" and ")}; building them over the existing records took ${ms} ms of this write, which is why it was slower than usual. This is one-time work.`;
+  if (projected.length > 0) parts.push(`indexes on ${projected.length === 1 ? "field" : "fields"} ${projected.map((f) => `'${f}'`).join(", ")}`);
+  if (unwound.length > 0) parts.push(`unwinding ${unwound.map((p) => `'${p}'`).join(", ")} into ${unwound.length === 1 ? "a queryable table" : "queryable tables"} (so filters and aggregates on ${unwound.length === 1 ? "its" : "their"} elements can use indexes)`);
+  if (search) parts.push("a full-text index for search");
+  return `This batch queued ${parts.join(", ")}. They are built in the background shortly after this write (hutch_describe_collection shows each one's state under storage.indexes); until they are ready, queries return the same results without them.`;
 }
 
 type CollectionRow = typeof collections.$inferSelect;
@@ -345,6 +349,7 @@ export async function queryRecords(slug: string, userId: string, params: Omit<Ta
   const access = await findAccessibleCollection(slug, userId, "viewer");
   if (!access) return null;
 
+  queueDueIndexBuild(access.collection);
   return queryTable(access.collection, params);
 }
 
@@ -516,12 +521,13 @@ export async function searchGlobal(userId: string, search: string, limit: number
   const clampedLimit = Math.max(1, Math.min(Math.trunc(limit) || 10, 50));
 
   const accessible = await db
-    .select({ id: collections.id, name: collections.name, slug: collections.slug })
+    .select({ id: collections.id, name: collections.name, slug: collections.slug, storage: collections.storage })
     .from(collections)
     .innerJoin(
       collectionMembers,
       and(eq(collectionMembers.collectionId, collections.id), eq(collectionMembers.userId, userId))
     );
+  for (const coll of accessible) queueDueIndexBuild(coll);
   // Bounded concurrency; results are concatenated in collection order, as
   // the serial loop did, so the stable sort below ranks ties the same way.
   const perCollection = await mapLimit(accessible, COLLECTION_QUERY_CONCURRENCY, async (coll) =>

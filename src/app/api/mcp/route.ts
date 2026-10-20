@@ -1,8 +1,10 @@
+import { after } from "next/server";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { createMcpServer } from "@/lib/mcp/server";
 import { authenticate } from "@/lib/auth/seam";
 import { publicBaseUrl } from "@/lib/base-url";
 import { MCP_MAX_REQUEST_BODY_BYTES } from "@/lib/constants";
+import { withIndexBuildQueue } from "@/lib/storage/build-queue";
 
 function unauthorizedResponse(): Response {
   return new Response(JSON.stringify({ error: "Unauthorized" }), {
@@ -39,14 +41,20 @@ async function handleMcpRequest(req: Request): Promise<Response> {
   const ctx = await authenticate(req);
   if (!ctx) return unauthorizedResponse();
 
-  return handler.fetch(req, {
-    authInfo: {
-      token: "",
-      clientId: ctx.userId,
-      scopes: [],
-      // Links in tool responses point at the configured public URL, else the origin this request reached.
-      extra: { userId: ctx.userId, orgId: ctx.orgId, baseUrl: publicBaseUrl(req) },
-    },
+  // Index builds queued while the tools run (writes that crossed an
+  // inference threshold, reads that found work left pending) are built
+  // after the response is sent, never inside the request.
+  return withIndexBuildQueue((drain) => {
+    after(drain);
+    return handler.fetch(req, {
+      authInfo: {
+        token: "",
+        clientId: ctx.userId,
+        scopes: [],
+        // Links in tool responses point at the configured public URL, else the origin this request reached.
+        extra: { userId: ctx.userId, orgId: ctx.orgId, baseUrl: publicBaseUrl(req) },
+      },
+    });
   });
 }
 

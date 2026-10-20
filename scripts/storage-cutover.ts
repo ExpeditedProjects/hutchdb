@@ -10,7 +10,11 @@
 // `records` after every collection has been copied and verified; without it
 // the old table is left in place. Re-running skips finished collections.
 //
+// After inference it builds the queued indexes and unwinds (the background
+// builder, src/lib/storage/builder.ts) before exiting.
+//
 // Env: HUTCH_DATABASE_URL (or DATABASE_URL); .env.local is read if present.
+// HUTCH_INDEX_BUILD_TIMEOUT_MS bounds each index build (default 10 min).
 // Run it in a quiet minute: there is no write lock.
 
 import { spawnSync } from "node:child_process";
@@ -87,11 +91,17 @@ async function main() {
     if (opts.json) console.log(JSON.stringify({ dump, ...report }, null, 2));
     const warnings = report.copied.flatMap((c) => c.warnings.map((w) => `${c.slug}: ${w}`));
     const failed = report.inference.filter((r) => r.error);
-    console.log(`done: ${report.copied.filter((c) => c.status === "copied").length} copied, ${report.copied.filter((c) => c.status === "already done").length} already done, ${report.inference.length} inferred${report.dropped ? ", records dropped" : ""}${dump ? `; backup ${dump}` : ""}`);
+    const failedBuilds = report.builds.filter((b) => b.state === "failed");
+    console.log(`done: ${report.copied.filter((c) => c.status === "copied").length} copied, ${report.copied.filter((c) => c.status === "already done").length} already done, ${report.inference.length} inferred, ${report.builds.length - failedBuilds.length} indexes built${report.dropped ? ", records dropped" : ""}${dump ? `; backup ${dump}` : ""}`);
     for (const w of warnings) console.log(`warning: ${w}`);
     for (const r of failed) console.log(`inference failed: ${r.slug}: ${r.error}`);
+    for (const b of failedBuilds) console.log(`build failed: ${b.slug}: ${b.kind} ${b.key}: ${b.error}`);
     if (failed.length > 0) {
       console.error(`rows copied and verified; inference failed for: ${failed.map((r) => r.slug).join(", ")}; re-run to retry`);
+      process.exitCode = 1;
+    }
+    if (failedBuilds.length > 0) {
+      console.error(`rows copied and verified; ${failedBuilds.length} index builds failed; re-run or \`npm run storage:build-indexes\` to retry`);
       process.exitCode = 1;
     }
   } catch (err) {

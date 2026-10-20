@@ -1,8 +1,21 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
-const { authenticateMock, transportHandleRequest } = vi.hoisted(() => ({
+const { authenticateMock, transportHandleRequest, afterMock, buildMock } = vi.hoisted(() => ({
   authenticateMock: vi.fn(),
   transportHandleRequest: vi.fn(),
+  afterMock: vi.fn(),
+  buildMock: vi.fn(),
+}))
+
+// after() only works inside a Next request scope; record the callbacks instead.
+vi.mock('next/server', () => ({
+  after: afterMock,
+}))
+
+vi.mock('@/lib/storage/builder', () => ({
+  buildPendingIndexes: buildMock,
+  buildTimeoutMs: () => 600_000,
+  staleBuildingMs: () => 660_000,
 }))
 
 vi.mock('@/lib/auth/seam', () => ({
@@ -22,6 +35,7 @@ vi.mock('@modelcontextprotocol/server', () => ({
 }))
 
 import { POST } from './route'
+import { queueIndexBuild } from '@/lib/storage/build-queue'
 
 function jsonRpcRequest(headers: Record<string, string> = {}, method = 'tools/list'): Request {
   return new Request('http://localhost/api/mcp', {
@@ -80,5 +94,50 @@ describe('POST /api/mcp — links in tool responses', () => {
     await POST(new Request('http://localhost:3116/api/mcp', { method: 'POST', body: '{}' }))
     const [, options] = transportHandleRequest.mock.calls[0]
     expect(options.authInfo.extra).toEqual({ userId: 'u1', orgId: 'o1', baseUrl: 'http://localhost:3116' })
+  })
+})
+
+describe('POST /api/mcp — background index builds', () => {
+  it('builds the collections queued during the request after the response, and only then', async () => {
+    authenticateMock.mockResolvedValue({ userId: 'u1', orgId: 'o1' })
+    buildMock.mockResolvedValue({ collections: [], failed: 0 })
+    transportHandleRequest.mockImplementation(async () => {
+      // A tool call inside the request queues work (a write that crossed a threshold).
+      expect(queueIndexBuild(7)).toBe(true)
+      queueIndexBuild(7)
+      queueIndexBuild(9)
+      return new Response('ok', { status: 200 })
+    })
+    const res = await POST(jsonRpcRequest({}, 'tools/call'))
+    expect(res.status).toBe(200)
+    expect(afterMock).toHaveBeenCalledTimes(1)
+    expect(buildMock).not.toHaveBeenCalled()
+
+    await afterMock.mock.calls[0][0]()
+    expect(buildMock.mock.calls.map(([opts]) => opts.collectionId)).toEqual([7, 9])
+    // Outside a request nothing is queued.
+    expect(queueIndexBuild(11)).toBe(false)
+  })
+
+  it('a failing build is logged, not thrown, and the next queued collection still builds', async () => {
+    authenticateMock.mockResolvedValue({ userId: 'u1', orgId: 'o1' })
+    buildMock.mockRejectedValueOnce(new Error('no connection')).mockResolvedValue({ collections: [], failed: 0 })
+    transportHandleRequest.mockImplementation(async () => {
+      queueIndexBuild(1)
+      queueIndexBuild(2)
+      return new Response('ok', { status: 200 })
+    })
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    await POST(jsonRpcRequest({}, 'tools/call'))
+    await expect(afterMock.mock.calls[0][0]()).resolves.toBeUndefined()
+    expect(buildMock).toHaveBeenCalledTimes(2)
+    expect(error).toHaveBeenCalled()
+    error.mockRestore()
+  })
+
+  it('registers no build work for a request that fails authentication', async () => {
+    authenticateMock.mockResolvedValue(null)
+    await POST(jsonRpcRequest())
+    expect(afterMock).not.toHaveBeenCalled()
   })
 })
