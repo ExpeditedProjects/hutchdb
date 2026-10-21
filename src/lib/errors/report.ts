@@ -9,13 +9,18 @@
 export type ErrorContext = Record<string, string | number | boolean | undefined>;
 export type ErrorReporter = (err: unknown, context: ErrorContext) => void;
 
-let reporter: ErrorReporter | null = null;
+// Held on globalThis, not in module scope: bundlers can inline this module
+// into several chunks (Next's instrumentation hook and each route), and a
+// module-scoped variable would give each copy its own reporter.
+const REPORTER_KEY = Symbol.for("hutch.errorReporter");
+type ReporterHolder = { [REPORTER_KEY]?: ErrorReporter | null };
 
 export function setErrorReporter(fn: ErrorReporter | null): void {
-  reporter = fn;
+  (globalThis as ReporterHolder)[REPORTER_KEY] = fn;
 }
 
 export function reportError(err: unknown, context: ErrorContext = {}): void {
+  const reporter = (globalThis as ReporterHolder)[REPORTER_KEY];
   if (!reporter) return;
   try {
     reporter(err, context);

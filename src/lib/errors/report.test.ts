@@ -30,6 +30,16 @@ describe("reportError", () => {
     expect(() => reportError(new Error("boom"))).not.toThrow();
   });
 
+  it("shares the reporter across separate copies of the module", async () => {
+    const reporter = vi.fn();
+    setErrorReporter(reporter);
+    vi.resetModules();
+    const copy = await import("./report");
+    const err = new Error("boom");
+    copy.reportError(err, { tool: "t" });
+    expect(reporter).toHaveBeenCalledWith(err, { tool: "t" });
+  });
+
   it("stops reporting after the reporter is cleared", () => {
     const reporter = vi.fn();
     setErrorReporter(reporter);
