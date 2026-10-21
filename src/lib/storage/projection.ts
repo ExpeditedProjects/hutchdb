@@ -1,4 +1,5 @@
 import { isPlainObject } from "@/lib/validation";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 
 /**
  * Response shaping for records: `fields` (which keys of each document to
@@ -109,26 +110,26 @@ export const ARRAY_OPS_HELP =
 export function parseArrayOps(arraySort: Record<string, unknown> | undefined, arrayLimit: Record<string, unknown> | undefined): ArrayOps {
   const ops = new Map<string, { path: string; sort: ArraySortKey[]; limit?: number }>();
   const entry = (path: string, param: string) => {
-    if (!PATH_RE.test(path)) throw new Error(`Invalid ${param} path '${path}' — ${ARRAY_OPS_HELP}`);
+    if (!PATH_RE.test(path)) throw new ClientInputError(`Invalid ${param} path '${path}' — ${ARRAY_OPS_HELP}`);
     const op = ops.get(path) ?? { path, sort: [] };
     ops.set(path, op);
     return op;
   };
   for (const [path, spec] of Object.entries(arraySort ?? {})) {
     const raw = typeof spec === "string" ? spec.split(",") : Array.isArray(spec) && spec.every((s) => typeof s === "string") ? spec.flatMap((s: string) => s.split(",")) : null;
-    if (!raw) throw new Error(`array_sort['${path}'] must be a string or an array of strings — ${ARRAY_OPS_HELP}`);
+    if (!raw) throw new ClientInputError(`array_sort['${path}'] must be a string or an array of strings — ${ARRAY_OPS_HELP}`);
     const keys = raw.map((k) => k.trim());
-    if (keys.length > MAX_ARRAY_SORT_KEYS) throw new Error(`array_sort['${path}'] takes at most ${MAX_ARRAY_SORT_KEYS} keys, got ${keys.length}`);
+    if (keys.length > MAX_ARRAY_SORT_KEYS) throw new ClientInputError(`array_sort['${path}'] takes at most ${MAX_ARRAY_SORT_KEYS} keys, got ${keys.length}`);
     const op = entry(path, "array_sort");
     for (const key of keys) {
       const descending = key.startsWith("-");
       const field = descending ? key.slice(1) : key;
-      if (!PATH_RE.test(field)) throw new Error(`Invalid array_sort key '${key}' for '${path}' — ${ARRAY_OPS_HELP}`);
+      if (!PATH_RE.test(field)) throw new ClientInputError(`Invalid array_sort key '${key}' for '${path}' — ${ARRAY_OPS_HELP}`);
       op.sort.push({ segments: field.split("."), descending });
     }
   }
   for (const [path, n] of Object.entries(arrayLimit ?? {})) {
-    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) throw new Error(`array_limit['${path}'] must be a whole number of elements (0 or more)`);
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 0) throw new ClientInputError(`array_limit['${path}'] must be a whole number of elements (0 or more)`);
     entry(path, "array_limit").limit = n;
   }
   return [...ops.values()];

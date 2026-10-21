@@ -14,6 +14,7 @@ import {
   type QueryParams,
 } from "@/lib/db/queries";
 import { isPlainObject } from "@/lib/validation";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 import { formatTimeout, isStatementTimeout } from "@/lib/db/errors";
 import {
   collectionTableName,
@@ -197,7 +198,7 @@ function pathArray(segments: string[]): SQL {
 
 function assertPathName(field: string): void {
   if (!PATH_RE.test(field)) {
-    throw new Error(`Invalid field name '${field}' — only letters, numbers, underscores, and dots between path segments are allowed`);
+    throw new ClientInputError(`Invalid field name '${field}' — only letters, numbers, underscores, and dots between path segments are allowed`);
   }
 }
 
@@ -297,26 +298,26 @@ function jsonpathConditions(data: SQL, path: string, conds: PathCondition[]): SQ
       }
     } else if (Object.hasOwn(COMPARISONS, op)) {
       const lit = jsonpathLiteral(operand);
-      if (typeof operand !== "number" && typeof operand !== "string") throw new Error(`${op} requires a number or string operand`);
+      if (typeof operand !== "number" && typeof operand !== "string") throw new ClientInputError(`${op} requires a number or string operand`);
       same.push(`@${accessor} ${COMPARISONS[op]} ${lit}`);
     } else if (op === "$in" || op === "$nin") {
-      if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
-      if (operand.length > IN_LIST_LIMIT) throw new Error(`$in/$nin arrays are limited to ${IN_LIST_LIMIT} elements`);
+      if (!Array.isArray(operand)) throw new ClientInputError(`${op} requires an array operand`);
+      if (operand.length > IN_LIST_LIMIT) throw new ClientInputError(`$in/$nin arrays are limited to ${IN_LIST_LIMIT} elements`);
       const lits = operand.map(jsonpathLiteral);
-      if (lits.some((l) => l === null)) throw new Error(`${op} on a nested path requires scalar values`);
+      if (lits.some((l) => l === null)) throw new ClientInputError(`${op} on a nested path requires scalar values`);
       const predicate = lits.length === 0 ? "false" : lits.map((l) => `@${accessor} == ${l}`).join(" || ");
       if (op === "$in") same.push(`(${predicate})`);
       else out.push(sql`NOT (${exists(predicate)})`);
     } else if (op === "$exists") {
-      if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+      if (typeof operand !== "boolean") throw new ClientInputError("$exists requires a boolean operand");
       if (operand) same.push(`exists(@${accessor})`);
       else out.push(sql`NOT (${exists(`exists(@${accessor})`)})`);
     } else if (op === "$contains") {
-      if (typeof operand !== "string") throw new Error("$contains requires a string operand");
+      if (typeof operand !== "string") throw new ClientInputError("$contains requires a string operand");
       const pattern = JSON.stringify(operand.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
       same.push(`@${accessor} like_regex ${pattern} flag "i"`);
     } else {
-      throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
+      throw new ClientInputError(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
     }
   }
   if (same.length > 0) out.unshift(exists(same.join(" && ")));
@@ -380,20 +381,20 @@ function likePattern(operand: string): string {
 
 function assertOperand(op: string, operand: unknown): void {
   if (Object.hasOwn(COMPARISONS, op)) {
-    if (typeof operand !== "number" && typeof operand !== "string") throw new Error(`${op} requires a number or string operand`);
+    if (typeof operand !== "number" && typeof operand !== "string") throw new ClientInputError(`${op} requires a number or string operand`);
   } else if (op === "$in" || op === "$nin") {
-    if (!Array.isArray(operand)) throw new Error(`${op} requires an array operand`);
-    if (operand.length > IN_LIST_LIMIT) throw new Error(`$in/$nin arrays are limited to ${IN_LIST_LIMIT} elements`);
+    if (!Array.isArray(operand)) throw new ClientInputError(`${op} requires an array operand`);
+    if (operand.length > IN_LIST_LIMIT) throw new ClientInputError(`$in/$nin arrays are limited to ${IN_LIST_LIMIT} elements`);
   } else if (op === "$exists") {
-    if (typeof operand !== "boolean") throw new Error("$exists requires a boolean operand");
+    if (typeof operand !== "boolean") throw new ClientInputError("$exists requires a boolean operand");
   } else if (op === "$contains") {
     if (typeof operand !== "string") {
-      throw new Error("$contains requires a string operand (a case-insensitive substring). To match array elements exactly use {\"field\": \"value\"}, {\"field\": {\"$in\": [...]}}, or {\"field\": [\"a\", \"b\"]} for all of them");
+      throw new ClientInputError("$contains requires a string operand (a case-insensitive substring). To match array elements exactly use {\"field\": \"value\"}, {\"field\": {\"$in\": [...]}}, or {\"field\": [\"a\", \"b\"]} for all of them");
     }
   } else if (op === "$size") {
     assertSizeOperand(operand);
   } else if (op !== "$ne") {
-    throw new Error(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
+    throw new ClientInputError(`Unsupported filter operator '${op}'. Supported: ${FILTER_OPERATORS.join(", ")}`);
   }
 }
 
@@ -405,13 +406,13 @@ type SizeOperand = number | Partial<Record<(typeof SIZE_OPERATORS)[number], numb
 
 function assertSizeOperand(operand: unknown): asserts operand is SizeOperand {
   if (typeof operand === "number") {
-    if (!Number.isFinite(operand)) throw new Error(SIZE_HELP);
+    if (!Number.isFinite(operand)) throw new ClientInputError(SIZE_HELP);
     return;
   }
-  if (!isPlainObject(operand) || Object.keys(operand).length === 0) throw new Error(SIZE_HELP);
+  if (!isPlainObject(operand) || Object.keys(operand).length === 0) throw new ClientInputError(SIZE_HELP);
   for (const [op, value] of Object.entries(operand)) {
-    if (!(SIZE_OPERATORS as readonly string[]).includes(op)) throw new Error(`Unsupported $size operator '${op}' (${SIZE_OPERATORS.join(", ")}): ${SIZE_HELP}`);
-    if (typeof value !== "number" || !Number.isFinite(value)) throw new Error(`$size ${op} takes a number: ${SIZE_HELP}`);
+    if (!(SIZE_OPERATORS as readonly string[]).includes(op)) throw new ClientInputError(`Unsupported $size operator '${op}' (${SIZE_OPERATORS.join(", ")}): ${SIZE_HELP}`);
+    if (typeof value !== "number" || !Number.isFinite(value)) throw new ClientInputError(`$size ${op} takes a number: ${SIZE_HELP}`);
   }
 }
 
@@ -585,7 +586,7 @@ function compileFilter(ctx: Ctx, filter: Record<string, unknown>): ParsedFilter 
       nestedRaw.set(path, raw);
       for (const cond of entries(value)) {
         if (cond.op === "$size") {
-          throw new Error(`$size is not supported on '${key}', a path into an array of objects ('${path}'); use it on a top-level field or an object path, e.g. {"${path}": {"$size": {"$gt": 3}}}`);
+          throw new ClientInputError(`$size is not supported on '${key}', a path into an array of objects ('${path}'); use it on a top-level field or an object path, e.g. {"${path}": {"$size": {"$gt": 3}}}`);
         }
         // Child columns carry no misfit flag; a text one may be NULL for an
         // over-long string, so it never answers a range.
@@ -639,10 +640,10 @@ export const LOGICAL_OPERATORS = ["$and", "$or"] as const;
  */
 function logicalCondition(ctx: Ctx, key: string, value: unknown, clauses: Clause[]): SQL {
   if (!(LOGICAL_OPERATORS as readonly string[]).includes(key)) {
-    throw new Error(`Unsupported top-level filter operator '${key}'. Supported: ${LOGICAL_OPERATORS.join(", ")} (each takes an array of filters, e.g. {"$or": [{"status": "open"}, {"score": {"$gt": 10}}]}); field operators ($gt, $in, ...) go inside a field: {"score": {"$gt": 10}}`);
+    throw new ClientInputError(`Unsupported top-level filter operator '${key}'. Supported: ${LOGICAL_OPERATORS.join(", ")} (each takes an array of filters, e.g. {"$or": [{"status": "open"}, {"score": {"$gt": 10}}]}); field operators ($gt, $in, ...) go inside a field: {"score": {"$gt": 10}}`);
   }
   if (!Array.isArray(value) || value.length === 0 || !value.every((b) => isPlainObject(b))) {
-    throw new Error(`${key} takes a non-empty array of filters, e.g. {"${key}": [{"status": "open"}, {"score": {"$gt": 10}}]}`);
+    throw new ClientInputError(`${key} takes a non-empty array of filters, e.g. {"${key}": [{"status": "open"}, {"score": {"$gt": 10}}]}`);
   }
   const branches = value.map((branch) => {
     const sub = compileFilter(ctx, branch as Record<string, unknown>);
@@ -724,15 +725,15 @@ export function sortKeys(sort: string | string[] | undefined): string[] {
   const keys = raw.map((k) => k.trim());
   if (keys.length === 1 && keys[0] === "") return [];
   const bad = keys.find((k) => k === "" || k === "-");
-  if (bad !== undefined) throw new Error(`Invalid sort field '${bad}' in '${Array.isArray(sort) ? sort.join(",") : sort}' — ${SORT_HELP}`);
-  if (keys.length > MAX_SORT_KEYS) throw new Error(`sort takes at most ${MAX_SORT_KEYS} keys, got ${keys.length}`);
+  if (bad !== undefined) throw new ClientInputError(`Invalid sort field '${bad}' in '${Array.isArray(sort) ? sort.join(",") : sort}' — ${SORT_HELP}`);
+  if (keys.length > MAX_SORT_KEYS) throw new ClientInputError(`sort takes at most ${MAX_SORT_KEYS} keys, got ${keys.length}`);
   return keys;
 }
 
 function parseSort(sort: string): { field: string; dir: SQL; descending: boolean } {
   const descending = sort.startsWith("-");
   const field = descending ? sort.slice(1) : sort;
-  if (!field) throw new Error(`Invalid sort field '${sort}' — ${SORT_HELP}`);
+  if (!field) throw new ClientInputError(`Invalid sort field '${sort}' — ${SORT_HELP}`);
   return { field, dir: descending ? sql`DESC` : sql`ASC`, descending };
 }
 
@@ -771,11 +772,11 @@ function compileRecordSortKey(ctx: Ctx, sort: string | undefined): SortKey {
     // fall through to the row id, so `id` is always a valid sort.
     return { orderBy: sql`t.data->${field}::text ${dir} NULLS LAST`, clause: { label: "sort on id", indexes: [] }, tiebreak: sameDir };
   }
-  if (!PATH_RE.test(field)) throw new Error(`Invalid sort field '${field}' — ${SORT_HELP}`);
+  if (!PATH_RE.test(field)) throw new ClientInputError(`Invalid sort field '${field}' — ${SORT_HELP}`);
 
   const parsed = parsePath(registry, ctx.arrayPaths, field);
   if (parsed.kind === "nested") {
-    throw new Error(`Cannot sort records on '${field}': '${parsed.path}' is an array of objects. Sort on a nested array is available in aggregate queries (group_by/aggregate) by aggregate alias or group_by key.`);
+    throw new ClientInputError(`Cannot sort records on '${field}': '${parsed.path}' is an array of objects. Sort on a nested array is available in aggregate queries (group_by/aggregate) by aggregate alias or group_by key.`);
   }
   const label = `sort on ${field}`;
   // The column orders exactly like the jsonb value only while every live
@@ -930,7 +931,7 @@ function aggregateExpr(op: string, f: FieldExprs, firstOrder: SQL): SQL {
     case "avg":
       return sql`to_jsonb(${sql.raw(op)}(${f.sumable}))`;
     default:
-      throw new Error(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
+      throw new ClientInputError(`Unsupported aggregation '${op}'. Supported: ${AGGREGATION_OPS}`);
   }
 }
 
@@ -948,16 +949,16 @@ function assertDistinctColumns(groupKeys: string[], aliases: string[], opts: { t
       const why = name.startsWith("__") ? "names starting with __ are used internally"
         : name === "time_bucket" ? "with time_bucket, each row carries its bucket as time_bucket"
         : "with per_record, each row carries parent_id and record";
-      throw new Error(`'${name}' is reserved in this aggregate's rows (${why}); ${groupKeys.includes(name) ? "a field with this name can't be a group_by key in this query" : "use another alias"}.`);
+      throw new ClientInputError(`'${name}' is reserved in this aggregate's rows (${why}); ${groupKeys.includes(name) ? "a field with this name can't be a group_by key in this query" : "use another alias"}.`);
     }
   }
   for (const alias of aliases) {
     if (groupKeys.includes(alias)) {
-      throw new Error(`'${alias}' is both a group_by key and an aggregate alias; each results row would hold only one of them. Use a different alias, e.g. {"n": "count"}.`);
+      throw new ClientInputError(`'${alias}' is both a group_by key and an aggregate alias; each results row would hold only one of them. Use a different alias, e.g. {"n": "count"}.`);
     }
   }
   if (aliases.length === 0 && groupKeys.includes("count")) {
-    throw new Error(`group_by key 'count' collides with the default count column; pass an aggregate with another alias, e.g. {"n": "count"}.`);
+    throw new ClientInputError(`group_by key 'count' collides with the default count column; pass an aggregate with another alias, e.g. {"n": "count"}.`);
   }
 }
 
@@ -990,24 +991,24 @@ function parseExpr(raw: unknown, depth: number): Expr {
     return { kind: "path", field: raw };
   }
   if (typeof raw === "number") {
-    if (!Number.isFinite(raw)) throw new Error(`Expression operands must be finite numbers. ${EXPRESSION_HELP}`);
+    if (!Number.isFinite(raw)) throw new ClientInputError(`Expression operands must be finite numbers. ${EXPRESSION_HELP}`);
     return { kind: "num", value: raw };
   }
   const entries = isPlainObject(raw) ? Object.entries(raw) : [];
-  if (entries.length !== 1) throw new Error(`Invalid expression operand ${JSON.stringify(raw)}: each operand is a field path, a number or an object with one operator. ${EXPRESSION_HELP}`);
+  if (entries.length !== 1) throw new ClientInputError(`Invalid expression operand ${JSON.stringify(raw)}: each operand is a field path, a number or an object with one operator. ${EXPRESSION_HELP}`);
   const [op, args] = entries[0];
   if (op === "$size") {
-    if (typeof args !== "string") throw new Error(`$size takes a field path, e.g. {"$size": "members"}`);
+    if (typeof args !== "string") throw new ClientInputError(`$size takes a field path, e.g. {"$size": "members"}`);
     assertPathName(args);
     return { kind: "size", field: args };
   }
   if (!(ARITHMETIC_OPERATORS as readonly string[]).includes(op)) {
-    throw new Error(`Unsupported expression operator '${op}'. Supported: ${ARITHMETIC_OPERATORS.join(", ")}, $size. ${EXPRESSION_HELP}`);
+    throw new ClientInputError(`Unsupported expression operator '${op}'. Supported: ${ARITHMETIC_OPERATORS.join(", ")}, $size. ${EXPRESSION_HELP}`);
   }
-  if (depth > MAX_EXPRESSION_DEPTH) throw new Error(`Expressions can be nested at most ${MAX_EXPRESSION_DEPTH} operators deep`);
+  if (depth > MAX_EXPRESSION_DEPTH) throw new ClientInputError(`Expressions can be nested at most ${MAX_EXPRESSION_DEPTH} operators deep`);
   const binary = op === "$subtract" || op === "$divide";
   if (!Array.isArray(args) || (binary ? args.length !== 2 : args.length < 2 || args.length > MAX_EXPRESSION_OPERANDS)) {
-    throw new Error(binary ? `${op} takes exactly 2 operands, e.g. {"${op}": ["total", "count"]}` : `${op} takes 2 to ${MAX_EXPRESSION_OPERANDS} operands in an array, e.g. {"${op}": ["items.qty", "items.price"]}`);
+    throw new ClientInputError(binary ? `${op} takes exactly 2 operands, e.g. {"${op}": ["total", "count"]}` : `${op} takes 2 to ${MAX_EXPRESSION_OPERANDS} operands in an array, e.g. {"${op}": ["items.qty", "items.price"]}`);
   }
   return { kind: "arith", op: op as (typeof ARITHMETIC_OPERATORS)[number], args: args.map((a) => parseExpr(a, depth + 1)) };
 }
@@ -1062,7 +1063,7 @@ function parseAggregate(aggregate: AggregateSpec | undefined): ParsedAggregate[]
     const entries = isPlainObject(spec) ? Object.entries(spec) : [];
     if (entries.length !== 1) {
       const label = typeof spec === "string" ? spec : JSON.stringify(spec);
-      throw new Error(`Unsupported aggregation '${label}' for '${alias}'. Each alias takes "count" or one {op: field} with op one of ${AGGREGATION_OPS}, e.g. ${AGGREGATE_SPEC_EXAMPLE}`);
+      throw new ClientInputError(`Unsupported aggregation '${label}' for '${alias}'. Each alias takes "count" or one {op: field} with op one of ${AGGREGATION_OPS}, e.g. ${AGGREGATE_SPEC_EXAMPLE}`);
     }
     const [op, field] = entries[0];
     if (op === "count") {
@@ -1070,11 +1071,11 @@ function parseAggregate(aggregate: AggregateSpec | undefined): ParsedAggregate[]
     }
     if (isPlainObject(field)) {
       if (!EXPRESSION_AGGREGATES.includes(op)) {
-        throw new Error(`Aggregation '${op}' for '${alias}' takes a field name; expressions work with sum, avg, min and max. ${EXPRESSION_HELP}`);
+        throw new ClientInputError(`Aggregation '${op}' for '${alias}' takes a field name; expressions work with sum, avg, min and max. ${EXPRESSION_HELP}`);
       }
       return { alias, op, field: null, expr: parseExpr(field, 1) };
     }
-    if (typeof field !== "string") throw new Error(`Aggregation '${op}' for '${alias}' takes a field name, e.g. {"${op}": "score"}, or for sum/avg/min/max an expression. ${EXPRESSION_HELP}`);
+    if (typeof field !== "string") throw new ClientInputError(`Aggregation '${op}' for '${alias}' takes a field name, e.g. {"${op}": "score"}, or for sum/avg/min/max an expression. ${EXPRESSION_HELP}`);
     assertPathName(field);
     return { alias, op, field };
   });
@@ -1091,9 +1092,9 @@ export function parseTimeBucket(raw: unknown): TimeBucket | null {
   if (raw === undefined || raw === null || raw === "") return null;
   if (typeof raw === "string") return { unit: escapeBucket(raw), field: null };
   if (!isPlainObject(raw) || typeof raw.field !== "string" || typeof raw.unit !== "string" || Object.keys(raw).some((k) => k !== "field" && k !== "unit")) {
-    throw new Error(TIME_BUCKET_HELP);
+    throw new ClientInputError(TIME_BUCKET_HELP);
   }
-  if (!(TIME_BUCKET_UNITS as readonly string[]).includes(raw.unit)) throw new Error(`Invalid time_bucket unit '${raw.unit}': ${TIME_BUCKET_HELP}`);
+  if (!(TIME_BUCKET_UNITS as readonly string[]).includes(raw.unit)) throw new ClientInputError(`Invalid time_bucket unit '${raw.unit}': ${TIME_BUCKET_HELP}`);
   assertPathName(raw.field);
   return { unit: raw.unit, field: raw.field };
 }
@@ -1151,7 +1152,7 @@ export function compileQuery(collection: Collection, params: TableQueryParams, o
     clauses.push({ label: "created_before", indexes: [indexName(parentTable, "created_at")] });
   }
 
-  if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) throw new Error("limit must be a number, 0 or more (0 returns only total)");
+  if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) throw new ClientInputError("limit must be a number, 0 or more (0 returns only total)");
   // limit: 0 counts: the response has total and no records (or groups).
   const countOnly = limit === 0;
   const clampedLimit = Math.min(Math.max(Math.floor(limit), 1), Math.min(limitCap, TABLE_LIMIT_CAP));
@@ -1253,7 +1254,7 @@ function compileAggregate(
   const nested = refs.filter((r) => r.parsed.kind === "nested") as { field: string; parsed: Extract<ParsedPath, { kind: "nested" }> }[];
   const nestedPaths = new Set(nested.map((r) => r.parsed.path));
   if (nestedPaths.size > 1) {
-    throw new Error(`group_by and aggregate can reference one nested array at a time, got: ${[...nestedPaths].join(", ")}`);
+    throw new ClientInputError(`group_by and aggregate can reference one nested array at a time, got: ${[...nestedPaths].join(", ")}`);
   }
   const path = nestedPaths.size === 1 ? [...nestedPaths][0] : null;
 
@@ -1364,7 +1365,7 @@ function compileAggregate(
       const ordinal = ordinals.get(field);
       if (ordinal === undefined || field === "parent_id") {
         const accepted = [...ordinals.keys()].filter((k) => k !== "parent_id");
-        throw new Error(`Invalid sort field '${field}' for an aggregate query — sort accepts an aggregate alias or a group_by key here (${accepted.join(", ")})`);
+        throw new ClientInputError(`Invalid sort field '${field}' for an aggregate query — sort accepts an aggregate alias or a group_by key here (${accepted.join(", ")})`);
       }
       // An aggregate sort orders computed groups: no index serves it, so it is not a clause for `indexed`/`reason`.
       first.push(sql`${sql.raw(String(ordinal))} ${dir} NULLS LAST`);
@@ -1630,7 +1631,7 @@ async function assertSortKeyExists(collection: Collection, registry: StorageRegi
     sortPathCache.set(key, exists);
   }
   if (!exists) {
-    throw new Error(`Invalid sort field '${field}': no record in this collection has it — ${SORT_HELP}`);
+    throw new ClientInputError(`Invalid sort field '${field}': no record in this collection has it — ${SORT_HELP}`);
   }
 }
 
@@ -1696,7 +1697,7 @@ async function probeExists(collection: Collection, field: string, what: string, 
     const why = field.includes(".") && known.includes(head)
       ? `no record with the path '${field}' was found before checking every record timed out (${formatTimeout()})`
       : `'${field}' is not in this collection's saved schema, and checking every record for it timed out (${formatTimeout()})`;
-    throw new Error(`Unknown ${what} '${field}': ${why}.${listed} Check the name with hutch_describe_collection or hutch_get_collection.`);
+    throw new ClientInputError(`Unknown ${what} '${field}': ${why}.${listed} Check the name with hutch_describe_collection or hutch_get_collection.`);
   }
 }
 
@@ -1707,24 +1708,24 @@ async function probeExists(collection: Collection, field: string, what: string, 
  */
 async function assertShapingPaths(collection: Collection, registry: StorageRegistry, fields: string[] | undefined, arrayOps: ArrayOps): Promise<void> {
   for (const field of fields ?? []) {
-    if (typeof field !== "string" || field === "") throw new Error("fields must be a list of field names or dotted paths");
+    if (typeof field !== "string" || field === "") throw new ClientInputError("fields must be a list of field names or dotted paths");
     const segments = field.split(".");
     if (segments.length > 1 && !PATH_RE.test(field)) {
-      throw new Error(`Invalid field '${field}' — fields takes top-level keys or dotted paths ("answers.score") whose segments are letters, numbers and underscores`);
+      throw new ClientInputError(`Invalid field '${field}' — fields takes top-level keys or dotted paths ("answers.score") whose segments are letters, numbers and underscores`);
     }
     if (!(await pathExists(collection, registry, field))) {
-      throw new Error(`Invalid field '${field}' in fields: no record in this collection has it. fields takes top-level keys and dotted paths into objects or arrays of objects ("answers.score"); run hutch_describe_collection to see the fields.`);
+      throw new ClientInputError(`Invalid field '${field}' in fields: no record in this collection has it. fields takes top-level keys and dotted paths into objects or arrays of objects ("answers.score"); run hutch_describe_collection to see the fields.`);
     }
   }
   for (const op of arrayOps) {
-    if (!fieldsCover(fields, op.path)) throw new Error(`'${op.path}' in array_sort/array_limit is not returned by fields — add it (or a path below it) to fields`);
+    if (!fieldsCover(fields, op.path)) throw new ClientInputError(`'${op.path}' in array_sort/array_limit is not returned by fields — add it (or a path below it) to fields`);
     if (!(await pathExists(collection, registry, op.path, true))) {
-      throw new Error(`Invalid array_sort/array_limit path '${op.path}': no record in this collection holds an array there — ${ARRAY_OPS_HELP}`);
+      throw new ClientInputError(`Invalid array_sort/array_limit path '${op.path}': no record in this collection holds an array there — ${ARRAY_OPS_HELP}`);
     }
     for (const key of op.sort) {
       const full = [op.path, ...key.segments].join(".");
       if (!(await pathExists(collection, registry, full))) {
-        throw new Error(`Invalid array_sort key '${key.segments.join(".")}' for '${op.path}': no element in this collection has it`);
+        throw new ClientInputError(`Invalid array_sort key '${key.segments.join(".")}' for '${op.path}': no element in this collection has it`);
       }
     }
   }
@@ -1750,7 +1751,7 @@ export async function queryTable(collection: Collection, params: TableQueryParam
   const arrayOps = parseArrayOps(params.arraySort, params.arrayLimit);
   const fieldsGiven = (params.fields ?? []).length > 0;
   if (compiled.kind === "aggregate" && (fieldsGiven || arrayOps.length > 0) && !(compiled.nested && params.record !== false)) {
-    throw new Error("fields, array_sort and array_limit shape returned records: they apply to a records query, or to the `record` attached to each row of a per_record aggregate. An aggregate's columns are its group_by keys and aggregate aliases.");
+    throw new ClientInputError("fields, array_sort and array_limit shape returned records: they apply to a records query, or to the `record` attached to each row of a per_record aggregate. An aggregate's columns are its group_by keys and aggregate aliases.");
   }
   await assertShapingPaths(collection, registry, params.fields, arrayOps);
 
@@ -1887,7 +1888,7 @@ export function typeCheckWarnings(checks: { alias: string; op: string; field: st
     const types = [...new Set(bad.map((r) => r[check.column] as string))].join(", ");
     const what = `${check.op} '${check.alias}' over '${check.field}'`;
     if (bad.length === rows.length) {
-      throw new Error(`${what} found ${types} values and nothing it can add: sum and avg take numbers, and booleans count as 1 (true) and 0 (false). Use count with a filter, or min/max/distinct, for other types.`);
+      throw new ClientInputError(`${what} found ${types} values and nothing it can add: sum and avg take numbers, and booleans count as 1 (true) and 0 (false). Use count with a filter, or min/max/distinct, for other types.`);
     }
     warnings.push(`${what} is null in ${bad.length} of ${rows.length} groups, whose values are ${types}: sum and avg take numbers and booleans only.`);
   }

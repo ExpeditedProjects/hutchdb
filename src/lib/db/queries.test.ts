@@ -35,6 +35,7 @@ vi.mock('./index', () => ({
   },
 }))
 
+import { ClientInputError } from '@/lib/errors/client-input-error'
 import {
   findAccessibleCollectionBySlug,
   normalizeGroupBy,
@@ -131,5 +132,6 @@ describe('normalizeGroupBy', () => {
     expect(normalizeGroupBy(['a', 'b', 'c', 'd', 'e'])).toHaveLength(5)
     expect(() => normalizeGroupBy(['a', 'b', 'c', 'd', 'e', 'f'])).toThrow(/at most 5 keys/)
     expect(() => normalizeGroupBy(['a', "b'; --"])).toThrow(/Invalid field name/)
+    expect(() => normalizeGroupBy(['a', "b'; --"])).toThrow(ClientInputError)
   })
 })

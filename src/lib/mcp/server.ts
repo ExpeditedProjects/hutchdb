@@ -5,6 +5,8 @@ import * as recordService from "@/lib/services/records";
 import { createView } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
+import { reportError } from "@/lib/errors/report";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 import { MCP_MAX_REQUEST_BODY_BYTES, MCP_MAX_REQUEST_BODY_LABEL } from "@/lib/constants";
 import { DESCRIBE_FIELDS_PAGE } from "@/lib/describe";
 import { DEFAULT_MAX_STRING_LENGTH, MAX_PAGE_CHARS } from "@/lib/services/output-limits";
@@ -129,6 +131,16 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
    * wrong type, or a generic failure) without any driver text. Every OTHER throw is rethrown unchanged so
    * intentional validation errors (e.g. "Unsupported filter operator …"
    * from the query engine) still reach the client verbatim via the SDK.
+   *
+   * Reporting: database errors and every unexpected throw go to
+   * reportError (a no-op unless a deployment installs a reporter). The
+   * discriminator for "intentional" is the ClientInputError class — the
+   * query engine throws it for caller mistakes, so those are expected
+   * outcomes, not bugs. A class beats message matching: new validation
+   * messages need no allowlist, and a plain Error from anywhere else is
+   * reported by default. (Zod input-schema failures are rejected by the
+   * SDK before the handler runs, so they never reach this wrapper.)
+   * Context carries identifiers only — never tool arguments or records.
    */
   const registerTool = ((
     name: string,
@@ -139,8 +151,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       try {
         return await (handler as (...a: unknown[]) => Promise<McpToolResponse>)(...args);
       } catch (err) {
+        const errorContext = { tool: name, organizationId, userId };
         if (isDatabaseError(err)) {
           console.error(`[mcp] ${name} database error:`, err);
+          reportError(err, errorContext);
           // The collection as the caller named it (slug or exact name) — their own input, safe to echo.
           const params = (args[0] ?? {}) as { slug?: unknown; collection?: unknown };
           const collection = typeof params.slug === "string" ? params.slug
@@ -158,6 +172,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
           const write = (config as { annotations?: ToolAnnotations }).annotations?.readOnlyHint !== true;
           return errorResponse(describeDbError(err, { tool: name, collection, timeoutHint, write, args: params as Record<string, unknown> }));
         }
+        if (!(err instanceof ClientInputError)) reportError(err, errorContext);
         throw err;
       }
     };

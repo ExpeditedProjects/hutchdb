@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 const { registeredTools, registeredConfigs } = vi.hoisted(() => ({
   registeredTools: new Map<string, (params: unknown) => Promise<unknown>>(),
@@ -60,6 +60,8 @@ import { FILTER_OPERATORS } from '@/lib/db/queries'
 import * as collectionService from '@/lib/services/collections'
 import * as recordService from '@/lib/services/records'
 import { createView } from '@/lib/services/views'
+import { setErrorReporter } from '@/lib/errors/report'
+import { ClientInputError } from '@/lib/errors/client-input-error'
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -230,7 +232,7 @@ describe('error hygiene chokepoint', () => {
   it('rethrows non-database errors unchanged so validation messages reach the client via the SDK', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
 
-    const validationError = new Error(
+    const validationError = new ClientInputError(
       "Unsupported filter operator '$regex'. Supported: $gt, $gte, $lt, $lte, $ne, $in, $nin, $exists, $contains"
     )
     vi.mocked(recordService.queryRecords).mockRejectedValue(validationError)
@@ -1084,6 +1086,90 @@ describe('list_collections tool', () => {
     expect(row).toEqual(expect.objectContaining({ slug: 'users', recordCount: 3 }))
     expect(row).not.toHaveProperty('schema')
     expect(row).not.toHaveProperty('role')
+  })
+})
+
+describe('error reporting at the chokepoint', () => {
+  const reporter = vi.fn()
+
+  beforeEach(() => setErrorReporter(reporter))
+  afterEach(() => setErrorReporter(null))
+
+  it('reports database errors with tool/org/user context and returns the same masked response', async () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const driverError = new Error('Failed query: SELECT 1\nparams: {"secret":"hunter2"}')
+    vi.mocked(recordService.queryRecords).mockRejectedValue(driverError)
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'users', filter: { secret: 'hunter2' } })
+
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'hutch_query_records failed while accessing the database. Try again or adjust the inputs.' }],
+      isError: true,
+    })
+    expect(reporter).toHaveBeenCalledTimes(1)
+    expect(reporter).toHaveBeenCalledWith(driverError, {
+      tool: 'hutch_query_records',
+      organizationId: 'org-test',
+      userId: 'user-1',
+    })
+    // Tool arguments never reach the reporter.
+    expect(JSON.stringify(reporter.mock.calls[0][1])).not.toMatch(/hunter2|users/)
+    consoleError.mockRestore()
+  })
+
+  it('reports unexpected errors and still rethrows them unchanged', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const bug = new TypeError("Cannot read properties of undefined (reading 'slug')")
+    vi.mocked(collectionService.listCollections).mockRejectedValue(bug)
+
+    await expect(registeredTools.get('hutch_list_collections')!({})).rejects.toBe(bug)
+    expect(reporter).toHaveBeenCalledTimes(1)
+    expect(reporter).toHaveBeenCalledWith(bug, {
+      tool: 'hutch_list_collections',
+      organizationId: 'org-test',
+      userId: 'user-1',
+    })
+  })
+
+  it('does not report intentional client input errors', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const validationError = new ClientInputError("Invalid field name 'a-b' — only letters, numbers, and underscores are allowed")
+    vi.mocked(recordService.queryRecords).mockRejectedValue(validationError)
+
+    await expect(registeredTools.get('hutch_query_records')!({ slug: 'users' })).rejects.toBe(validationError)
+    expect(reporter).not.toHaveBeenCalled()
+  })
+
+  it('does not report successful calls', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.listCollections).mockResolvedValue([] as never)
+
+    await registeredTools.get('hutch_list_collections')!({})
+    expect(reporter).not.toHaveBeenCalled()
+  })
+
+  it('returns the same response when no reporter is installed', async () => {
+    setErrorReporter(null)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockRejectedValue(new Error('Failed query: SELECT 1'))
+
+    const result = await registeredTools.get('hutch_query_records')!({ slug: 'users' })
+    expect(result).toEqual({
+      content: [{ type: 'text', text: 'hutch_query_records failed while accessing the database. Try again or adjust the inputs.' }],
+      isError: true,
+    })
+    consoleError.mockRestore()
+  })
+
+  it('a throwing reporter does not change the client response', async () => {
+    setErrorReporter(() => { throw new Error('reporter down') })
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const bug = new Error('unexpected')
+    vi.mocked(collectionService.listCollections).mockRejectedValue(bug)
+
+    await expect(registeredTools.get('hutch_list_collections')!({})).rejects.toBe(bug)
   })
 })
 

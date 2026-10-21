@@ -5,6 +5,7 @@ vi.mock('@/lib/db', () => ({ db: { execute: vi.fn() } }))
 import { PgDialect } from 'drizzle-orm/pg-core'
 import { compileQuery, summarizePlan, sortKeys, typeCheckWarnings } from './compiler'
 import type { StorageRegistry } from './registry'
+import { ClientInputError } from '@/lib/errors/client-input-error'
 
 const dialect = new PgDialect()
 
@@ -635,6 +636,13 @@ describe('filter operator validation', () => {
     expect(() => compile({ filter: { f: { $in: big } } })).toThrow(/limited to 1000 elements/)
     expect(() => compile({ filter: { f: { $nin: big } } })).toThrow(/limited to 1000 elements/)
     expect(() => compile({ filter: { f: { $in: big.slice(0, 1000) } } })).not.toThrow()
+  })
+
+  it('throws ClientInputError so the MCP chokepoint treats caller mistakes as expected, not bugs', () => {
+    expect(() => compile({ filter: { f: { $regex: 'a' } } })).toThrow(ClientInputError)
+    expect(() => compile({ filter: { f: { $in: 'active' } } })).toThrow(ClientInputError)
+    expect(() => compile({ aggregate: { m: { median: 'price' } } })).toThrow(ClientInputError)
+    expect(() => compile({ sort: 'bad field!' })).toThrow(ClientInputError)
   })
 
   it('compiles empty $in to false and empty $nin to true', () => {

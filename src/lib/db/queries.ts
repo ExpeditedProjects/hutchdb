@@ -4,6 +4,7 @@ import { collections, collectionMembers, organizations, organizationMembers, use
 import { eq, and, sql, asc, inArray, type SQL } from "drizzle-orm";
 import { isPlainObject } from "@/lib/validation";
 import { createCollectionTable } from "@/lib/storage/ddl";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 
 export type CollectionAccess = {
   collection: typeof collections.$inferSelect;
@@ -301,9 +302,9 @@ export const AGGREGATION_OPS = "count, min, max, distinct, sum, avg, first";
 
 export function normalizeGroupBy(groupBy: string | string[] | undefined): string[] {
   if (Array.isArray(groupBy)) {
-    if (groupBy.length > MAX_GROUP_BY_KEYS) throw new Error(`group_by accepts at most ${MAX_GROUP_BY_KEYS} keys`);
+    if (groupBy.length > MAX_GROUP_BY_KEYS) throw new ClientInputError(`group_by accepts at most ${MAX_GROUP_BY_KEYS} keys`);
     for (const key of groupBy) {
-      if (typeof key !== "string") throw new Error("group_by must be a field name or an array of field names");
+      if (typeof key !== "string") throw new ClientInputError("group_by must be a field name or an array of field names");
       escapeFieldPath(key);
     }
     return groupBy;
@@ -321,7 +322,7 @@ const FIELD_PATH_RE = /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)*$/;
 /** A field or a dotted path into nested objects (each segment as strict as a field name). */
 function escapeFieldPath(field: string): string {
   if (typeof field !== "string" || !FIELD_PATH_RE.test(field)) {
-    throw new Error(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed, with dots separating nested object keys`);
+    throw new ClientInputError(`Invalid field name '${field}' — only letters, numbers, and underscores are allowed, with dots separating nested object keys`);
   }
   return field;
 }

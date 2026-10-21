@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { applyArrayOps, fieldHeads, fieldsCover, parseArrayOps, projectData } from "./projection";
+import { ClientInputError } from "@/lib/errors/client-input-error";
 
 const question = {
   title: "Q",
@@ -79,6 +80,7 @@ describe("array_sort / array_limit", () => {
   it("rejects bad specs", () => {
     expect(() => parseArrayOps({ votes: 3 as unknown as string }, undefined)).toThrow(/must be a string/);
     expect(() => parseArrayOps({ votes: "a,b,c,d" }, undefined)).toThrow(/at most 3/);
+    expect(() => parseArrayOps({ votes: "a,b,c,d" }, undefined)).toThrow(ClientInputError);
     expect(() => parseArrayOps({ "bad path": "a" }, undefined)).toThrow(/Invalid array_sort path/);
     expect(() => parseArrayOps(undefined, { votes: -1 })).toThrow(/whole number/);
     expect(() => parseArrayOps(undefined, { votes: 1.5 })).toThrow(/whole number/);
