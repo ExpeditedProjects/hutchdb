@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-23: Docker build requires a patched Node
+
+Node before 26.12.1 has a Brotli decoder bug that allows remote code execution (CVE-2026-111497). The `Dockerfile` still uses the moving `node:26-alpine` tag, but the build now fails if the base image has an older Node, which happens when Docker reuses a cached base layer. If you self-host with Docker, rebuild with `docker compose build --pull` and restart.
+
 ## 2026-07-02 — Repositioning: Hutch Core is now a headless MCP server
 
 Hutch Core has been narrowed to a single job: be the simplest self-hostable MCP server for structured agent data. Everything user-facing moved out.
