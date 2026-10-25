@@ -31,6 +31,8 @@ docker compose up
 
 Visit `http://localhost:3000` and sign in with the password.
 
+To update, pull the repo and rebuild with `docker compose build --pull` so you also get the latest Node base image. The build fails on Node older than 26.12.1, which has a Brotli remote code execution bug (CVE-2026-111497).
+
 The container entrypoint runs database migrations on every start (idempotent) and, when `HUTCH_AUTO_SEED=true` (default in `docker-compose.yml`), creates the singleton admin user + org if they don't already exist.
 
 ### Putting it behind a reverse proxy
