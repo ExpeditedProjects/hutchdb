@@ -1,6 +1,6 @@
 import { db } from "@/lib/db";
 import { views } from "@/lib/db/schema";
-import { eq, and } from "drizzle-orm";
+import { eq, and, asc } from "drizzle-orm";
 import { findAccessibleCollection } from "./resolve";
 import { uniqueSlug, titleCase } from "@/lib/slugify";
 import { revalidateDashboard } from "@/lib/revalidation";
@@ -11,6 +11,8 @@ import { isSelectableField } from "@/lib/schema/field-types";
 
 const TIMESTAMP_FIELD_NAMES = new Set(["created_at", "updated_at"]);
 
+const GROUP_BY_KANBAN_ONLY = { error: "group_by applies to kanban views only", status: 400 };
+
 export async function createView(collectionSlug: string, userId: string, params: {
   type?: string;
   name?: string;
@@ -20,6 +22,7 @@ export async function createView(collectionSlug: string, userId: string, params:
   columns?: string[];
   config?: Record<string, unknown>;
   groupBy?: string;
+  published?: boolean;
 }) {
   let resolvedName: string | undefined;
   if (params.name !== undefined) {
@@ -34,6 +37,7 @@ export async function createView(collectionSlug: string, userId: string, params:
   collectionSlug = access.collection.slug;
 
   const type = params.type || "table";
+  if (params.groupBy && type !== "kanban") return GROUP_BY_KANBAN_ONLY;
   const name = resolvedName ?? titleCase(type);
 
   const config = { ...(params.config ?? {}) };
@@ -51,6 +55,7 @@ export async function createView(collectionSlug: string, userId: string, params:
     sort: params.sort || null,
     columns: params.columns ?? [],
     config,
+    published: params.published ?? false,
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
@@ -178,4 +183,97 @@ export async function seedAutoViews(
       console.error(`seedAutoViews: failed to seed ${seeds[i].type} view`, result.reason);
     }
   });
+}
+
+/** A view's id, or its slug within the collection. */
+export type ViewRef = number | string;
+
+function viewRefCondition(collectionId: number, viewRef: ViewRef) {
+  return and(
+    typeof viewRef === "number" ? eq(views.id, viewRef) : eq(views.slug, viewRef),
+    eq(views.collectionId, collectionId),
+  );
+}
+
+/** Same access rule as findEditableView, with the view named by id or slug. */
+async function findEditableViewByRef(collectionSlug: string, viewRef: ViewRef, userId: string) {
+  const access = await findAccessibleCollection(collectionSlug, userId, "editor");
+  if (!access) return null;
+
+  const [view] = await db
+    .select()
+    .from(views)
+    .where(viewRefCondition(access.collection.id, viewRef))
+    .limit(1);
+  return view ? { view, slug: access.collection.slug } : null;
+}
+
+export async function updateView(
+  collectionSlug: string,
+  viewRef: ViewRef,
+  userId: string,
+  patch: {
+    name?: string;
+    columns?: string[];
+    sort?: string | null;
+    filter?: Record<string, unknown>;
+    config?: Record<string, unknown>;
+    groupBy?: string;
+    published?: boolean;
+  },
+) {
+  let name: string | undefined;
+  if (patch.name !== undefined) {
+    const validated = validateTrimmedLength(patch.name, MAX_VIEW_NAME_LENGTH, "Name");
+    if ("error" in validated) return validated;
+    name = validated.value;
+  }
+
+  const found = await findEditableViewByRef(collectionSlug, viewRef, userId);
+  if (!found) return null;
+  const { view, slug } = found;
+
+  if (patch.groupBy !== undefined && view.type !== "kanban") return GROUP_BY_KANBAN_ONLY;
+
+  const set: Partial<typeof views.$inferInsert> = { updatedAt: new Date() };
+  if (name !== undefined) set.name = name;
+  if (patch.columns !== undefined) set.columns = patch.columns;
+  if (patch.sort !== undefined) set.sort = patch.sort;
+  if (patch.filter !== undefined) set.filter = patch.filter;
+  if (patch.published !== undefined) set.published = patch.published;
+  if (patch.config !== undefined || patch.groupBy !== undefined) {
+    const config: Record<string, unknown> = {
+      ...((view.config as Record<string, unknown>) ?? {}),
+      ...pickAllowedConfig(patch.config ?? {}),
+    };
+    if (patch.groupBy !== undefined) {
+      config.groupByField = patch.groupBy;
+      // The dashboard writes groupField and readers prefer it; a stale one
+      // would hide the new grouping.
+      delete config.groupField;
+    }
+    set.config = config;
+  }
+
+  const [updated] = await db.update(views).set(set).where(eq(views.id, view.id)).returning();
+
+  revalidateDashboard(slug, "views");
+  return { view: updated, slug };
+}
+
+export async function deleteView(collectionSlug: string, viewRef: ViewRef, userId: string) {
+  const found = await findEditableViewByRef(collectionSlug, viewRef, userId);
+  if (!found) return null;
+
+  await db.delete(views).where(eq(views.id, found.view.id));
+
+  revalidateDashboard(found.slug, "views");
+  return { deleted: true };
+}
+
+export async function listViews(collectionSlug: string, userId: string) {
+  const access = await findAccessibleCollection(collectionSlug, userId, "viewer");
+  if (!access) return null;
+
+  return db.select().from(views).where(eq(views.collectionId, access.collection.id)).orderBy(asc(views.id));
 }

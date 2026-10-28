@@ -47,6 +47,9 @@ vi.mock('@/lib/services/records', () => ({
 
 vi.mock('@/lib/services/views', () => ({
   createView: vi.fn(),
+  updateView: vi.fn(),
+  deleteView: vi.fn(),
+  listViews: vi.fn(),
 }))
 
 vi.mock('@/lib/db', () => ({
@@ -59,7 +62,7 @@ import { createMcpServer } from './server'
 import { FILTER_OPERATORS } from '@/lib/db/queries'
 import * as collectionService from '@/lib/services/collections'
 import * as recordService from '@/lib/services/records'
-import { createView } from '@/lib/services/views'
+import { createView, updateView, deleteView, listViews } from '@/lib/services/views'
 import { setErrorReporter } from '@/lib/errors/report'
 import { ClientInputError } from '@/lib/errors/client-input-error'
 
@@ -77,7 +80,7 @@ describe('createMcpServer tool registration', () => {
       'hutch_store_records', 'hutch_query_records', 'hutch_search', 'hutch_update_collection',
       'hutch_delete_collection', 'hutch_delete_record', 'hutch_update_record', 'hutch_transform_records',
       'hutch_set_record_status', 'hutch_infer_schema', 'hutch_update_schema', 'hutch_create_view',
-      'hutch_collection_stats', 'hutch_export_records', 'hutch_import_records',
+      'hutch_update_view', 'hutch_delete_view', 'hutch_collection_stats', 'hutch_export_records', 'hutch_import_records',
     ]
     for (const name of expected) {
       expect(registeredTools.has(name), `expected tool ${name} to be registered`).toBe(true)
@@ -133,7 +136,7 @@ describe('createMcpServer tool registration', () => {
 describe('tool surface snapshot', () => {
   // Deliberate-drift gate for the connectors directory: any change to a tool
   // name, title, safety annotations, or input keys must update this literal.
-  it('matches the pinned 18-tool connector surface exactly', () => {
+  it('matches the pinned 20-tool connector surface exactly', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
 
     const surface = [...registeredConfigs.entries()]
@@ -159,9 +162,10 @@ describe('tool surface snapshot', () => {
 
     expect(surface).toEqual([
       { name: 'hutch_collection_stats', title: 'Collection Stats', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'slug', 'sort', 'type'] },
+      { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'type'] },
       { name: 'hutch_delete_collection', title: 'Delete Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
       { name: 'hutch_delete_record', title: 'Delete Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
+      { name: 'hutch_delete_view', title: 'Delete View', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug', 'view'] },
       { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
       { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
       { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
@@ -176,6 +180,7 @@ describe('tool surface snapshot', () => {
       { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
       { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
       { name: 'hutch_update_schema', title: 'Update Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
+      { name: 'hutch_update_view', title: 'Update View', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'view'] },
     ])
   })
 })
@@ -1030,14 +1035,43 @@ describe('create_view tool', () => {
     expect(collectionService.getCollection).not.toHaveBeenCalled()
   })
 
-  it('does not forward groupBy to createView for non-kanban view types', async () => {
+  it('forwards group_by on a non-kanban type so the service rejects it, and returns the error', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
-    vi.mocked(createView).mockResolvedValue({ view: { id: 1, name: 'Table' } } as never)
+    vi.mocked(createView).mockResolvedValue({ error: 'group_by applies to kanban views only', status: 400 } as never)
 
-    await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'table', group_by: 'status' })
+    const result = await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'table', group_by: 'status' }) as {
+      isError?: boolean
+      content: { text: string }[]
+    }
 
     const passed = vi.mocked(createView).mock.calls[0][2] as { groupBy?: string }
-    expect(passed.groupBy).toBeUndefined()
+    expect(passed.groupBy).toBe('status')
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe('group_by applies to kanban views only')
+    expect(collectionService.getCollection).not.toHaveBeenCalled()
+  })
+
+  it('forwards published to createView and documents it', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(createView).mockResolvedValue({ view: { id: 1, name: 'Table', published: true }, slug: 'tasks' } as never)
+
+    await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'table', published: true })
+
+    expect(createView).toHaveBeenCalledWith('tasks', 'user-1', expect.objectContaining({ published: true }))
+    const shape = (registeredConfigs.get('hutch_create_view')!.inputSchema as { shape: Record<string, { description?: string }> }).shape
+    expect(shape.published.description).toMatch(/public page/)
+    expect(shape.published.description).toMatch(/Default false/)
+    expect(shape.group_by.description).toMatch(/kanban only/i)
+  })
+
+  it('does not pass published when omitted', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(createView).mockResolvedValue({ view: { id: 1, name: 'Table' }, slug: 'tasks' } as never)
+
+    await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'table' })
+
+    const passed = vi.mocked(createView).mock.calls[0][2] as { published?: boolean }
+    expect(passed.published).toBeUndefined()
   })
 
   it('forwards an explicit name to createView', async () => {
@@ -1054,6 +1088,121 @@ describe('create_view tool', () => {
     expect(createView).toHaveBeenCalledWith('tasks', 'user-1', expect.objectContaining({
       name: 'My Board',
     }))
+  })
+})
+
+describe('update_view tool', () => {
+  type ToolResult = { isError?: boolean; content: { text: string }[] }
+  const call = (args: unknown) => registeredTools.get('hutch_update_view')!(args) as Promise<ToolResult>
+
+  it('maps snake_case inputs onto the service patch and returns the view with the collection url', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(updateView).mockResolvedValue({ view: { id: 7, name: 'Board', published: true }, slug: 'tasks-1a2b' } as never)
+
+    const result = await call({
+      slug: 'Tasks', view: 7, name: 'Board', columns: ['title'], sort: '-due', filter: { status: 'open' },
+      config: { cardTitle: 'title' }, group_by: 'priority', published: true,
+    })
+
+    expect(updateView).toHaveBeenCalledWith('Tasks', 7, 'user-1', {
+      name: 'Board', columns: ['title'], sort: '-due', filter: { status: 'open' },
+      config: { cardTitle: 'title' }, groupBy: 'priority', published: true,
+    })
+    expect(result.isError).toBeFalsy()
+    const parsed = JSON.parse(result.content[0].text)
+    expect(parsed).toEqual(expect.objectContaining({ id: 7, published: true }))
+  })
+
+  it('accepts a view slug and sends only the fields given', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(updateView).mockResolvedValue({ view: { id: 7 }, slug: 'tasks' } as never)
+
+    await call({ slug: 'tasks', view: 'board-1a2b3c4d', published: false })
+
+    expect(updateView).toHaveBeenCalledWith('tasks', 'board-1a2b3c4d', 'user-1', { published: false })
+  })
+
+  it('returns an error when the view or collection is not found', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(updateView).mockResolvedValue(null)
+
+    const result = await call({ slug: 'tasks', view: 99, published: true })
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toMatch(/not found/i)
+  })
+
+  it('returns service validation errors verbatim', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(updateView).mockResolvedValue({ error: 'group_by applies to kanban views only', status: 400 } as never)
+
+    const result = await call({ slug: 'tasks', view: 1, group_by: 'status' })
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe('group_by applies to kanban views only')
+  })
+
+  it('has a description with an example, and is not flagged destructive', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const config = registeredConfigs.get('hutch_update_view')!
+    expect(config.description).toMatch(/Example:/)
+    expect(config.description).toMatch(/public page/)
+    expect((config.annotations as { destructiveHint?: boolean }).destructiveHint).toBe(false)
+  })
+})
+
+describe('delete_view tool', () => {
+  type ToolResult = { isError?: boolean; content: { text: string }[] }
+  const call = (args: unknown) => registeredTools.get('hutch_delete_view')!(args) as Promise<ToolResult>
+
+  it('deletes by id or slug', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(deleteView).mockResolvedValue({ deleted: true } as never)
+
+    const result = await call({ slug: 'tasks', view: 3 })
+    expect(deleteView).toHaveBeenCalledWith('tasks', 3, 'user-1')
+    expect(result.isError).toBeFalsy()
+    await call({ slug: 'tasks', view: 'board-1a2b3c4d' })
+    expect(deleteView).toHaveBeenLastCalledWith('tasks', 'board-1a2b3c4d', 'user-1')
+  })
+
+  it('returns an error when the view or collection is not found', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(deleteView).mockResolvedValue(null)
+
+    const result = await call({ slug: 'tasks', view: 3 })
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toMatch(/not found/i)
+  })
+})
+
+describe('get_collection lists views', () => {
+  it('adds views with id, name, slug, type, published, columns, sort, filter and config', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollection).mockResolvedValue({ id: 5, slug: 'tasks-1a2b', name: 'Tasks' } as never)
+    vi.mocked(listViews).mockResolvedValue([
+      {
+        id: 1, collectionId: 5, name: 'Board', slug: 'board-aaaa', description: null, type: 'kanban', published: true,
+        columns: [], sort: null, filter: {}, config: { groupByField: 'status' }, createdAt: new Date(), updatedAt: new Date(),
+      },
+    ] as never)
+
+    const result = await registeredTools.get('hutch_get_collection')!({ slug: 'Tasks' }) as { content: { text: string }[] }
+
+    expect(listViews).toHaveBeenCalledWith('tasks-1a2b', 'user-1')
+    const parsed = JSON.parse(result.content[0].text)
+    expect(parsed.views).toEqual([
+      { id: 1, name: 'Board', slug: 'board-aaaa', type: 'kanban', published: true, columns: [], sort: null, filter: {}, config: { groupByField: 'status' } },
+    ])
+  })
+})
+
+describe('server instructions mention view management', () => {
+  it('names update/delete and the published flag', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
+    const instructions = McpServer.lastOptions?.instructions ?? ''
+    expect(instructions).toMatch(/hutch_update_view/)
+    expect(instructions).toMatch(/hutch_delete_view/)
+    expect(instructions).toMatch(/published/)
   })
 })
 
