@@ -634,21 +634,17 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     },
     async (params) => {
       let groupBy: string | undefined = params.group_by;
-      if (params.type === "kanban") {
-        if (params.group_by) {
-          groupBy = params.group_by;
-        } else {
-          const coll = await collectionService.getCollection(params.slug, userId);
-          if (!coll) return collectionNotFound(params.slug);
-          const fields = (coll.schema as { fields?: { name: string; type?: string }[] } | null)?.fields ?? [];
-          const selectField = fields.find((f) => f.type === "select");
-          if (!selectField) {
-            return errorResponse(
-              "Cannot infer group_by: collection has no select-type field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'."
-            );
-          }
-          groupBy = selectField.name;
+      if (params.type === "kanban" && !groupBy) {
+        const coll = await collectionService.getCollection(params.slug, userId);
+        if (!coll) return collectionNotFound(params.slug);
+        const fields = (coll.schema as { fields?: { name: string; type?: string }[] } | null)?.fields ?? [];
+        const selectField = fields.find((f) => f.type === "select");
+        if (!selectField) {
+          return errorResponse(
+            "Cannot infer group_by: collection has no select-type field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'."
+          );
         }
+        groupBy = selectField.name;
       }
 
       const result = await createView(params.slug, userId, {
