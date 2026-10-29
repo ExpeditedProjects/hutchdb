@@ -241,16 +241,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, fields_offset, field_prefix }) => {
-      const result = await collectionService.getCollection(slug, userId, { fields_offset, field_prefix });
+      const [result, collectionViews] = await Promise.all([
+        collectionService.getCollection(slug, userId, { fields_offset, field_prefix }),
+        listViews(slug, userId),
+      ]);
       if (!result) return collectionNotFound(slug);
-      const collectionViews = (await listViews(result.slug, userId)) ?? [];
-      return jsonResponse({
-        ...result,
-        views: collectionViews.map((v) => ({
-          id: v.id, name: v.name, slug: v.slug, type: v.type, published: v.published,
-          columns: v.columns, sort: v.sort, filter: v.filter, config: v.config,
-        })),
-      });
+      return jsonResponse({ ...result, views: collectionViews ?? [] });
     }
   );
 
@@ -621,7 +617,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         slug: z.string().describe(slugDescription),
         type: z.enum(VIEW_TYPES).optional().default("table"),
         name: z.string().optional().describe("View name (defaults to the type label)"),
-        group_by: z.string().optional().describe("Field name to group by, e.g. \"status\". Kanban only: any other type returns an error. If omitted on kanban, the first select field is inferred."),
+        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban only: any other type returns an error. If omitted on kanban, the first select field is inferred."),
         config: z.record(z.string(), z.unknown()).optional().describe("View-type-specific settings (e.g. {\"dateField\": \"due_date\"} for calendar, {\"imageField\": \"cover\"} for gallery)"),
         filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"})"),
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
@@ -655,7 +651,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         columns: params.columns,
         ...(params.name !== undefined ? { name: params.name } : {}),
         ...(groupBy !== undefined ? { groupBy } : {}),
-        ...(params.published !== undefined ? { published: params.published } : {}),
+        published: params.published,
       });
       if (!result) return collectionNotFound(params.slug);
       if ("error" in result) return errorResponse(result.error as string);
@@ -663,9 +659,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     }
   );
 
-  // Slugs always end in a random suffix, so a digits-only string is an id.
-  const viewRef = (view: number | string): ViewRef => (typeof view === "string" && /^\d+$/.test(view) ? Number(view) : view);
-  const viewRefSchema = z.union([z.number().int(), z.string()]).describe("The view's id or slug, as hutch_get_collection lists them");
+  // Slugs always end in a random suffix, so a digits-only string is an id
+  // (one past the int4 id range stays a string and simply matches no slug).
+  const MAX_VIEW_ID = 2147483647;
+  const viewRef = (view: number | string): ViewRef =>
+    typeof view === "string" && /^\d{1,10}$/.test(view) && Number(view) <= MAX_VIEW_ID ? Number(view) : view;
+  const viewRefSchema = z.union([z.number().int().positive().max(MAX_VIEW_ID), z.string().min(1)]).describe("The view's id or slug, as hutch_get_collection lists them");
 
   registerTool(
     "hutch_update_view",
@@ -680,25 +679,17 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         sort: z.string().nullable().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\"); null clears it"),
         filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"}); replaces the current filter"),
         config: z.record(z.string(), z.unknown()).optional().describe("View-type-specific settings merged into the current ones (dateField, cardTitle, imageField, groupByField)"),
-        group_by: z.string().optional().describe("Field name to group by, e.g. \"status\". Kanban views only: any other type returns an error."),
+        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban views only: any other type returns an error."),
         published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
       // Not destructive: a published view is public only once the collection
       // itself is published, which is the destructive hutch_update_collection call.
       annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async (params) => {
-      const ref = viewRef(params.view);
-      const result = await updateView(params.slug, ref, userId, {
-        ...(params.name !== undefined ? { name: params.name } : {}),
-        ...(params.columns !== undefined ? { columns: params.columns } : {}),
-        ...(params.sort !== undefined ? { sort: params.sort } : {}),
-        ...(params.filter !== undefined ? { filter: params.filter as Record<string, unknown> } : {}),
-        ...(params.config !== undefined ? { config: params.config as Record<string, unknown> } : {}),
-        ...(params.group_by !== undefined ? { groupBy: params.group_by } : {}),
-        ...(params.published !== undefined ? { published: params.published } : {}),
-      });
-      if (!result) return viewNotFound(params.slug, ref);
+    async ({ slug, view, group_by, ...patch }) => {
+      const ref = viewRef(view);
+      const result = await updateView(slug, ref, userId, { ...patch, groupBy: group_by });
+      if (!result) return viewNotFound(slug, ref);
       if ("error" in result) return errorResponse(result.error as string);
       return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
     }

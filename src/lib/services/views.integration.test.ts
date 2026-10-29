@@ -75,8 +75,12 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     return result.view as View;
   }
 
-  async function grantViewer(collectionId: number) {
-    await testDb.insert(schema.collectionMembers).values({ collectionId, userId: VIEWER_ID, role: "viewer" });
+  async function grantViewer(collectionId: number, role: "viewer" | "editor" = "viewer") {
+    await testDb.insert(schema.collectionMembers).values({ collectionId, userId: VIEWER_ID, role });
+  }
+
+  async function ageView(id: number) {
+    await testDb.update(schema.views).set({ updatedAt: new Date("2020-01-01T00:00:00Z") }).where(eq(schema.views.id, id));
   }
 
   async function rawView(id: number): Promise<View> {
@@ -112,6 +116,12 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       expect(view.config).toEqual(expect.objectContaining({ groupByField: "status" }));
     });
 
+    it("stores only allowlisted config keys", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "calendar", config: { dateField: "due", evil: "<script>" } });
+      expect((await rawView(view.id)).config).toEqual({ dateField: "due" });
+    });
+
     it("leaves seeded views unpublished", async () => {
       const { collection } = await collectionsSvc.createCollection(OWNER_ID, ORG_ID, {
         name: "Seeded",
@@ -128,7 +138,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     it("updates a view addressed by id", async () => {
       const { slug } = await makeCollection("Tasks");
       const view = await makeView(slug, { type: "table", name: "All" });
-      const before = (await rawView(view.id)).updatedAt!;
+      await ageView(view.id);
 
       const result = await viewsSvc.updateView(slug, view.id, OWNER_ID, {
         name: "  Open tasks  ",
@@ -152,7 +162,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const row = await rawView(view.id);
       expect(row.published).toBe(true);
       expect(row.name).toBe("Open tasks");
-      expect(row.updatedAt!.getTime()).toBeGreaterThanOrEqual(before.getTime());
+      expect(row.updatedAt!.getTime()).toBeGreaterThan(new Date("2020-01-01T00:00:00Z").getTime());
     });
 
     it("updates a view addressed by its slug, accepting the collection's name", async () => {
@@ -162,6 +172,29 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const result = await viewsSvc.updateView("Tasks", view.slug, OWNER_ID, { published: true });
       expect((result as { view: View }).view.published).toBe(true);
       expect((await rawView(view.id)).published).toBe(true);
+    });
+
+    it("replaces the filter rather than merging it", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", filter: { status: "open" } });
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { filter: { priority: "high" } });
+      expect((await rawView(view.id)).filter).toEqual({ priority: "high" });
+    });
+
+    it("unpublishes a published view", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true });
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: false });
+      expect((await rawView(view.id)).published).toBe(false);
+    });
+
+    it("writes nothing when the patch is empty", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table" });
+      await ageView(view.id);
+      const result = await viewsSvc.updateView(slug, view.id, OWNER_ID, {});
+      expect((result as { view: View }).view.id).toBe(view.id);
+      expect((await rawView(view.id)).updatedAt).toEqual(new Date("2020-01-01T00:00:00Z"));
     });
 
     it("clears sort with null and leaves untouched fields alone", async () => {
@@ -207,6 +240,20 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       expect((await rawView(view.id)).config).toEqual({ groupByField: "priority", cardTitle: "title" });
     });
 
+    it("treats a group field passed in config like group_by", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const board = await makeView(slug, { type: "kanban", groupBy: "status" });
+      await viewsSvc.updateViewConfig(slug, board.id, OWNER_ID, { groupField: "status" });
+
+      await viewsSvc.updateView(slug, board.id, OWNER_ID, { config: { groupByField: "priority" } });
+      expect((await rawView(board.id)).config).toEqual({ groupByField: "priority" });
+
+      const table = await makeView(slug, { type: "table" });
+      const rejected = await viewsSvc.updateView(slug, table.id, OWNER_ID, { config: { groupField: "status" } });
+      expect(rejected).toEqual({ error: "group_by applies to kanban views only", status: 400 });
+      expect((await rawView(table.id)).config).toEqual({});
+    });
+
     it("merges config through the allowlist", async () => {
       const { slug } = await makeCollection("Tasks");
       const view = await makeView(slug, { type: "calendar", config: { dateField: "due" } });
@@ -233,6 +280,14 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       expect(await viewsSvc.updateView("nope", 1, OWNER_ID, { published: true })).toBeNull();
       expect(await viewsSvc.updateView(slug, 9999, OWNER_ID, { published: true })).toBeNull();
       expect(await viewsSvc.updateView(slug, "no-such-view", OWNER_ID, { published: true })).toBeNull();
+    });
+
+    it("is allowed to an editor", async () => {
+      const { id, slug } = await makeCollection("Tasks");
+      await grantViewer(id, "editor");
+      const view = await makeView(slug, { type: "table" });
+      expect(await viewsSvc.updateView(slug, view.id, VIEWER_ID, { published: true })).not.toBeNull();
+      expect((await rawView(view.id)).published).toBe(true);
     });
 
     it("is refused to a viewer", async () => {
@@ -263,6 +318,14 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       expect(await rawView(viewB.id)).toBeDefined();
     });
 
+    it("is allowed to an editor", async () => {
+      const { id, slug } = await makeCollection("Tasks");
+      await grantViewer(id, "editor");
+      const view = await makeView(slug, { type: "table" });
+      expect(await viewsSvc.deleteView(slug, view.id, VIEWER_ID)).toEqual({ deleted: true });
+      expect(await rawView(view.id)).toBeUndefined();
+    });
+
     it("is refused to a viewer", async () => {
       const { id, slug } = await makeCollection("Tasks");
       await grantViewer(id);
@@ -287,6 +350,9 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
 
       const viewer = await viewsSvc.listViews(a.slug, VIEWER_ID);
       expect(viewer!.map((v) => v.id)).toEqual([first.id, second.id]);
+      expect(Object.keys(viewer![0]).sort()).toEqual(
+        ["columns", "config", "filter", "id", "name", "published", "slug", "sort", "type"],
+      );
     });
 
     it("returns null for a collection the user cannot see", async () => {

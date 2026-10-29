@@ -1111,6 +1111,20 @@ describe('update_view tool', () => {
     expect(result.isError).toBeFalsy()
     const parsed = JSON.parse(result.content[0].text)
     expect(parsed).toEqual(expect.objectContaining({ id: 7, published: true }))
+    expect(parsed.url).toBe('https://example.test/c/tasks-1a2b')
+  })
+
+  it('reads a digits-only view string as an id, and anything else as a slug', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(updateView).mockResolvedValue({ view: { id: 7 }, slug: 'tasks' } as never)
+
+    await call({ slug: 'tasks', view: '7', published: true })
+    expect(vi.mocked(updateView).mock.calls.at(-1)![1]).toBe(7)
+    await call({ slug: 'tasks', view: '7a', published: true })
+    expect(vi.mocked(updateView).mock.calls.at(-1)![1]).toBe('7a')
+    // Past the int4 id range: kept as a string, so it can't reach Postgres as an id.
+    await call({ slug: 'tasks', view: '2147483648', published: true })
+    expect(vi.mocked(updateView).mock.calls.at(-1)![1]).toBe('2147483648')
   })
 
   it('accepts a view slug and sends only the fields given', async () => {
@@ -1160,6 +1174,7 @@ describe('delete_view tool', () => {
     const result = await call({ slug: 'tasks', view: 3 })
     expect(deleteView).toHaveBeenCalledWith('tasks', 3, 'user-1')
     expect(result.isError).toBeFalsy()
+    expect(result.content[0].text).toBe("View '3' deleted.")
     await call({ slug: 'tasks', view: 'board-1a2b3c4d' })
     expect(deleteView).toHaveBeenLastCalledWith('tasks', 'board-1a2b3c4d', 'user-1')
   })
@@ -1175,23 +1190,29 @@ describe('delete_view tool', () => {
 })
 
 describe('get_collection lists views', () => {
-  it('adds views with id, name, slug, type, published, columns, sort, filter and config', async () => {
+  it('adds the views listViews returns for the same collection reference', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     vi.mocked(collectionService.getCollection).mockResolvedValue({ id: 5, slug: 'tasks-1a2b', name: 'Tasks' } as never)
-    vi.mocked(listViews).mockResolvedValue([
-      {
-        id: 1, collectionId: 5, name: 'Board', slug: 'board-aaaa', description: null, type: 'kanban', published: true,
-        columns: [], sort: null, filter: {}, config: { groupByField: 'status' }, createdAt: new Date(), updatedAt: new Date(),
-      },
-    ] as never)
+    const listed = [
+      { id: 1, name: 'Board', slug: 'board-aaaa', type: 'kanban', published: true, columns: [], sort: null, filter: {}, config: { groupByField: 'status' } },
+    ]
+    vi.mocked(listViews).mockResolvedValue(listed as never)
 
     const result = await registeredTools.get('hutch_get_collection')!({ slug: 'Tasks' }) as { content: { text: string }[] }
 
-    expect(listViews).toHaveBeenCalledWith('tasks-1a2b', 'user-1')
-    const parsed = JSON.parse(result.content[0].text)
-    expect(parsed.views).toEqual([
-      { id: 1, name: 'Board', slug: 'board-aaaa', type: 'kanban', published: true, columns: [], sort: null, filter: {}, config: { groupByField: 'status' } },
-    ])
+    expect(listViews).toHaveBeenCalledWith('Tasks', 'user-1')
+    expect(JSON.parse(result.content[0].text).views).toEqual(listed)
+  })
+
+  it('lists no views when listViews finds none for the caller', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollection).mockResolvedValue({ id: 5, slug: 'tasks-1a2b', name: 'Tasks' } as never)
+    vi.mocked(listViews).mockResolvedValue(null)
+
+    const result = await registeredTools.get('hutch_get_collection')!({ slug: 'tasks-1a2b' }) as { content: { text: string }[]; isError?: boolean }
+
+    expect(result.isError).toBeFalsy()
+    expect(JSON.parse(result.content[0].text).views).toEqual([])
   })
 })
 
