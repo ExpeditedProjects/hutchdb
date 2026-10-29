@@ -2,7 +2,7 @@ import { McpServer, type ToolAnnotations } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import * as collectionService from "@/lib/services/collections";
 import * as recordService from "@/lib/services/records";
-import { createView } from "@/lib/services/views";
+import { createView, updateView, deleteView, listViews, type ViewRef } from "@/lib/services/views";
 import { VIEW_TYPES } from "@/lib/views/types";
 import { FILTER_OPERATORS, MAX_GROUP_BY_KEYS } from "@/lib/db/queries";
 import { reportError } from "@/lib/errors/report";
@@ -36,7 +36,7 @@ Use hutch_collection_stats for a quick overview of a collection's size and field
 
 For deduplication: set unique_key via hutch_update_collection, then hutch_store_records honors on_conflict (default: replace).
 
-Views (hutch_create_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it.
+Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A view marked published appears as a tab on the collection's public page once the collection is published.
 
 This is the headless single-user Core. Multi-user sharing, organizations, invitations, and published dashboards live in Hutch Cloud (app.hutchdb.com), not here.`;
 
@@ -67,6 +67,9 @@ const FILTER_DESCRIPTION =
   "Any other top-level key starting with $ is an error. " +
   STATUS_NOTE +
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
+
+// Shared by hutch_create_view and hutch_update_view.
+const PUBLISHED_VIEW_DESCRIPTION = "Show this view as a tab on the collection's public page (only matters when the collection is published). Default false.";
 
 // Field paging shared by hutch_describe_collection and hutch_get_collection.
 const FIELDS_OFFSET_DESCRIPTION = `Skip this many fields (default 0): each call lists at most ${DESCRIBE_FIELDS_PAGE}; pass the response's fields_next_offset for the next page.`;
@@ -101,6 +104,12 @@ function summarizedWriteResponse(result: object, collectionUrl: (slug: string) =
   const json = JSON.stringify(enriched);
   const summary = (result as { summary?: string }).summary;
   return textResponse(summary ? `${summary}\n\n${json}` : json);
+}
+
+function viewNotFound(slug: string, view: ViewRef): McpToolResponse {
+  return errorResponse(
+    `View '${view}' not found in collection '${slug}' (or the collection was not found). Call hutch_get_collection to list its views with their ids and slugs.`
+  );
 }
 
 function collectionNotFound(slug: string): McpToolResponse {
@@ -223,7 +232,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_get_collection",
     {
       title: "Get Collection",
-      description: `Get one collection's metadata, settings and record count, its saved schema (schema.fields: name, type, options; at most ${DESCRIBE_FIELDS_PAGE} per call, paged like hutch_describe_collection), and storage diagnostics: storage.projections (fields with indexed columns), storage.unwinds (arrays of objects made queryable), storage.pending_unwinds, and storage.search_index, each with its build state (pending, building, ready, or failed with a reason and retry time; until ready, queries on that field read every document). Example: use when the user asks 'how big is my bookmarks collection?', or when queries on a collection are slow or failing.`,
+      description: `Get one collection's metadata, settings and record count, its saved schema (schema.fields: name, type, options; at most ${DESCRIBE_FIELDS_PAGE} per call, paged like hutch_describe_collection), and storage diagnostics: storage.projections (fields with indexed columns), storage.unwinds (arrays of objects made queryable), storage.pending_unwinds, and storage.search_index, each with its build state (pending, building, ready, or failed with a reason and retry time; until ready, queries on that field read every document); and its saved views (id, name, slug, type, published, columns, sort, filter, config). Example: use when the user asks 'how big is my bookmarks collection?', or when queries on a collection are slow or failing.`,
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         fields_offset: z.number().int().min(0).optional().describe(FIELDS_OFFSET_DESCRIPTION),
@@ -232,9 +241,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, fields_offset, field_prefix }) => {
-      const result = await collectionService.getCollection(slug, userId, { fields_offset, field_prefix });
+      const [result, collectionViews] = await Promise.all([
+        collectionService.getCollection(slug, userId, { fields_offset, field_prefix }),
+        listViews(slug, userId),
+      ]);
       if (!result) return collectionNotFound(slug);
-      return jsonResponse(result);
+      return jsonResponse({ ...result, views: collectionViews ?? [] });
     }
   );
 
@@ -605,31 +617,30 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         slug: z.string().describe(slugDescription),
         type: z.enum(VIEW_TYPES).optional().default("table"),
         name: z.string().optional().describe("View name (defaults to the type label)"),
-        group_by: z.string().optional().describe("Field name to group by (kanban only), e.g. \"status\". If omitted on kanban, the first select field is inferred."),
+        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban only: any other type returns an error. If omitted on kanban, the first select field is inferred."),
         config: z.record(z.string(), z.unknown()).optional().describe("View-type-specific settings (e.g. {\"dateField\": \"due_date\"} for calendar, {\"imageField\": \"cover\"} for gallery)"),
         filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"})"),
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
         columns: z.array(z.string()).optional().describe("Columns to display, in order (e.g. [\"title\", \"url\"])"),
+        published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
+      // Not destructive: a published view is public only once the collection
+      // itself is published, which is the destructive hutch_update_collection call.
       annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
-      let groupBy: string | undefined;
-      if (params.type === "kanban") {
-        if (params.group_by) {
-          groupBy = params.group_by;
-        } else {
-          const coll = await collectionService.getCollection(params.slug, userId);
-          if (!coll) return collectionNotFound(params.slug);
-          const fields = (coll.schema as { fields?: { name: string; type?: string }[] } | null)?.fields ?? [];
-          const selectField = fields.find((f) => f.type === "select");
-          if (!selectField) {
-            return errorResponse(
-              "Cannot infer group_by: collection has no select-type field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'."
-            );
-          }
-          groupBy = selectField.name;
+      let groupBy: string | undefined = params.group_by;
+      if (params.type === "kanban" && !groupBy) {
+        const coll = await collectionService.getCollection(params.slug, userId);
+        if (!coll) return collectionNotFound(params.slug);
+        const fields = (coll.schema as { fields?: { name: string; type?: string }[] } | null)?.fields ?? [];
+        const selectField = fields.find((f) => f.type === "select");
+        if (!selectField) {
+          return errorResponse(
+            "Cannot infer group_by: collection has no select-type field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'."
+          );
         }
+        groupBy = selectField.name;
       }
 
       const result = await createView(params.slug, userId, {
@@ -640,10 +651,66 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         columns: params.columns,
         ...(params.name !== undefined ? { name: params.name } : {}),
         ...(groupBy !== undefined ? { groupBy } : {}),
+        published: params.published,
       });
       if (!result) return collectionNotFound(params.slug);
       if ("error" in result) return errorResponse(result.error as string);
       return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
+    }
+  );
+
+  // Slugs always end in a random suffix, so a digits-only string is an id
+  // (one past the int4 id range stays a string and simply matches no slug).
+  const MAX_VIEW_ID = 2147483647;
+  const viewRef = (view: number | string): ViewRef =>
+    typeof view === "string" && /^\d{1,10}$/.test(view) && Number(view) <= MAX_VIEW_ID ? Number(view) : view;
+  const viewRefSchema = z.union([z.number().int().positive().max(MAX_VIEW_ID), z.string().min(1)]).describe("The view's id or slug, as hutch_get_collection lists them");
+
+  registerTool(
+    "hutch_update_view",
+    {
+      title: "Update View",
+      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or mark it published so it shows as a tab on the collection's public page. Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants a view shown on the public page (published: true), or regrouped/renamed.",
+      inputSchema: z.object({
+        slug: z.string().describe(slugDescription),
+        view: viewRefSchema,
+        name: z.string().optional().describe("New view name"),
+        columns: z.array(z.string()).optional().describe("Columns to display, in order (e.g. [\"title\", \"url\"])"),
+        sort: z.string().nullable().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\"); null clears it"),
+        filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"}); replaces the current filter"),
+        config: z.record(z.string(), z.unknown()).optional().describe("View-type-specific settings merged into the current ones (dateField, cardTitle, imageField, groupByField)"),
+        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban views only: any other type returns an error."),
+        published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
+      }),
+      // Not destructive: a published view is public only once the collection
+      // itself is published, which is the destructive hutch_update_collection call.
+      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ slug, view, group_by, ...patch }) => {
+      const ref = viewRef(view);
+      const result = await updateView(slug, ref, userId, { ...patch, groupBy: group_by });
+      if (!result) return viewNotFound(slug, ref);
+      if ("error" in result) return errorResponse(result.error as string);
+      return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
+    }
+  );
+
+  registerTool(
+    "hutch_delete_view",
+    {
+      title: "Delete View",
+      description: "Delete a saved view from a collection (its records are not touched). Find view ids and slugs with hutch_get_collection. Example: use when the user says 'remove the calendar view'.",
+      inputSchema: z.object({
+        slug: z.string().describe(slugDescription),
+        view: viewRefSchema,
+      }),
+      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async (params) => {
+      const ref = viewRef(params.view);
+      const result = await deleteView(params.slug, ref, userId);
+      if (!result) return viewNotFound(params.slug, ref);
+      return textResponse(`View '${params.view}' deleted.`);
     }
   );
 

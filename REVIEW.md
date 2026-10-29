@@ -11,6 +11,7 @@ What review should care about in this repo. `/review` and `/issue-pr` read this;
 - **Background work that outlives its platform.** `after()` work on Vercel is cut off at the function's duration, and a killed build never reaches its `catch`. Work started from a request must fit `HUTCH_AFTER_BUILD_BUDGET_MS`, count a killed attempt as a failure so it backs off, and run at most one per process: each builder holds a pool connection for minutes (#71).
 - **DDL that blocks a request.** A request that changes a table's structure (`DROP TABLE`, triggers, unique keys) must set a short `lock_timeout` well under the 5 s statement timeout. Reads and writes queue behind a waiting lock request, so a long wait times out other users' requests, not just this one (#71).
 - **Shortened output written back as data.** Query output can be cut short (`max_string_length`, page budgets). A write path must never store a cut-short value as if it were the full one. `hutch_update_record` overwrites the whole record (#71).
+- **A migration the migrator skips.** Drizzle applies only journal entries whose `when` is newer than the last applied migration, and Cloud shares this journal. A new entry's `when` must be today, not a future date: a future one hides every Cloud migration dated before it (#77).
 - **Leaking internals or crashing the process.** DB errors must not reach tool output as raw driver or SQL text (#7, #9). One unhandled pool `error` event killed the process and every in-flight request (#61).
 
 ## Sensitive paths

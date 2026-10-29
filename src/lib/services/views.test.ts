@@ -171,23 +171,19 @@ describe('createView with explicit name and groupBy', () => {
     expect(inserted.config).toEqual(expect.objectContaining({ groupByField: 'status' }))
   })
 
-  it('merges groupBy into a caller-supplied config without clobbering other keys', async () => {
+  it('merges groupBy into the allowlisted caller config, dropping unknown keys', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: collectionRow, role: 'editor' })
     insertReturning.mockResolvedValue([{ id: 1, name: 'Kanban', slug: 'kanban-aaaaaaaa', type: 'kanban' }])
 
     await createView('bookmarks', 'user-test', {
       type: 'kanban',
       groupBy: 'status',
-      config: { color: 'blue', cardSize: 'lg' },
+      config: { cardTitle: 'title', color: 'blue' },
     } as never)
 
     const valuesCall = vi.mocked(db.insert).mock.results[0].value.values
     const inserted = valuesCall.mock.calls[0][0]
-    expect(inserted.config).toEqual(expect.objectContaining({
-      groupByField: 'status',
-      color: 'blue',
-      cardSize: 'lg',
-    }))
+    expect(inserted.config).toEqual({ groupByField: 'status', cardTitle: 'title' })
   })
 })
 

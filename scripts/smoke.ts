@@ -15,7 +15,7 @@
 //   suggest a stale build.
 //
 // Opt-in full loop (SMOKE_FULL=1): runs a real MCP session end to end —
-// initialize → tools/list (18 tools, titles, readOnlyHint on read tools) →
+// initialize → tools/list (20 tools, titles, readOnlyHint on read tools) →
 // store → query (operator filter) → transform (rename) → export CSV →
 // delete collection — against a scratch collection that is removed at the
 // end. Requires the target server to have a working database.
@@ -155,7 +155,7 @@ function toolJson(text: string): Record<string, unknown> {
   return JSON.parse(text.slice(start)) as Record<string, unknown>;
 }
 
-const EXPECTED_TOOL_COUNT = 18;
+const EXPECTED_TOOL_COUNT = 20;
 
 // Tools registered with readOnlyHint: true in src/lib/mcp/server.ts.
 const READ_ONLY_TOOLS = [

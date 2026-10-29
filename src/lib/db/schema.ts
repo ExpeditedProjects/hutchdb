@@ -251,6 +251,8 @@ export const views = pgTable("views", {
   sort: text("sort"),
   columns: jsonb("columns").default([]),
   config: jsonb("config").default({}),
+  // Shown as a tab on the collection's public page (when the collection is published).
+  published: boolean("published").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
