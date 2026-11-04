@@ -100,11 +100,54 @@ function jsonResponse(value: unknown): McpToolResponse {
  */
 function summarizedWriteResponse(result: object, collectionUrl: (slug: string) => string): McpToolResponse {
   const slug = (result as { collection?: { slug?: string } }).collection?.slug;
-  const enriched = slug ? { ...result, url: collectionUrl(slug) } : result;
+  const trimmed = trimRecordResults(result);
+  const enriched = slug ? { ...trimmed, url: collectionUrl(slug) } : trimmed;
   const json = JSON.stringify(enriched);
   const summary = (result as { summary?: string }).summary;
   return textResponse(summary ? `${summary}\n\n${json}` : json);
 }
+
+/**
+ * Storage bookkeeping the services return alongside each record or view
+ * but that is not the user's data: the internal collection FK (the slug
+ * already names the collection), the write source (always "api") and
+ * deletedAt (always null on a live record). Tool output leaves them out;
+ * only these top-level keys go, never anything inside `data`.
+ */
+const INTERNAL_RECORD_KEYS = ["collectionId", "source", "deletedAt"] as const;
+
+function withoutInternalKeys<T>(value: T, keys: readonly string[] = INTERNAL_RECORD_KEYS): T {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const copy = { ...(value as Record<string, unknown>) };
+  for (const key of keys) delete copy[key];
+  return copy as T;
+}
+
+/** Records in a query result (`records`), a write result (`results[].record`) or a search group. */
+function trimRecordList(list: unknown): unknown {
+  return Array.isArray(list) ? list.map((r) => withoutInternalKeys(r)) : list;
+}
+
+/**
+ * The record(s) in a write result or a per_record aggregate: `results[].record`,
+ * or the top-level `record` of a single-record store (`data:`), which spreads
+ * its one result into the response.
+ */
+function trimRecordResults(result: object): object {
+  const results = (result as { results?: unknown }).results;
+  if (!Array.isArray(results)) {
+    return "record" in result ? { ...result, record: withoutInternalKeys(result.record) } : result;
+  }
+  return {
+    ...result,
+    results: results.map((r) =>
+      r && typeof r === "object" && "record" in r ? { ...r, record: withoutInternalKeys((r as { record: unknown }).record) } : r
+    ),
+  };
+}
+
+/** The tenant id is the account's internal key, not collection data. */
+const INTERNAL_COLLECTION_KEYS = ["organizationId"] as const;
 
 function viewNotFound(slug: string, view: ViewRef): McpToolResponse {
   return errorResponse(
@@ -205,7 +248,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       title: "List Collections",
       description: "List every collection the user has stored, with id, name, slug, description, unique_key, and record count. Use hutch_describe_collection for a collection's fields and types. Example: use when the user asks 'what data do I have in Hutch?'.",
       inputSchema: z.object({}),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async () => {
       const collections = await collectionService.listCollections(userId);
@@ -238,7 +281,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         fields_offset: z.number().int().min(0).optional().describe(FIELDS_OFFSET_DESCRIPTION),
         field_prefix: z.string().optional().describe(FIELD_PREFIX_DESCRIPTION),
       }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, fields_offset, field_prefix }) => {
       const [result, collectionViews] = await Promise.all([
@@ -246,7 +289,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         listViews(slug, userId),
       ]);
       if (!result) return collectionNotFound(slug);
-      return jsonResponse({ ...result, views: collectionViews ?? [] });
+      return jsonResponse({
+        ...withoutInternalKeys(result, INTERNAL_COLLECTION_KEYS),
+        views: (collectionViews ?? []).map((v) => withoutInternalKeys(v)),
+      });
     }
   );
 
@@ -260,7 +306,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         fields_offset: z.number().int().min(0).optional().describe(FIELDS_OFFSET_DESCRIPTION),
         field_prefix: z.string().optional().describe(FIELD_PREFIX_DESCRIPTION),
       }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, fields_offset, field_prefix }) => {
       const result = await collectionService.describeCollection(slug, userId, { fields_offset, field_prefix });
@@ -273,7 +319,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_store_records",
     {
       title: "Store Records",
-      description: `Save one or many records to a collection (auto-creates the collection if new). ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. When a batch makes fields queryable or unwinds an array, the response says so in storage_note; the indexes are built in the background shortly after the write, which does not wait for them. Example: use when the user says 'save this' or has just produced structured output worth keeping for later.`,
+      description: `Save one or many records to a collection (auto-creates the collection if new). A new collection also gets default views seeded from the first batch's fields: kanban for a field with a few repeated values (e.g. status or tags), calendar and timeline for a date field, gallery for an image URL field. ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. When a batch makes fields queryable or unwinds an array, the response says so in storage_note; the indexes are built in the background shortly after the write, which does not wait for them. With a unique_key on the collection, a record matching an existing one is handled by on_conflict: the default, replace, overwrites the stored record. Without a unique_key, calling again with the same data stores the records again. Example: use when the user asks to save something, e.g. 'save this bookmark'.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
         data: z.record(z.string(), z.unknown()).optional().describe("Single record as a JSON object (e.g. {\"title\": \"My note\", \"tags\": [\"work\"]}). Use this OR records, not both."),
@@ -281,7 +327,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do if a record with the same unique key exists. Default: replace"),
         return: z.enum(["records", "summary"]).optional().describe("\"records\" (default) echoes each stored record; \"summary\" returns only counts and the summary line — use it for bulk loads."),
       }),
-      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // Destructive: the default on_conflict (replace) overwrites a stored
+      // record that matches the unique key. Not idempotent: without a
+      // unique_key a retry inserts the records a second time.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
       const result = await recordService.createRecords(userId, organizationId, {
@@ -322,7 +371,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         offset: z.number().optional().describe(`Offset for pagination, for records and for aggregate groups alike: follow next_offset while has_more is true. A page whose JSON would exceed ${MAX_PAGE_CHARS.toLocaleString("en-US")} characters returns fewer rows than limit, with page_note, has_more and next_offset set to continue.`),
         max_string_length: z.number().int().min(0).optional().describe(MAX_STRING_LENGTH_DESCRIPTION),
       }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
       const result = await recordService.queryRecords(params.slug, userId, {
@@ -343,7 +392,9 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         perRecord: params.per_record,
       }, { maxStringLength: params.max_string_length ?? DEFAULT_MAX_STRING_LENGTH, maxPageChars: MAX_PAGE_CHARS });
       if (!result) return collectionNotFound(params.slug);
-      return jsonResponse(result);
+      // A records query returns `records`; an aggregate returns `results`,
+      // whose per_record rows carry the parent as `record`.
+      return jsonResponse("records" in result ? { ...result, records: trimRecordList(result.records) } : trimRecordResults(result));
     }
   );
 
@@ -357,11 +408,14 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         limit: z.number().optional().describe("Max results in total across all collections (default 10, max 50), most relevant first, then newest; results are grouped by collection and each record carries its collection slug"),
         max_string_length: z.number().int().min(0).optional().describe(MAX_STRING_LENGTH_DESCRIPTION),
       }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
       const result = await recordService.searchGlobal(userId, params.search, params.limit, { maxStringLength: params.max_string_length ?? DEFAULT_MAX_STRING_LENGTH });
-      return jsonResponse(result);
+      const results = Array.isArray(result.results)
+        ? result.results.map((g) => ({ ...g, records: trimRecordList(g.records) }))
+        : result.results;
+      return jsonResponse({ ...result, results });
     }
   );
 
@@ -371,7 +425,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       title: "Collection Stats",
       description: "Get statistics for one collection: record_count, counts by status, first/last created_at and updated_at, approximate storage bytes, and per-field fill rates (for each top-level key: how many records have it and what percent, most common first, capped at 50 keys). Fill rates are exact counts over all records (hutch_describe_collection's frequency is sampled), except on a collection whose documents are too large to scan in time (over 100 MB stored), where they are estimated from a random sample: the response then has fields_sampled and fields_note, and each field gives estimated_count instead of count. Example: use before a bulk cleanup, or when the user asks 'how complete is my contacts data?' or 'how big is this collection really?'.",
       inputSchema: z.object({ slug: z.string().describe(slugDescription) }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
       const result = await collectionService.getCollectionStats(slug, userId);
@@ -394,7 +448,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         fields: z.array(z.string()).optional().describe("Top-level data keys to include (CSV data columns / JSON data keys). Omit for all fields."),
         limit: z.number().optional().describe("Max records to export (default 1000, max 10000). Check the truncated flag in the response."),
       }),
-      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
       const result = await recordService.exportRecords(params.collection, userId, {
@@ -415,7 +469,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_import_records",
     {
       title: "Import Records",
-      description: `Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). ${NESTED_DOCUMENTS_NOTE.replace("Records can", "JSON records can")}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL} (content up to ${MCP_MAX_REQUEST_BODY_BYTES < 10 * 1024 * 1024 ? "a little less than that" : "10 MB"}). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.`,
+      description: `Import records into a collection from CSV or JSON text (auto-creates the collection if new; honors unique_key and on_conflict exactly like hutch_store_records). ${NESTED_DOCUMENTS_NOTE.replace("Records can", "JSON records can")}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL} (content up to ${MCP_MAX_REQUEST_BODY_BYTES < 10 * 1024 * 1024 ? "a little less than that" : "10 MB"}). CSV requires a header row; numeric strings become numbers, true/false become booleans, empty cells are omitted, JSON-looking cells ({...} or [...]) are parsed, and id/created_at/updated_at columns are ignored — so hutch_export_records output round-trips cleanly. A row matching an existing record's unique key is overwritten under the default on_conflict (replace); without a unique_key, importing the same content again stores the rows again. Example: use when the user pastes a spreadsheet export and says 'load this into Hutch'. For records you already hold as JSON objects, hutch_store_records is the more direct path.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name or slug (created automatically if new)"),
         format: z.enum(["csv", "json"]).optional().describe("Content format. Default: csv"),
@@ -423,7 +477,8 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         on_conflict: z.enum(["replace", "merge", "skip", "error"]).optional().describe("What to do when a record matches an existing unique key. Default: replace"),
         return: z.enum(["records", "summary"]).optional().describe("\"summary\" (default) returns counts only; \"records\" also echoes each stored record."),
       }),
-      annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      // Destructive for the same reason as hutch_store_records (default on_conflict: replace).
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async (params) => {
       const result = await recordService.importRecords(userId, organizationId, {
@@ -442,7 +497,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_collection",
     {
       title: "Update Collection",
-      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Example: use when the user wants to publish a collection or set a dedup key.",
+      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Only the fields you pass change; each replaces the current value. published: true makes the collection, and its views marked published, viewable by anyone as a read-only web page; published: false makes it private again. Example: use when the user wants to publish a collection or set a dedup key.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         name: z.string().optional().describe("New collection name"),
@@ -450,14 +505,15 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         unique_key: z.array(z.string()).optional().describe("Fields that form the unique key for upsert (e.g. [\"url\"] or [\"email\", \"date\"])"),
         published: z.boolean().optional().describe("Whether the collection is publicly viewable"),
       }),
-      // destructiveHint: true because `published: true` exposes the collection to the public web.
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      // Destructive: overwrites name/description/unique_key. Open world:
+      // `published: true` exposes the collection on the public web.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async (params) => {
       const { slug, ...updates } = params;
       const result = await collectionService.updateCollection(slug, userId, updates);
       if ('error' in result) return errorResponse(result.error!);
-      return jsonResponse({ ...result.collection, url: collectionUrl((result.collection as { slug?: string }).slug ?? slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.collection, INTERNAL_COLLECTION_KEYS), url: collectionUrl((result.collection as { slug?: string }).slug ?? slug) });
     }
   );
 
@@ -467,7 +523,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       title: "Delete Collection",
       description: "Permanently delete a collection and all of its records. Example: use when the user says 'drop the test collection' or 'delete bookmarks'.",
       inputSchema: z.object({ slug: z.string().describe(`${slugDescription} to delete`) }),
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
       const result = await collectionService.deleteCollection(slug, userId);
@@ -486,13 +542,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         record_id: z.number().describe("Record ID to update"),
         data: z.record(z.string(), z.unknown()).describe("New data for the record (replaces existing data)"),
       }),
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id, data }) => {
       const result = await recordService.updateRecord(slug, userId, record_id, data as Record<string, unknown>);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result.record, url: collectionUrl(result.slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.record), url: collectionUrl(result.slug) });
     }
   );
 
@@ -500,7 +556,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_transform_records",
     {
       title: "Transform Records",
-      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'.",
+      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Changes are written to the stored records in place. Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"})"),
@@ -511,7 +567,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
           filter: z.record(z.string(), z.unknown()).optional().describe("Only update records matching this filter, same syntax as hutch_query_records (e.g. {\"status\": \"active\"} or {\"score\": {\"$gt\": 10}})"),
         }).optional().describe("Set a field value, optionally on filtered records"),
       }),
-      annotations: { destructiveHint: true, idempotentHint: false, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async ({ slug, rename_fields, remove_fields, set_field }) => {
       const result = await recordService.transformRecords(slug, userId, {
@@ -529,12 +585,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_delete_record",
     {
       title: "Delete Record",
-      description: "Soft-delete one record by ID. Example: use when the user says 'remove this bookmark' or 'drop record 42'.",
+      description: "Delete one record by ID: it no longer appears in queries, search or exports, and no tool restores it. Example: use when the user says 'remove this bookmark' or 'drop record 42'.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         record_id: z.number().describe("Record ID to delete"),
       }),
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id }) => {
       const result = await recordService.deleteRecord(slug, userId, record_id);
@@ -553,7 +609,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       inputSchema: z.object({ slug: z.string().describe(slugDescription) }),
       // Saves the inferred schema over any manually-set field types — destructive
       // by the same logic as hutch_update_schema.
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug }) => {
       const result = await collectionService.inferCollectionSchema(slug, userId);
@@ -577,7 +633,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         hidden: z.boolean().optional(),
       }),
       // destructiveHint: true — schema rewrites change how subsequent queries behave.
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, field, type, options, position, hidden }) => {
       const result = await collectionService.updateFieldDefinition(slug, userId, field, { type, options, position, hidden });
@@ -598,13 +654,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         status: z.enum(["active","pending","flagged","archived"]).describe("New status"),
       }),
       // destructiveHint: true — overwrites an existing record's status.
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ slug, record_id, status }) => {
       const result = await recordService.updateRecordStatus(slug, userId, record_id, status);
       if (!result) return collectionNotFound(slug);
       if ('error' in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result, url: collectionUrl(result.slug) });
+      return jsonResponse({ ...result, record: withoutInternalKeys(result.record), url: collectionUrl(result.slug) });
     }
   );
 
@@ -612,7 +668,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_create_view",
     {
       title: "Create View",
-      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted.",
+      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted. Each call creates a new view, so a retry adds another. With published: true on a published collection, the view is publicly viewable right away.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         type: z.enum(VIEW_TYPES).optional().default("table"),
@@ -624,9 +680,9 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         columns: z.array(z.string()).optional().describe("Columns to display, in order (e.g. [\"title\", \"url\"])"),
         published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
-      // Not destructive: a published view is public only once the collection
-      // itself is published, which is the destructive hutch_update_collection call.
-      annotations: { destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      // Not destructive: it only adds a view. Open world: `published: true`
+      // on an already-published collection shows the view publicly.
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (params) => {
       let groupBy: string | undefined = params.group_by;
@@ -655,7 +711,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       });
       if (!result) return collectionNotFound(params.slug);
       if ("error" in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
     }
   );
 
@@ -682,16 +738,16 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban views only: any other type returns an error."),
         published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
-      // Not destructive: a published view is public only once the collection
-      // itself is published, which is the destructive hutch_update_collection call.
-      annotations: { destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      // Destructive: name, columns, sort and filter replace the current
+      // values. Open world: `published: true` can show the view publicly.
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
     },
     async ({ slug, view, group_by, ...patch }) => {
       const ref = viewRef(view);
       const result = await updateView(slug, ref, userId, { ...patch, groupBy: group_by });
       if (!result) return viewNotFound(slug, ref);
       if ("error" in result) return errorResponse(result.error as string);
-      return jsonResponse({ ...result.view, url: collectionUrl(result.slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
     }
   );
 
@@ -704,7 +760,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         slug: z.string().describe(slugDescription),
         view: viewRefSchema,
       }),
-      annotations: { destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async (params) => {
       const ref = viewRef(params.view);

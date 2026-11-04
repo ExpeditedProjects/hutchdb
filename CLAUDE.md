@@ -36,6 +36,9 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - Implicit collection creation: writing a record auto-creates the collection
 - JSONB storage: records store arbitrary JSON, queryable via Postgres containment operators
 - Upsert via unique_key: set on collection, then MCP `hutch_store_records` honors on_conflict
+- Tool annotations follow ChatGPT app review, which reads them from the server: every tool sets readOnlyHint/destructiveHint/idempotentHint/openWorldHint explicitly; anything that can overwrite (incl. on_conflict: replace) is destructive even if undoable; a `published` input means openWorldHint: true. Tool output strips record/view/collection bookkeeping (`collectionId`, `source`, `deletedAt`, `organizationId`) in `server.ts`, not in services. Locked by `app-directory review rules` in `server.test.ts`.
+- Records reach tool output in more shapes than `records`/`results[].record`: a single-record store (`data:`) spreads its one result so `record` is top-level (`createRecords`), and a `per_record` aggregate attaches the parent as `results[].record` from `fetchEmbeddedRecords`. Mocked unit tests only see the shapes the mock was written with; `server-output.integration.test.ts` checks the real ones, so add a case there for any new record-bearing response.
+- Descriptions that promise behavior (e.g. store_records' seeded default views from `seedAutoViews`) get an integration test against the real behavior, not only a regex on the text.
 
 ## Testing workflow
 

@@ -133,6 +133,157 @@ describe('createMcpServer tool registration', () => {
   })
 })
 
+describe('app-directory review rules', () => {
+  // ChatGPT's app review reads readOnlyHint, destructiveHint and
+  // openWorldHint from the server and requires each to be explicit and to
+  // match what the tool does; justifications cannot override them.
+  const annotationsOf = (name: string) =>
+    (registeredConfigs.get(name)!.annotations ?? {}) as Record<string, unknown>
+  const inputKeysOf = (name: string) =>
+    Object.keys(((registeredConfigs.get(name)!.inputSchema as { shape?: Record<string, unknown> }).shape ?? {}))
+
+  // tool, readOnly, destructive, openWorld
+  const ANNOTATION_TABLE = [
+    ['hutch_list_collections', true, false, false],
+    ['hutch_get_collection', true, false, false],
+    ['hutch_describe_collection', true, false, false],
+    ['hutch_query_records', true, false, false],
+    ['hutch_search', true, false, false],
+    ['hutch_collection_stats', true, false, false],
+    ['hutch_export_records', true, false, false],
+    ['hutch_store_records', false, true, false],
+    ['hutch_import_records', false, true, false],
+    ['hutch_update_collection', false, true, true],
+    ['hutch_delete_collection', false, true, false],
+    ['hutch_update_record', false, true, false],
+    ['hutch_transform_records', false, true, false],
+    ['hutch_delete_record', false, true, false],
+    ['hutch_infer_schema', false, true, false],
+    ['hutch_update_schema', false, true, false],
+    ['hutch_set_record_status', false, true, false],
+    ['hutch_create_view', false, false, true],
+    ['hutch_update_view', false, true, true],
+    ['hutch_delete_view', false, true, false],
+  ] as const
+
+  it.each(ANNOTATION_TABLE)('%s: readOnly=%s destructive=%s openWorld=%s', (name, readOnly, destructive, openWorld) => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const a = annotationsOf(name)
+    expect(a.readOnlyHint).toBe(readOnly)
+    expect(a.destructiveHint).toBe(destructive)
+    expect(a.openWorldHint).toBe(openWorld)
+  })
+
+  it('covers every registered tool in the table above', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect([...registeredConfigs.keys()].sort()).toEqual(ANNOTATION_TABLE.map(([name]) => name).sort())
+  })
+
+  it('sets every hint explicitly on every tool', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    for (const name of registeredConfigs.keys()) {
+      const a = annotationsOf(name)
+      for (const hint of ['readOnlyHint', 'destructiveHint', 'idempotentHint', 'openWorldHint']) {
+        expect(typeof a[hint], `${name}.${hint}`).toBe('boolean')
+      }
+      if (a.readOnlyHint) expect(a.destructiveHint, `${name} is read-only`).toBe(false)
+    }
+  })
+
+  it('flags tools that can overwrite on conflict as destructive and not idempotent', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    for (const name of registeredConfigs.keys()) {
+      if (!inputKeysOf(name).includes('on_conflict')) continue
+      expect(annotationsOf(name).destructiveHint, name).toBe(true)
+      expect(annotationsOf(name).idempotentHint, name).toBe(false)
+      expect(registeredConfigs.get(name)!.description as string, name).toMatch(/overwrit/)
+    }
+  })
+
+  it('flags tools that can publish data as open world', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    for (const name of registeredConfigs.keys()) {
+      expect(annotationsOf(name).openWorldHint, name).toBe(inputKeysOf(name).includes('published'))
+    }
+  })
+
+  it('keeps descriptions non-empty, unpromotional, and off saving the conversation', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    for (const [name, config] of registeredConfigs) {
+      const description = config.description as string
+      expect(description.length, name).toBeGreaterThan(20)
+      expect(description, name).not.toMatch(/\b(powerful|seamless|revolutionary|ultimate|amazing|always use|whenever possible)\b/i)
+      expect(description, name).not.toMatch(/conversation|chat history|worth keeping/i)
+    }
+  })
+
+  it('says which write tools repeat their effect on retry', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.get('hutch_store_records')!.description).toMatch(/stores the records again/)
+    expect(registeredConfigs.get('hutch_import_records')!.description).toMatch(/stores the rows again/)
+    expect(registeredConfigs.get('hutch_create_view')!.description).toMatch(/a retry adds another/)
+  })
+
+  it('says storing into a new collection seeds default views (seedAutoViews)', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.get('hutch_store_records')!.description).toMatch(/A new collection also gets default views seeded from the first batch's fields: kanban .* calendar and timeline .* gallery/)
+  })
+})
+
+describe('response fields', () => {
+  const record = { id: 7, collectionId: 3, data: { title: 'a', source: 'mine', collectionId: 'x' }, source: 'api', status: 'active', deletedAt: null, createdAt: 'c', updatedAt: 'u' }
+  const publicRecord = { id: 7, data: { title: 'a', source: 'mine', collectionId: 'x' }, status: 'active', createdAt: 'c', updatedAt: 'u' }
+  const parse = (r: unknown) => {
+    const text = (r as { content: { text: string }[] }).content[0].text
+    return JSON.parse(text.slice(text.indexOf('{')))
+  }
+
+  it('query records leave out collectionId, source and deletedAt but keep them inside data', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ records: [record], total: 1, plan: 'p' } as never)
+    const out = parse(await registeredTools.get('hutch_query_records')!({ slug: 'notes' }))
+    expect(out.records).toEqual([publicRecord])
+    expect(out.plan).toBe('p')
+  })
+
+  it('store results, search groups, update and status responses trim records the same way', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'N', slug: 'n' }, results: [{ action: 'created', record }], count: 1 } as never)
+    expect(parse(await registeredTools.get('hutch_store_records')!({ collection: 'n', records: [{}] })).results).toEqual([{ action: 'created', record: publicRecord }])
+
+    // A single-record store (data:) spreads its one result: record sits at the top level.
+    vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'N', slug: 'n' }, action: 'created', record, summary: 's' } as never)
+    expect(parse(await registeredTools.get('hutch_store_records')!({ collection: 'n', data: {} })).record).toEqual(publicRecord)
+
+    // A per_record aggregate attaches the parent record to each group row.
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [{ parent_id: 7, n: 1, record }], total: 1 } as never)
+    expect(parse(await registeredTools.get('hutch_query_records')!({ slug: 'n', group_by: 'items.sku', per_record: true })).results).toEqual([{ parent_id: 7, n: 1, record: publicRecord }])
+
+    vi.mocked(recordService.searchGlobal).mockResolvedValue({ search: 'a', results: [{ collection: { name: 'N', slug: 'n' }, matches: 1, records: [{ ...record, collectionName: 'N', collectionSlug: 'n' }] }] } as never)
+    expect(parse(await registeredTools.get('hutch_search')!({ search: 'a' })).results[0].records).toEqual([{ ...publicRecord, collectionName: 'N', collectionSlug: 'n' }])
+
+    vi.mocked(recordService.updateRecord).mockResolvedValue({ updated: true, record, slug: 'n' } as never)
+    expect(parse(await registeredTools.get('hutch_update_record')!({ slug: 'n', record_id: 7, data: {} }))).toEqual({ ...publicRecord, url: 'https://example.test/c/n' })
+
+    vi.mocked(recordService.updateRecordStatus).mockResolvedValue({ updated: true, record, slug: 'n' } as never)
+    expect(parse(await registeredTools.get('hutch_set_record_status')!({ slug: 'n', record_id: 7, status: 'active' })).record).toEqual(publicRecord)
+  })
+
+  it('collections leave out organizationId and views leave out collectionId', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    vi.mocked(collectionService.getCollection).mockResolvedValue({ id: 3, organizationId: 'org-test', name: 'N', slug: 'n' } as never)
+    vi.mocked(listViews).mockResolvedValue([{ id: 1, collectionId: 3, name: 'T' }] as never)
+    const got = parse(await registeredTools.get('hutch_get_collection')!({ slug: 'n' }))
+    expect(got).toEqual({ id: 3, name: 'N', slug: 'n', views: [{ id: 1, name: 'T' }] })
+
+    vi.mocked(collectionService.updateCollection).mockResolvedValue({ collection: { id: 3, organizationId: 'org-test', slug: 'n' } } as never)
+    expect(parse(await registeredTools.get('hutch_update_collection')!({ slug: 'n', description: 'd' }))).toEqual({ id: 3, slug: 'n', url: 'https://example.test/c/n' })
+
+    vi.mocked(createView).mockResolvedValue({ view: { id: 2, collectionId: 3, name: 'T' }, slug: 'n' } as never)
+    expect(parse(await registeredTools.get('hutch_create_view')!({ slug: 'n', type: 'table' }))).toEqual({ id: 2, name: 'T', url: 'https://example.test/c/n' })
+  })
+})
+
 describe('tool surface snapshot', () => {
   // Deliberate-drift gate for the connectors directory: any change to a tool
   // name, title, safety annotations, or input keys must update this literal.
@@ -145,6 +296,7 @@ describe('tool surface snapshot', () => {
           readOnlyHint?: boolean
           destructiveHint?: boolean
           idempotentHint?: boolean
+          openWorldHint?: boolean
         }
         return {
           name,
@@ -152,6 +304,7 @@ describe('tool surface snapshot', () => {
           readOnlyHint: annotations.readOnlyHint,
           destructiveHint: annotations.destructiveHint,
           idempotentHint: annotations.idempotentHint,
+          openWorldHint: annotations.openWorldHint,
           // v2 registers inputSchema as a z.object(...) — field names live on .shape.
           inputKeys: Object.keys(
             ((config.inputSchema as { shape?: Record<string, unknown> } | undefined)?.shape ?? {})
@@ -161,26 +314,26 @@ describe('tool surface snapshot', () => {
       .sort((a, b) => a.name.localeCompare(b.name))
 
     expect(surface).toEqual([
-      { name: 'hutch_collection_stats', title: 'Collection Stats', readOnlyHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'type'] },
-      { name: 'hutch_delete_collection', title: 'Delete Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_delete_record', title: 'Delete Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug'] },
-      { name: 'hutch_delete_view', title: 'Delete View', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug', 'view'] },
-      { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
-      { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
-      { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, idempotentHint: true, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
-      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: false, idempotentHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
-      { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['slug'] },
-      { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, idempotentHint: true, inputKeys: [] },
-      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'max_string_length', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
-      { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, idempotentHint: true, inputKeys: ['limit', 'max_string_length', 'search'] },
-      { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['record_id', 'slug', 'status'] },
-      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
-      { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
-      { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
-      { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['data', 'record_id', 'slug'] },
-      { name: 'hutch_update_schema', title: 'Update Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
-      { name: 'hutch_update_view', title: 'Update View', readOnlyHint: false, destructiveHint: false, idempotentHint: true, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'view'] },
+      { name: 'hutch_collection_stats', title: 'Collection Stats', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['slug'] },
+      { name: 'hutch_create_view', title: 'Create View', readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'type'] },
+      { name: 'hutch_delete_collection', title: 'Delete Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['slug'] },
+      { name: 'hutch_delete_record', title: 'Delete Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['record_id', 'slug'] },
+      { name: 'hutch_delete_view', title: 'Delete View', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['slug', 'view'] },
+      { name: 'hutch_describe_collection', title: 'Describe Collection', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
+      { name: 'hutch_export_records', title: 'Export Records', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['collection', 'fields', 'filter', 'format', 'limit', 'search', 'sort'] },
+      { name: 'hutch_get_collection', title: 'Get Collection', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['field_prefix', 'fields_offset', 'slug'] },
+      { name: 'hutch_import_records', title: 'Import Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false, inputKeys: ['collection', 'content', 'format', 'on_conflict', 'return'] },
+      { name: 'hutch_infer_schema', title: 'Infer Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['slug'] },
+      { name: 'hutch_list_collections', title: 'List Collections', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: [] },
+      { name: 'hutch_query_records', title: 'Query Records', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['aggregate', 'array_limit', 'array_sort', 'created_after', 'created_before', 'fields', 'filter', 'group_by', 'limit', 'max_string_length', 'offset', 'per_record', 'record', 'search', 'slug', 'sort', 'time_bucket'] },
+      { name: 'hutch_search', title: 'Search Records', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false, inputKeys: ['limit', 'max_string_length', 'search'] },
+      { name: 'hutch_set_record_status', title: 'Set Record Status', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['record_id', 'slug', 'status'] },
+      { name: 'hutch_store_records', title: 'Store Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false, inputKeys: ['collection', 'data', 'on_conflict', 'records', 'return'] },
+      { name: 'hutch_transform_records', title: 'Transform Records', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false, inputKeys: ['remove_fields', 'rename_fields', 'set_field', 'slug'] },
+      { name: 'hutch_update_collection', title: 'Update Collection', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true, inputKeys: ['description', 'name', 'published', 'slug', 'unique_key'] },
+      { name: 'hutch_update_record', title: 'Update Record', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['data', 'record_id', 'slug'] },
+      { name: 'hutch_update_schema', title: 'Update Schema', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false, inputKeys: ['field', 'hidden', 'options', 'position', 'slug', 'type'] },
+      { name: 'hutch_update_view', title: 'Update View', readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true, inputKeys: ['columns', 'config', 'filter', 'group_by', 'name', 'published', 'slug', 'sort', 'view'] },
     ])
   })
 })
@@ -1154,12 +1307,12 @@ describe('update_view tool', () => {
     expect(result.content[0].text).toBe('group_by applies to kanban views only')
   })
 
-  it('has a description with an example, and is not flagged destructive', () => {
+  it('has a description with an example, and is flagged destructive (it replaces columns, sort and filter)', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const config = registeredConfigs.get('hutch_update_view')!
     expect(config.description).toMatch(/Example:/)
     expect(config.description).toMatch(/public page/)
-    expect((config.annotations as { destructiveHint?: boolean }).destructiveHint).toBe(false)
+    expect((config.annotations as { destructiveHint?: boolean }).destructiveHint).toBe(true)
   })
 })
 
