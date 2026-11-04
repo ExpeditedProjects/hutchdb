@@ -142,8 +142,8 @@ describe('app-directory review rules', () => {
   const inputKeysOf = (name: string) =>
     Object.keys(((registeredConfigs.get(name)!.inputSchema as { shape?: Record<string, unknown> }).shape ?? {}))
 
-  it.each([
-    // tool, readOnly, destructive, openWorld
+  // tool, readOnly, destructive, openWorld
+  const ANNOTATION_TABLE = [
     ['hutch_list_collections', true, false, false],
     ['hutch_get_collection', true, false, false],
     ['hutch_describe_collection', true, false, false],
@@ -164,7 +164,9 @@ describe('app-directory review rules', () => {
     ['hutch_create_view', false, false, true],
     ['hutch_update_view', false, true, true],
     ['hutch_delete_view', false, true, false],
-  ] as const)('%s: readOnly=%s destructive=%s openWorld=%s', (name, readOnly, destructive, openWorld) => {
+  ] as const
+
+  it.each(ANNOTATION_TABLE)('%s: readOnly=%s destructive=%s openWorld=%s', (name, readOnly, destructive, openWorld) => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const a = annotationsOf(name)
     expect(a.readOnlyHint).toBe(readOnly)
@@ -174,7 +176,7 @@ describe('app-directory review rules', () => {
 
   it('covers every registered tool in the table above', () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
-    expect(registeredConfigs.size).toBe(20)
+    expect([...registeredConfigs.keys()].sort()).toEqual(ANNOTATION_TABLE.map(([name]) => name).sort())
   })
 
   it('sets every hint explicitly on every tool', () => {
@@ -247,7 +249,15 @@ describe('response fields', () => {
   it('store results, search groups, update and status responses trim records the same way', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'N', slug: 'n' }, results: [{ action: 'created', record }], count: 1 } as never)
-    expect(parse(await registeredTools.get('hutch_store_records')!({ collection: 'n', data: {} })).results).toEqual([{ action: 'created', record: publicRecord }])
+    expect(parse(await registeredTools.get('hutch_store_records')!({ collection: 'n', records: [{}] })).results).toEqual([{ action: 'created', record: publicRecord }])
+
+    // A single-record store (data:) spreads its one result: record sits at the top level.
+    vi.mocked(recordService.createRecords).mockResolvedValue({ collection: { name: 'N', slug: 'n' }, action: 'created', record, summary: 's' } as never)
+    expect(parse(await registeredTools.get('hutch_store_records')!({ collection: 'n', data: {} })).record).toEqual(publicRecord)
+
+    // A per_record aggregate attaches the parent record to each group row.
+    vi.mocked(recordService.queryRecords).mockResolvedValue({ results: [{ parent_id: 7, n: 1, record }], total: 1 } as never)
+    expect(parse(await registeredTools.get('hutch_query_records')!({ slug: 'n', group_by: 'items.sku', per_record: true })).results).toEqual([{ parent_id: 7, n: 1, record: publicRecord }])
 
     vi.mocked(recordService.searchGlobal).mockResolvedValue({ search: 'a', results: [{ collection: { name: 'N', slug: 'n' }, matches: 1, records: [{ ...record, collectionName: 'N', collectionSlug: 'n' }] }] } as never)
     expect(parse(await registeredTools.get('hutch_search')!({ search: 'a' })).results[0].records).toEqual([{ ...publicRecord, collectionName: 'N', collectionSlug: 'n' }])

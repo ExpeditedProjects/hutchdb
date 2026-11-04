@@ -78,7 +78,7 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     // User data that uses an internal key name must survive untouched.
     const stored = json(await call("hutch_store_records", {
       collection: "Output Notes",
-      records: [{ title: "zebra crossing", source: "field notes" }, { title: "other" }],
+      records: [{ title: "zebra crossing", source: "field notes", collectionId: "mine", deletedAt: "never" }, { title: "other" }],
     }));
     const slug = (stored.collection as { slug: string }).slug;
     const results = stored.results as { record: Record<string, unknown> }[];
@@ -87,7 +87,7 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
       expectNoInternalKeys(r.record);
       expect(Object.keys(r.record).sort()).toEqual(["createdAt", "data", "id", "status", "updatedAt"]);
     }
-    expect((results[0].record.data as Record<string, unknown>).source).toBe("field notes");
+    expect(results[0].record.data).toMatchObject({ source: "field notes", collectionId: "mine", deletedAt: "never" });
 
     const query = json(await call("hutch_query_records", { slug }));
     const records = query.records as Record<string, unknown>[];
@@ -125,6 +125,46 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     expect(updatedColl.description).toBe("notes");
 
     const imported = json(await call("hutch_import_records", { collection: slug, format: "csv", content: "title\nimported\n", return: "records" }));
+    expect(imported.results).toHaveLength(1);
     for (const r of imported.results as { record: unknown }[]) expectNoInternalKeys(r.record);
+  });
+
+  it("a single-record store (data:) leaves out internal keys on its top-level record", async () => {
+    const single = json(await call("hutch_store_records", { collection: "Output Single", data: { title: "x", source: "mine" } }));
+    const record = single.record as Record<string, unknown>;
+    expectNoInternalKeys(record);
+    expect(record.data).toEqual({ title: "x", source: "mine" });
+  });
+
+  it("storing into a new collection seeds the default views its description promises", async () => {
+    const stored = json(await call("hutch_store_records", {
+      collection: "Output Tasks",
+      records: [
+        { title: "a", status: "open", due: "2026-01-01" },
+        { title: "b", status: "done", due: "2026-02-01" },
+      ],
+    }));
+    const slug = (stored.collection as { slug: string }).slug;
+    const coll = json(await call("hutch_get_collection", { slug }));
+    const types = (coll.views as { type: string }[]).map((v) => v.type).sort();
+    expect(types).toEqual(["calendar", "kanban", "timeline"]);
+  });
+
+  it("a per-record group_by over an array attaches the parent record without internal keys", async () => {
+    await call("hutch_store_records", {
+      collection: "Output Orders",
+      records: [
+        { name: "first", source: "web", items: [{ sku: "a" }, { sku: "b" }] },
+        { name: "second", items: [{ sku: "a" }] },
+      ],
+    });
+    const agg = json(await call("hutch_query_records", { slug: "output-orders", group_by: "items.sku", aggregate: { n: "count" }, per_record: true }));
+    const groups = agg.results as { record: Record<string, unknown> | null }[];
+    expect(groups.length).toBeGreaterThan(0);
+    for (const g of groups) {
+      expect(g.record).not.toBeNull();
+      expectNoInternalKeys(g.record);
+    }
+    expect(groups.some((g) => (g.record!.data as Record<string, unknown>).source === "web")).toBe(true);
   });
 });

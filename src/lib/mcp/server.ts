@@ -100,7 +100,7 @@ function jsonResponse(value: unknown): McpToolResponse {
  */
 function summarizedWriteResponse(result: object, collectionUrl: (slug: string) => string): McpToolResponse {
   const slug = (result as { collection?: { slug?: string } }).collection?.slug;
-  const trimmed = trimWriteResults(result);
+  const trimmed = trimRecordResults(result);
   const enriched = slug ? { ...trimmed, url: collectionUrl(slug) } : trimmed;
   const json = JSON.stringify(enriched);
   const summary = (result as { summary?: string }).summary;
@@ -128,9 +128,16 @@ function trimRecordList(list: unknown): unknown {
   return Array.isArray(list) ? list.map((r) => withoutInternalKeys(r)) : list;
 }
 
-function trimWriteResults(result: object): object {
+/**
+ * The record(s) in a write result or a per_record aggregate: `results[].record`,
+ * or the top-level `record` of a single-record store (`data:`), which spreads
+ * its one result into the response.
+ */
+function trimRecordResults(result: object): object {
   const results = (result as { results?: unknown }).results;
-  if (!Array.isArray(results)) return result;
+  if (!Array.isArray(results)) {
+    return "record" in result ? { ...result, record: withoutInternalKeys(result.record) } : result;
+  }
   return {
     ...result,
     results: results.map((r) =>
@@ -312,7 +319,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_store_records",
     {
       title: "Store Records",
-      description: `Save one or many records to a collection (auto-creates the collection if new). A new collection also gets default views seeded from the first batch's fields: kanban for a status- or category-like field, calendar and timeline for a date field, gallery for an image URL field. ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. When a batch makes fields queryable or unwinds an array, the response says so in storage_note; the indexes are built in the background shortly after the write, which does not wait for them. With a unique_key on the collection, a record matching an existing one is handled by on_conflict: the default, replace, overwrites the stored record. Without a unique_key, calling again with the same data stores the records again. Example: use when the user asks to save something, e.g. 'save this bookmark'.`,
+      description: `Save one or many records to a collection (auto-creates the collection if new). A new collection also gets default views seeded from the first batch's fields: kanban for a field with a few repeated values (e.g. status or tags), calendar and timeline for a date field, gallery for an image URL field. ${NESTED_DOCUMENTS_NOTE}The request body is limited to ${MCP_MAX_REQUEST_BODY_LABEL}; split larger loads into several calls and pass return: "summary" to skip echoing the stored records. When a batch makes fields queryable or unwinds an array, the response says so in storage_note; the indexes are built in the background shortly after the write, which does not wait for them. With a unique_key on the collection, a record matching an existing one is handled by on_conflict: the default, replace, overwrites the stored record. Without a unique_key, calling again with the same data stores the records again. Example: use when the user asks to save something, e.g. 'save this bookmark'.`,
       inputSchema: z.object({
         collection: z.string().describe("Collection name (e.g. 'bookmarks', 'notes', 'research'). Created automatically if new."),
         data: z.record(z.string(), z.unknown()).optional().describe("Single record as a JSON object (e.g. {\"title\": \"My note\", \"tags\": [\"work\"]}). Use this OR records, not both."),
@@ -385,8 +392,9 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         perRecord: params.per_record,
       }, { maxStringLength: params.max_string_length ?? DEFAULT_MAX_STRING_LENGTH, maxPageChars: MAX_PAGE_CHARS });
       if (!result) return collectionNotFound(params.slug);
-      const records = (result as { records?: unknown }).records;
-      return jsonResponse(records === undefined ? result : { ...result, records: trimRecordList(records) });
+      // A records query returns `records`; an aggregate returns `results`,
+      // whose per_record rows carry the parent as `record`.
+      return jsonResponse("records" in result ? { ...result, records: trimRecordList(result.records) } : trimRecordResults(result));
     }
   );
 
@@ -548,7 +556,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_transform_records",
     {
       title: "Transform Records",
-      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'. Changes are written to the stored records in place.",
+      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Changes are written to the stored records in place. Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"})"),
