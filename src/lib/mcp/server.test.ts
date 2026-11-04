@@ -221,6 +221,11 @@ describe('app-directory review rules', () => {
     expect(registeredConfigs.get('hutch_import_records')!.description).toMatch(/stores the rows again/)
     expect(registeredConfigs.get('hutch_create_view')!.description).toMatch(/a retry adds another/)
   })
+
+  it('says storing into a new collection seeds default views (seedAutoViews)', () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    expect(registeredConfigs.get('hutch_store_records')!.description).toMatch(/A new collection also gets default views seeded from the first batch's fields: kanban .* calendar and timeline .* gallery/)
+  })
 })
 
 describe('response fields', () => {
