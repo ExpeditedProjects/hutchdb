@@ -36,6 +36,7 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - Implicit collection creation: writing a record auto-creates the collection
 - JSONB storage: records store arbitrary JSON, queryable via Postgres containment operators
 - Upsert via unique_key: set on collection, then MCP `hutch_store_records` honors on_conflict
+- Tool annotations follow ChatGPT app review, which reads them from the server: every tool sets readOnlyHint/destructiveHint/idempotentHint/openWorldHint explicitly; anything that can overwrite (incl. on_conflict: replace) is destructive even if undoable; a `published` input means openWorldHint: true. Tool output strips record/view/collection bookkeeping (`collectionId`, `source`, `deletedAt`, `organizationId`) in `server.ts`, not in services. Locked by `app-directory review rules` in `server.test.ts`.
 
 ## Testing workflow
 
