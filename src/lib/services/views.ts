@@ -17,7 +17,7 @@ const TIMESTAMP_FIELD_NAMES = new Set(["created_at", "updated_at"]);
  * A service error. Messages are written for any client (the Cloud dashboard
  * shows them as they are); `code` lets the MCP tools add their own hints.
  */
-export type ViewError = { error: string; status: number; code?: string };
+type ViewError = { error: string; status: number; code?: string };
 
 const GROUP_BY_KANBAN_ONLY: ViewError = { error: "group_by applies to kanban views only", status: 400 };
 
