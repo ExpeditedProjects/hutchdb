@@ -36,7 +36,7 @@ Use hutch_collection_stats for a quick overview of a collection's size and field
 
 For deduplication: set unique_key via hutch_update_collection, then hutch_store_records honors on_conflict (default: replace).
 
-Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A view marked published appears as a tab on the collection's public page once the collection is published.
+Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A view marked published is a public read-only page of its own (its filter, sort and columns applied), even while the collection is private; when the collection is published too, the view also appears as a tab on the collection's public page.
 
 This is the headless single-user Core. Multi-user sharing, organizations, invitations, and published dashboards live in Hutch Cloud (app.hutchdb.com), not here.`;
 
@@ -69,7 +69,7 @@ const FILTER_DESCRIPTION =
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
 
 // Shared by hutch_create_view and hutch_update_view.
-const PUBLISHED_VIEW_DESCRIPTION = "Show this view as a tab on the collection's public page (only matters when the collection is published). Default false.";
+const PUBLISHED_VIEW_DESCRIPTION = "Make this view a public read-only page of its own, showing only the records its filter matches, even while the collection is private; on a published collection it is also a tab on the collection's public page. Default false.";
 
 // Field paging shared by hutch_describe_collection and hutch_get_collection.
 const FIELDS_OFFSET_DESCRIPTION = `Skip this many fields (default 0): each call lists at most ${DESCRIBE_FIELDS_PAGE}; pass the response's fields_next_offset for the next page.`;
@@ -497,13 +497,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_collection",
     {
       title: "Update Collection",
-      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Only the fields you pass change; each replaces the current value. published: true makes the collection, and its views marked published, viewable by anyone as a read-only web page; published: false makes it private again. Example: use when the user wants to publish a collection or set a dedup key.",
+      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Only the fields you pass change; each replaces the current value. published: true makes the whole collection viewable by anyone as a read-only web page, with its views marked published as tabs; published: false makes the collection page private again (views marked published stay public on their own pages; unpublish them with hutch_update_view). Example: use when the user wants to publish a collection or set a dedup key.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         name: z.string().optional().describe("New collection name"),
         description: z.string().optional().describe("Collection description"),
         unique_key: z.array(z.string()).optional().describe("Fields that form the unique key for upsert (e.g. [\"url\"] or [\"email\", \"date\"])"),
-        published: z.boolean().optional().describe("Whether the collection is publicly viewable"),
+        published: z.boolean().optional().describe("Whether the whole collection is publicly viewable (views have their own published flag)"),
       }),
       // Destructive: overwrites name/description/unique_key. Open world:
       // `published: true` exposes the collection on the public web.
@@ -668,7 +668,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_create_view",
     {
       title: "Create View",
-      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted. Each call creates a new view, so a retry adds another. With published: true on a published collection, the view is publicly viewable right away.",
+      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted. Each call creates a new view, so a retry adds another. With published: true, the view is publicly viewable right away, even if the collection is private.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         type: z.enum(VIEW_TYPES).optional().default("table"),
@@ -681,7 +681,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
       // Not destructive: it only adds a view. Open world: `published: true`
-      // on an already-published collection shows the view publicly.
+      // shows the view publicly.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (params) => {
@@ -726,7 +726,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_view",
     {
       title: "Update View",
-      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or mark it published so it shows as a tab on the collection's public page. Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants a view shown on the public page (published: true), or regrouped/renamed.",
+      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or mark it published so it is a public read-only page of its own (and a tab on the collection's public page when the collection is published). Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants to share a view publicly without publishing the whole collection (published: true), or regrouped/renamed.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         view: viewRefSchema,
