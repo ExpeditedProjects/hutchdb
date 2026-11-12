@@ -13,6 +13,87 @@ const TIMESTAMP_FIELD_NAMES = new Set(["created_at", "updated_at"]);
 
 const GROUP_BY_KANBAN_ONLY = { error: "group_by applies to kanban views only", status: 400 };
 
+// ── Publishing ────────────────────────────────────────────────────────────────
+//
+// A published view is a public read-only page that shows only its columns.
+// Publishing therefore needs a non-empty `columns` whose every entry is a
+// visible (not hidden) field of the collection's saved schema, so a field
+// never becomes public by being added to the data later. This is the one
+// place the rule is enforced: the MCP tools and the Cloud dashboard both
+// publish through createView/updateView.
+
+/** Most fields an error lists; a wide collection can have thousands. */
+const MAX_LISTED_FIELDS = 50;
+
+/**
+ * Config keys naming the field each view type's layout needs, in the order
+ * readers prefer them (the dashboard's groupField over the MCP's
+ * groupByField). Timeline has no end-date key, only dateField.
+ */
+const LAYOUT_FIELD_KEYS: Record<string, readonly string[]> = {
+  kanban: ["groupField", "groupByField"],
+  calendar: ["dateField"],
+  timeline: ["dateField"],
+  gallery: ["imageField"],
+};
+
+/** Field names a published view may show: the saved schema's fields that are not hidden. */
+function publishableFields(schema: unknown): string[] {
+  const fields = (schema as { fields?: unknown } | null)?.fields;
+  if (!Array.isArray(fields)) return [];
+  return fields
+    .filter((f): f is { name: string; hidden?: boolean } => !!f && typeof f.name === "string" && f.hidden !== true)
+    .map((f) => f.name);
+}
+
+function listFields(names: string[]): string {
+  const listed = names.slice(0, MAX_LISTED_FIELDS).join(", ");
+  const rest = names.length - MAX_LISTED_FIELDS;
+  return rest > 0 ? `${listed}, and ${rest} more (hutch_get_collection lists them)` : listed;
+}
+
+/** An error when `columns` cannot be published, else null. */
+function unpublishableColumns(columns: string[], publishable: string[]): { error: string; status: number } | null {
+  if (publishable.length === 0) {
+    return {
+      error: "This collection has no saved schema fields yet (or all of them are hidden), so its views cannot be published. Save its schema with hutch_infer_schema, or unhide fields with hutch_update_schema, then set columns.",
+      status: 400,
+    };
+  }
+  if (columns.length === 0) {
+    return {
+      error: `Set columns before publishing: a published view shows only the fields listed in its columns. Valid fields: ${listFields(publishable)}.`,
+      status: 400,
+    };
+  }
+  const allowed = new Set(publishable);
+  const invalid = columns.filter((c) => !allowed.has(c));
+  if (invalid.length > 0) {
+    return {
+      error: `These columns are hidden or not in the collection's saved schema, so they cannot be published: ${listFields(invalid)}. Valid fields: ${listFields(publishable)}.`,
+      status: 400,
+    };
+  }
+  return null;
+}
+
+/**
+ * `columns` plus the field the view's layout needs (kanban group, calendar
+ * or timeline date, gallery image) when it is set, publishable and missing.
+ * Returns the same array when nothing is added.
+ */
+function withLayoutField(columns: string[], type: string | null, config: unknown, publishable: string[]): string[] {
+  const cfg = (config ?? {}) as Record<string, unknown>;
+  const field = (LAYOUT_FIELD_KEYS[type ?? "table"] ?? [])
+    .map((key) => cfg[key])
+    .find((value): value is string => typeof value === "string" && publishable.includes(value));
+  return field && !columns.includes(field) ? [...columns, field] : columns;
+}
+
+function storedColumns(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((c): c is string => typeof c === "string") : [];
+}
+
 export async function createView(collectionSlug: string, userId: string, params: {
   type?: string;
   name?: string;
@@ -45,6 +126,14 @@ export async function createView(collectionSlug: string, userId: string, params:
     config.groupByField = params.groupBy;
   }
 
+  let columns = params.columns ?? [];
+  if (params.published) {
+    const publishable = publishableFields(access.collection.schema);
+    const invalid = unpublishableColumns(columns, publishable);
+    if (invalid) return invalid;
+    columns = withLayoutField(columns, type, config, publishable);
+  }
+
   const [created] = await db.insert(views).values({
     collectionId: access.collection.id,
     name,
@@ -53,7 +142,7 @@ export async function createView(collectionSlug: string, userId: string, params:
     description: params.description || null,
     filter: params.filter ?? {},
     sort: params.sort || null,
-    columns: params.columns ?? [],
+    columns,
     config,
     published: params.published ?? false,
   }).returning();
@@ -82,7 +171,7 @@ async function findEditableView(collectionSlug: string, viewRef: ViewRef, userId
     .from(views)
     .where(viewRefCondition(access.collection.id, viewRef))
     .limit(1);
-  return view ? { view, slug: access.collection.slug } : null;
+  return view ? { view, slug: access.collection.slug, collection: access.collection } : null;
 }
 
 export async function renameView(collectionSlug: string, viewId: number, userId: string, name: string) {
@@ -132,9 +221,16 @@ export async function updateViewConfig(
 
   const sanitized = pickAllowedConfig(config);
   const merged = { ...((existing.view.config as Record<string, unknown>) ?? {}), ...sanitized };
+  const set: Partial<typeof views.$inferInsert> = { config: merged };
+  // A published view keeps the field its new layout needs.
+  if (existing.view.published) {
+    const columns = storedColumns(existing.view.columns);
+    const withLayout = withLayoutField(columns, existing.view.type, merged, publishableFields(existing.collection.schema));
+    if (withLayout !== columns) set.columns = withLayout;
+  }
   const [updated] = await db
     .update(views)
-    .set({ config: merged, updatedAt: new Date() })
+    .set({ ...set, updatedAt: new Date() })
     .where(eq(views.id, existing.view.id))
     .returning();
 
@@ -218,7 +314,7 @@ export async function updateView(
 
   const found = await findEditableView(collectionSlug, viewRef, userId);
   if (!found) return null;
-  const { view, slug } = found;
+  const { view, slug, collection } = found;
 
   // Grouping set through config takes the same path as groupBy, so it gets
   // the kanban check and replaces a stale dashboard groupField.
@@ -243,6 +339,19 @@ export async function updateView(
       delete merged.groupField;
     }
     set.config = merged;
+  }
+  // Publishing, or changing the columns of a view that stays published,
+  // needs publishable columns; a published view also keeps its layout field.
+  const columnsChecked = patch.published === true || (patch.columns !== undefined && view.published && patch.published !== false);
+  if (columnsChecked || (view.published && patch.published !== false && set.config !== undefined)) {
+    const publishable = publishableFields(collection.schema);
+    const columns = patch.columns ?? storedColumns(view.columns);
+    if (columnsChecked) {
+      const invalid = unpublishableColumns(columns, publishable);
+      if (invalid) return invalid;
+    }
+    const withLayout = withLayoutField(columns, view.type, set.config ?? view.config, publishable);
+    if (withLayout !== columns) set.columns = withLayout;
   }
   if (Object.keys(set).length === 0) return { view, slug };
 

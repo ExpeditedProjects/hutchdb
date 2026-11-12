@@ -40,7 +40,7 @@ vi.mock('@/lib/revalidation', () => ({
   revalidateDashboard: vi.fn(),
 }))
 
-import { createView, renameView, updateViewConfig, seedAutoViews } from './views'
+import { createView, renameView, updateView, updateViewConfig, seedAutoViews } from './views'
 import { findAccessibleCollectionBySlug } from '@/lib/db/queries'
 import { db } from '@/lib/db'
 import { revalidateDashboard } from '@/lib/revalidation'
@@ -184,6 +184,193 @@ describe('createView with explicit name and groupBy', () => {
     const valuesCall = vi.mocked(db.insert).mock.results[0].value.values
     const inserted = valuesCall.mock.calls[0][0]
     expect(inserted.config).toEqual({ groupByField: 'status', cardTitle: 'title' })
+  })
+})
+
+describe('publishing a view', () => {
+  // A published view shows only its columns, so they must be visible fields
+  // of the saved schema; the field its layout needs is added for it.
+  const schema = {
+    fields: [
+      { name: 'title', type: 'text', inferred: true, position: 0, hidden: false },
+      { name: 'status', type: 'select', inferred: true, position: 1, hidden: false },
+      { name: 'priority', type: 'select', inferred: true, position: 2, hidden: false },
+      { name: 'due', type: 'date', inferred: true, position: 3, hidden: false },
+      { name: 'cover', type: 'image_url', inferred: true, position: 4, hidden: false },
+      { name: 'secret', type: 'text', inferred: true, position: 5, hidden: true },
+    ],
+    version: 1,
+    lastInferredAt: '',
+  }
+  const VALID = 'Valid fields: title, status, priority, due, cover.'
+  const withSchema = (s: unknown = schema) => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: { ...collectionRow, schema: s }, role: 'editor' } as never)
+    insertReturning.mockResolvedValue([{ id: 1 }])
+    updateReturning.mockResolvedValue([{ id: 7 }])
+  }
+  const inserted = () => vi.mocked(db.insert).mock.results[0].value.values.mock.calls[0][0]
+  const updateSet = () => vi.mocked(db.update).mock.results[0].value.set.mock.calls[0][0]
+
+  describe('createView', () => {
+    it('refuses to publish without columns, listing the valid fields, and inserts nothing', async () => {
+      withSchema()
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true })
+      expect(result).toEqual({
+        error: `Set columns before publishing: a published view shows only the fields listed in its columns. ${VALID}`,
+        status: 400,
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('refuses hidden and unknown columns, naming them', async () => {
+      withSchema()
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title', 'secret', 'nope'] })
+      expect(result).toEqual({
+        error: `These columns are hidden or not in the collection's saved schema, so they cannot be published: secret, nope. ${VALID}`,
+        status: 400,
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('says when the collection has no saved schema fields yet', async () => {
+      withSchema(null)
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title'] })
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^This collection has no saved schema fields yet .*hutch_infer_schema/) }))
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('publishes visible columns as given', async () => {
+      withSchema()
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['due', 'title'] })
+      expect(result).not.toHaveProperty('error')
+      expect(inserted()).toEqual(expect.objectContaining({ published: true, columns: ['due', 'title'] }))
+    })
+
+    it('does not check the columns of an unpublished view', async () => {
+      withSchema(null)
+      await createView('bookmarks', 'user-test', { type: 'table', columns: ['anything'] })
+      expect(inserted()).toEqual(expect.objectContaining({ published: false, columns: ['anything'] }))
+    })
+
+    it.each([
+      ['kanban', { groupBy: 'status' }, 'status'],
+      ['kanban', { config: { groupByField: 'status' } }, 'status'],
+      ['kanban', { config: { groupField: 'priority' } }, 'priority'],
+      ['calendar', { config: { dateField: 'due' } }, 'due'],
+      ['timeline', { config: { dateField: 'due' } }, 'due'],
+      ['gallery', { config: { imageField: 'cover' } }, 'cover'],
+    ])('appends the layout field of a published %s view (%j)', async (type, extra, field) => {
+      withSchema()
+      await createView('bookmarks', 'user-test', { type, published: true, columns: ['title'], ...extra })
+      expect(inserted().columns).toEqual(['title', field])
+    })
+
+    it('prefers the dashboard groupField over groupByField, as readers do', async () => {
+      withSchema()
+      await createView('bookmarks', 'user-test', { type: 'kanban', published: true, columns: ['title'], config: { groupField: 'priority', groupByField: 'status' } })
+      expect(inserted().columns).toEqual(['title', 'priority'])
+    })
+
+    it('does not append a layout field that is hidden, unknown or already a column', async () => {
+      withSchema()
+      await createView('bookmarks', 'user-test', { type: 'gallery', published: true, columns: ['title'], config: { imageField: 'secret' } })
+      expect(inserted().columns).toEqual(['title'])
+      vi.mocked(db.insert).mockClear()
+      await createView('bookmarks', 'user-test', { type: 'calendar', published: true, columns: ['title'], config: { dateField: 'nope' } })
+      expect(inserted().columns).toEqual(['title'])
+      vi.mocked(db.insert).mockClear()
+      await createView('bookmarks', 'user-test', { type: 'kanban', published: true, columns: ['status', 'title'], groupBy: 'status' })
+      expect(inserted().columns).toEqual(['status', 'title'])
+    })
+
+    it('does not append the layout field to an unpublished view', async () => {
+      withSchema()
+      await createView('bookmarks', 'user-test', { type: 'kanban', columns: ['title'], groupBy: 'status' })
+      expect(inserted().columns).toEqual(['title'])
+    })
+  })
+
+  describe('updateView', () => {
+    const stored = (view: Record<string, unknown>) =>
+      selectLimit.mockResolvedValue([{ id: 7, type: 'table', columns: [], config: {}, published: false, ...view }])
+
+    it('refuses to publish a view whose stored columns are empty', async () => {
+      withSchema()
+      stored({ columns: [] })
+      const result = await updateView('bookmarks', 7, 'user-test', { published: true })
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^Set columns before publishing/) }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('refuses to publish a view whose stored columns include a hidden field', async () => {
+      withSchema()
+      stored({ columns: ['title', 'secret'] })
+      const result = await updateView('bookmarks', 7, 'user-test', { published: true })
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('cannot be published: secret.') }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('refuses to clear the columns of a published view', async () => {
+      withSchema()
+      stored({ columns: ['title'], published: true })
+      const result = await updateView('bookmarks', 7, 'user-test', { columns: [] })
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^Set columns before publishing/) }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('refuses to add an unknown column to a published view', async () => {
+      withSchema()
+      stored({ columns: ['title'], published: true })
+      const result = await updateView('bookmarks', 7, 'user-test', { columns: ['title', 'nope'] })
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('cannot be published: nope.') }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('publishes with new columns and appends the layout field', async () => {
+      withSchema()
+      stored({ type: 'kanban', config: { groupByField: 'status' } })
+      const result = await updateView('bookmarks', 7, 'user-test', { published: true, columns: ['title'] })
+      expect(result).not.toHaveProperty('error')
+      expect(updateSet()).toEqual(expect.objectContaining({ published: true, columns: ['title', 'status'] }))
+    })
+
+    it('lets a view be unpublished and its columns cleared in one call', async () => {
+      withSchema()
+      stored({ columns: ['title'], published: true })
+      const result = await updateView('bookmarks', 7, 'user-test', { published: false, columns: [] })
+      expect(result).not.toHaveProperty('error')
+      expect(updateSet()).toEqual(expect.objectContaining({ published: false, columns: [] }))
+    })
+
+    it('does not check the columns of an unpublished view', async () => {
+      withSchema(null)
+      stored({ columns: ['title'] })
+      await updateView('bookmarks', 7, 'user-test', { columns: ['anything'] })
+      expect(updateSet().columns).toEqual(['anything'])
+    })
+
+    it('appends the new group field when a published kanban is regrouped', async () => {
+      withSchema()
+      stored({ type: 'kanban', columns: ['title', 'status'], config: { groupByField: 'status' }, published: true })
+      await updateView('bookmarks', 7, 'user-test', { groupBy: 'priority' })
+      expect(updateSet()).toEqual(expect.objectContaining({ columns: ['title', 'status', 'priority'], config: { groupByField: 'priority' } }))
+    })
+  })
+
+  describe('updateViewConfig', () => {
+    it('appends the new layout field of a published view', async () => {
+      withSchema()
+      selectLimit.mockResolvedValue([{ id: 7, type: 'kanban', columns: ['title', 'status'], config: { groupByField: 'status' }, published: true }])
+      await updateViewConfig('bookmarks', 7, 'user-test', { groupField: 'priority' })
+      expect(updateSet()).toEqual(expect.objectContaining({ columns: ['title', 'status', 'priority'] }))
+    })
+
+    it('leaves the columns of an unpublished view alone', async () => {
+      withSchema()
+      selectLimit.mockResolvedValue([{ id: 7, type: 'calendar', columns: ['title'], config: {}, published: false }])
+      await updateViewConfig('bookmarks', 7, 'user-test', { dateField: 'due' })
+      expect(updateSet()).not.toHaveProperty('columns')
+    })
   })
 })
 

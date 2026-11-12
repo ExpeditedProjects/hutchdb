@@ -177,7 +177,6 @@ export async function listCollections(userId: string, organizationId?: string) {
       description: collections.description,
       schema: collections.schema,
       uniqueKey: collections.uniqueKey,
-      published: collections.published,
       createdAt: collections.createdAt,
       updatedAt: collections.updatedAt,
       role: collectionMembers.role,
@@ -204,9 +203,8 @@ export async function createCollection(userId: string, organizationId: string, p
   description?: string;
   schema?: unknown;
   unique_key?: unknown;
-  published?: boolean;
 }) {
-  const { name, description, schema: schemaVal, unique_key, published } = params;
+  const { name, description, schema: schemaVal, unique_key } = params;
 
   const slug = uniqueSlug(name);
 
@@ -218,7 +216,6 @@ export async function createCollection(userId: string, organizationId: string, p
     description: description || null,
     schema: schemaVal ?? { fields: [] },
     uniqueKey: unique_key ?? [],
-    published: published ?? false,
   });
 
   if (schemaVal && (schemaVal as CollectionSchema)?.fields?.length) {
@@ -257,7 +254,13 @@ export async function getCollection(slug: string, userId: string, page?: FieldPa
   };
 }
 
-export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
+/** Collections are never published (only views are), so there is no `published` update. */
+export async function updateCollection(slug: string, userId: string, updates: {
+  name?: string;
+  description?: string;
+  schema?: unknown;
+  unique_key?: unknown;
+}) {
   const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
   // The argument may be the collection's name; continue with its slug.
@@ -269,12 +272,6 @@ export async function updateCollection(slug: string, userId: string, updates: Re
   if (updates.description !== undefined) dbUpdates.description = updates.description;
   if (updates.schema !== undefined) dbUpdates.schema = updates.schema;
   if (updates.unique_key !== undefined) dbUpdates.uniqueKey = updates.unique_key;
-  if (updates.published !== undefined) {
-    dbUpdates.published = updates.published;
-    if (updates.published && !collection.publishedAt) {
-      dbUpdates.publishedAt = new Date();
-    }
-  }
 
   const [updated] = await db
     .update(collections)

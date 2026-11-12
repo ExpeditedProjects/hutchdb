@@ -129,6 +129,22 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     for (const r of imported.results as { record: unknown }[]) expectNoInternalKeys(r.record);
   });
 
+  it("hutch_update_collection never publishes the collection, and collections carry no published flag", async () => {
+    const stored = json(await call("hutch_store_records", { collection: "Output Private", data: { title: "x" } }));
+    const slug = (stored.collection as { slug: string }).slug;
+    // An older client may still send published: the handler drops it.
+    const updated = json(await call("hutch_update_collection", { slug, description: "d", published: true }));
+    expect(updated.description).toBe("d");
+    for (const out of [updated, json(await call("hutch_get_collection", { slug }))]) {
+      expect(out).not.toHaveProperty("published");
+      expect(out).not.toHaveProperty("publishedAt");
+    }
+    const listed = JSON.parse((await call("hutch_list_collections", {}) as ToolResult).content[0].text) as Record<string, unknown>[];
+    expect(listed.find((c) => c.slug === slug)).not.toHaveProperty("published");
+    const row = await testPool.query("SELECT published, published_at FROM collections WHERE slug = $1", [slug]);
+    expect(row.rows[0]).toEqual({ published: false, published_at: null });
+  });
+
   it("a single-record store (data:) leaves out internal keys on its top-level record", async () => {
     const single = json(await call("hutch_store_records", { collection: "Output Single", data: { title: "x", source: "mine" } }));
     const record = single.record as Record<string, unknown>;

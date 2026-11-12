@@ -39,6 +39,7 @@ Core self-bootstraps its singleton user + personal org on the first authenticate
 - Tool annotations follow ChatGPT app review, which reads them from the server: every tool sets readOnlyHint/destructiveHint/idempotentHint/openWorldHint explicitly; anything that can overwrite (incl. on_conflict: replace) is destructive even if undoable; a `published` input means openWorldHint: true. Tool output strips record/view/collection bookkeeping (`collectionId`, `source`, `deletedAt`, `organizationId`) in `server.ts`, not in services. Locked by `app-directory review rules` in `server.test.ts`.
 - Records reach tool output in more shapes than `records`/`results[].record`: a single-record store (`data:`) spreads its one result so `record` is top-level (`createRecords`), and a `per_record` aggregate attaches the parent as `results[].record` from `fetchEmbeddedRecords`. Mocked unit tests only see the shapes the mock was written with; `server-output.integration.test.ts` checks the real ones, so add a case there for any new record-bearing response.
 - Descriptions that promise behavior (e.g. store_records' seeded default views from `seedAutoViews`) get an integration test against the real behavior, not only a regex on the text.
+- Views are the only publishable unit (collections never are; `collections.published` is unused). Publishing a view, or changing a published view's columns, needs non-empty `columns` of visible saved-schema fields, and the layout field (kanban group, calendar/timeline date, gallery image) is appended. `src/lib/services/views.ts` is the one place this is enforced, for MCP and the Cloud dashboard alike.
 
 ## Testing workflow
 
@@ -48,7 +49,7 @@ For new functionality (features, bug fixes that change behavior):
 2. Review the tests together before any code is written; the tests *are* the spec.
 3. Implement to green. The test suite is the verification gate.
 
-Test stack: vitest + @testing-library/react. Run `npm test` (vitest run) or `npm run test:watch`. Tests live next to source as `*.test.ts(x)`.
+Test stack: vitest + @testing-library/react. Run `npm test` (vitest run) or `npm run test:watch`. Tests live next to source as `*.test.ts(x)`. Unit tests run under happy-dom, where `import.meta.url` is not a `file:` URL: a unit test that reads repo files (e.g. `src/lib/db/migrations.test.ts`) needs `// @vitest-environment node` on its first line.
 
 `*.integration.test.ts` run against real Postgres and are silently **skipped** unless `HUTCH_TEST_DATABASE_URL` is set (`createdb hutch_core_test` once, then `HUTCH_TEST_DATABASE_URL=postgresql://localhost/hutch_core_test npm test`). Any change to services, queries, or SQL should run them, and should usually add one: mocked unit tests only check SQL strings, and have missed real result-type bugs (numeric aggregates coming back as strings).
 

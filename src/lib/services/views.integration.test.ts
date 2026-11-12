@@ -8,9 +8,10 @@ import { sql, eq } from "drizzle-orm";
 import * as schema from "@/lib/db/schema";
 
 // ---------------------------------------------------------------------------
-// Views service against real Postgres: the per-view `published` flag,
-// group_by limited to kanban, updateView / deleteView / listViews with their
-// access rules, and the 0023 backfill.
+// Views service against real Postgres: the per-view `published` flag and the
+// columns a published view needs, group_by limited to kanban, updateView /
+// deleteView / listViews with their access rules, and the 0023 and 0024
+// migrations.
 //
 // Auto-skipped unless HUTCH_TEST_DATABASE_URL is set.
 // ---------------------------------------------------------------------------
@@ -24,6 +25,20 @@ const MIGRATIONS = fileURLToPath(new URL("../../../drizzle", import.meta.url));
 type ViewsService = typeof import("@/lib/services/views");
 type CollectionsService = typeof import("@/lib/services/collections");
 type View = typeof schema.views.$inferSelect;
+
+/** The saved schema makeCollection gives every collection: `secret` is hidden. */
+const SAVED_SCHEMA = {
+  fields: ["title", "status", "priority", "due", "cover", "secret"].map((name, position) => ({
+    name,
+    type: ({ status: "select", priority: "select", due: "date", cover: "image_url" } as Record<string, string>)[name] ?? "text",
+    inferred: true,
+    position,
+    hidden: name === "secret",
+  })),
+  version: 1,
+  lastInferredAt: "2026-11-12T00:00:00.000Z",
+};
+const VALID_FIELDS = "Valid fields: title, status, priority, due, cover.";
 
 describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
   let testPool: Pool;
@@ -64,8 +79,10 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     else process.env.HUTCH_DATABASE_URL = savedUrl;
   });
 
-  async function makeCollection(name: string, published = false): Promise<{ id: number; slug: string }> {
-    const { collection } = await collectionsSvc.createCollection(OWNER_ID, ORG_ID, { name, published });
+  /** A collection with SAVED_SCHEMA, set directly so no default views are seeded. */
+  async function makeCollection(name: string, savedSchema: unknown = SAVED_SCHEMA): Promise<{ id: number; slug: string }> {
+    const { collection } = await collectionsSvc.createCollection(OWNER_ID, ORG_ID, { name });
+    await testDb.update(schema.collections).set({ schema: savedSchema }).where(eq(schema.collections.id, collection.id));
     return { id: collection.id, slug: collection.slug };
   }
 
@@ -98,7 +115,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
 
     it("creates a published view when asked", async () => {
       const { slug } = await makeCollection("Tasks");
-      const view = await makeView(slug, { type: "table", published: true });
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
       expect(view.published).toBe(true);
       expect((await rawView(view.id)).published).toBe(true);
     });
@@ -125,7 +142,6 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     it("leaves seeded views unpublished", async () => {
       const { collection } = await collectionsSvc.createCollection(OWNER_ID, ORG_ID, {
         name: "Seeded",
-        published: true,
         schema: { fields: [{ name: "status", type: "select", options: ["a", "b"] }, { name: "due", type: "date" }] },
       });
       const rows = await testDb.select().from(schema.views).where(eq(schema.views.collectionId, collection.id));
@@ -169,7 +185,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const { slug } = await makeCollection("Tasks");
       const view = await makeView(slug, { type: "table", name: "All" });
 
-      const result = await viewsSvc.updateView("Tasks", view.slug, OWNER_ID, { published: true });
+      const result = await viewsSvc.updateView("Tasks", view.slug, OWNER_ID, { published: true, columns: ["title"] });
       expect((result as { view: View }).view.published).toBe(true);
       expect((await rawView(view.id)).published).toBe(true);
     });
@@ -183,7 +199,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
 
     it("unpublishes a published view", async () => {
       const { slug } = await makeCollection("Tasks");
-      const view = await makeView(slug, { type: "table", published: true });
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
       await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: false });
       expect((await rawView(view.id)).published).toBe(false);
     });
@@ -286,7 +302,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const { id, slug } = await makeCollection("Tasks");
       await grantViewer(id, "editor");
       const view = await makeView(slug, { type: "table" });
-      expect(await viewsSvc.updateView(slug, view.id, VIEWER_ID, { published: true })).not.toBeNull();
+      expect(await viewsSvc.updateView(slug, view.id, VIEWER_ID, { published: true, columns: ["title"] })).not.toBeNull();
       expect((await rawView(view.id)).published).toBe(true);
     });
 
@@ -342,7 +358,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       await grantViewer(a.id);
       const first = await makeView(a.slug, { type: "table", name: "First" });
       await makeView(b.slug, { type: "table", name: "Other" });
-      const second = await makeView(a.slug, { type: "kanban", name: "Second", groupBy: "status", published: true });
+      const second = await makeView(a.slug, { type: "kanban", name: "Second", groupBy: "status", published: true, columns: ["title"] });
 
       const owner = await viewsSvc.listViews(a.slug, OWNER_ID);
       expect(owner!.map((v) => v.id)).toEqual([first.id, second.id]);
@@ -362,22 +378,140 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     });
   });
 
+  describe("publishing needs columns", () => {
+    it("refuses to create a published view without columns, listing the valid fields", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const result = await viewsSvc.createView(slug, OWNER_ID, { type: "table", published: true });
+      expect(result).toEqual({
+        error: `Set columns before publishing: a published view shows only the fields listed in its columns. ${VALID_FIELDS}`,
+        status: 400,
+      });
+      expect(await testDb.select().from(schema.views)).toHaveLength(0);
+    });
+
+    it("refuses hidden and unknown columns, naming them", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const result = await viewsSvc.createView(slug, OWNER_ID, { type: "table", published: true, columns: ["title", "secret", "nope"] });
+      expect(result).toEqual({
+        error: `These columns are hidden or not in the collection's saved schema, so they cannot be published: secret, nope. ${VALID_FIELDS}`,
+        status: 400,
+      });
+      expect(await testDb.select().from(schema.views)).toHaveLength(0);
+    });
+
+    it("says when the collection has no saved schema fields yet", async () => {
+      const { slug } = await makeCollection("Tasks", { fields: [] });
+      const result = await viewsSvc.createView(slug, OWNER_ID, { type: "table", published: true, columns: ["title"] });
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^This collection has no saved schema fields yet/) }));
+      expect(await testDb.select().from(schema.views)).toHaveLength(0);
+    });
+
+    it("publishes valid columns, by create or by update", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const created = await makeView(slug, { type: "table", published: true, columns: ["due", "title"] });
+      expect(await rawView(created.id)).toEqual(expect.objectContaining({ published: true, columns: ["due", "title"] }));
+
+      const draft = await makeView(slug, { type: "table" });
+      const result = await viewsSvc.updateView(slug, draft.id, OWNER_ID, { published: true, columns: ["status"] });
+      expect(result).not.toHaveProperty("error");
+      expect(await rawView(draft.id)).toEqual(expect.objectContaining({ published: true, columns: ["status"] }));
+    });
+
+    it("refuses to publish a view whose stored columns are empty, and leaves it unpublished", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table" });
+      const result = await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true });
+      expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^Set columns before publishing/) }));
+      expect((await rawView(view.id)).published).toBe(false);
+    });
+
+    it("refuses to clear or break the columns of a published view", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+
+      const cleared = await viewsSvc.updateView(slug, view.id, OWNER_ID, { columns: [] });
+      expect(cleared).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^Set columns before publishing/) }));
+      const hidden = await viewsSvc.updateView(slug, view.id, OWNER_ID, { columns: ["title", "secret"] });
+      expect(hidden).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining("cannot be published: secret.") }));
+      expect(await rawView(view.id)).toEqual(expect.objectContaining({ published: true, columns: ["title"] }));
+
+      // Unpublishing in the same call lifts the rule.
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: false, columns: [] });
+      expect(await rawView(view.id)).toEqual(expect.objectContaining({ published: false, columns: [] }));
+    });
+
+    it("adds a published kanban's group field: groupByField from group_by, groupField from the dashboard", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const board = await makeView(slug, { type: "kanban", groupBy: "status", published: true, columns: ["title"] });
+      expect((await rawView(board.id)).columns).toEqual(["title", "status"]);
+
+      // The Cloud dashboard regroups through updateViewConfig, writing groupField.
+      await viewsSvc.updateViewConfig(slug, board.id, OWNER_ID, { groupField: "priority" });
+      expect((await rawView(board.id)).columns).toEqual(["title", "status", "priority"]);
+    });
+
+    it.each([
+      ["calendar", { dateField: "due" }, "due"],
+      ["timeline", { dateField: "due" }, "due"],
+      ["gallery", { imageField: "cover" }, "cover"],
+    ])("adds a published %s view's layout field when it is published", async (type, config, field) => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type, config, columns: ["title"] });
+      expect((await rawView(view.id)).columns).toEqual(["title"]);
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true });
+      expect((await rawView(view.id)).columns).toEqual(["title", field]);
+    });
+
+    it("does not add a hidden layout field", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "gallery", config: { imageField: "secret" }, published: true, columns: ["title"] });
+      expect((await rawView(view.id)).columns).toEqual(["title"]);
+    });
+  });
+
+  // There is no harness for running one migration against an older schema,
+  // so these replay a migration's UPDATE against current rows.
+  function migrationUpdate(tag: string): string {
+    const file = readFileSync(`${MIGRATIONS}/${tag}.sql`, "utf8");
+    const updates = file.split("--> statement-breakpoint").map((s) => s.replace(/^--.*$/gm, "").trim()).filter((s) => /^UPDATE\b/i.test(s));
+    expect(updates).toHaveLength(1);
+    return updates[0];
+  }
+
   describe("migration 0023 backfill", () => {
-    // There is no harness for running one migration against an older schema,
-    // so this replays the migration's UPDATE against current rows.
     it("publishes every view of an already-published collection, and only those", async () => {
-      const live = await makeCollection("Live", true);
-      const draft = await makeCollection("Draft", false);
+      const live = await makeCollection("Live");
+      const draft = await makeCollection("Draft");
+      // collections.published is no longer settable through the services.
+      await testDb.update(schema.collections).set({ published: true }).where(eq(schema.collections.id, live.id));
       const liveView = await makeView(live.slug, { type: "table" });
       const draftView = await makeView(draft.slug, { type: "table" });
 
-      const file = readFileSync(`${MIGRATIONS}/0023_view_published.sql`, "utf8");
-      const updates = file.split("--> statement-breakpoint").map((s) => s.trim()).filter((s) => /^UPDATE\b/i.test(s.replace(/^--.*$/gm, "").trim()));
-      expect(updates).toHaveLength(1);
-      await testDb.execute(sql.raw(updates[0]));
+      await testDb.execute(sql.raw(migrationUpdate("0023_view_published")));
 
       expect((await rawView(liveView.id)).published).toBe(true);
       expect((await rawView(draftView.id)).published).toBe(false);
+    });
+  });
+
+  describe("migration 0024 unpublish", () => {
+    it("unpublishes every view, leaving its columns and config alone", async () => {
+      const a = await makeCollection("Alpha");
+      const b = await makeCollection("Beta");
+      const one = await makeView(a.slug, { type: "kanban", groupBy: "status", published: true, columns: ["title"] });
+      const two = await makeView(b.slug, { type: "table", published: true, columns: ["due"] });
+      const draft = await makeView(b.slug, { type: "table" });
+      await ageView(one.id);
+
+      await testDb.execute(sql.raw(migrationUpdate("0024_unpublish_views")));
+
+      const rows = await testDb.select().from(schema.views);
+      expect(rows.map((r) => r.published)).toEqual([false, false, false]);
+      expect(await rawView(one.id)).toEqual(expect.objectContaining({
+        columns: ["title", "status"], config: { groupByField: "status" }, updatedAt: new Date("2020-01-01T00:00:00Z"),
+      }));
+      expect((await rawView(two.id)).columns).toEqual(["due"]);
+      expect((await rawView(draft.id)).published).toBe(false);
     });
   });
 });
