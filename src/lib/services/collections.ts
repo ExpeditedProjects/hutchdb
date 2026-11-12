@@ -254,11 +254,14 @@ export async function getCollection(slug: string, userId: string, page?: FieldPa
   };
 }
 
-/** Collections are never published (only views are), so there is no `published` update. */
+/**
+ * Collections are never published (only views are), so there is no
+ * `published` update. With nothing to change it writes nothing and returns
+ * the collection as it is.
+ */
 export async function updateCollection(slug: string, userId: string, updates: {
   name?: string;
   description?: string;
-  schema?: unknown;
   unique_key?: unknown;
 }) {
   const access = await findAccessibleCollection(slug, userId, "owner");
@@ -267,15 +270,15 @@ export async function updateCollection(slug: string, userId: string, updates: {
   slug = access.collection.slug;
   const collection = access.collection;
 
-  const dbUpdates: Record<string, unknown> = { updatedAt: new Date() };
+  const dbUpdates: Record<string, unknown> = {};
   if (updates.name !== undefined) dbUpdates.name = updates.name;
   if (updates.description !== undefined) dbUpdates.description = updates.description;
-  if (updates.schema !== undefined) dbUpdates.schema = updates.schema;
   if (updates.unique_key !== undefined) dbUpdates.uniqueKey = updates.unique_key;
+  if (Object.keys(dbUpdates).length === 0) return { collection };
 
   const [updated] = await db
     .update(collections)
-    .set(dbUpdates)
+    .set({ ...dbUpdates, updatedAt: new Date() })
     .where(eq(collections.id, collection.id))
     .returning();
 

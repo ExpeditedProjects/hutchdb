@@ -145,6 +145,22 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     expect(row.rows[0]).toEqual({ published: false, published_at: null });
   });
 
+  it("hutch_update_collection with nothing to update returns an error and writes nothing", async () => {
+    const stored = json(await call("hutch_store_records", { collection: "Output Untouched", data: { title: "x" } }));
+    const slug = (stored.collection as { slug: string }).slug;
+    await testPool.query("UPDATE collections SET updated_at = '2020-01-01T00:00:00Z' WHERE slug = $1", [slug]);
+    for (const params of [{ slug }, { slug, published: true }]) {
+      const result = await call("hutch_update_collection", params) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/^Nothing to update\. Collections can't be published; to share data publicly, publish a view with hutch_update_view/);
+    }
+    // The service itself writes nothing either when given nothing to change.
+    const { updateCollection } = await import("@/lib/services/collections");
+    expect(await updateCollection(slug, USER_ID, {})).toEqual({ collection: expect.objectContaining({ slug }) });
+    const row = await testPool.query("SELECT published, updated_at FROM collections WHERE slug = $1", [slug]);
+    expect(row.rows[0]).toEqual({ published: false, updated_at: new Date("2020-01-01T00:00:00Z") });
+  });
+
   it("a single-record store (data:) leaves out internal keys on its top-level record", async () => {
     const single = json(await call("hutch_store_records", { collection: "Output Single", data: { title: "x", source: "mine" } }));
     const record = single.record as Record<string, unknown>;

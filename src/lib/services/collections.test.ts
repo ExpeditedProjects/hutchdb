@@ -222,6 +222,17 @@ describe('updateCollection', () => {
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
 
+  it('writes and revalidates nothing when there is nothing to update', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'owner' })
+    const { db } = await import('@/lib/db')
+    const { revalidateDashboard } = await import('@/lib/revalidation')
+    // published is not an update: collections are never published.
+    const result = await updateCollection('bookmarks', 'user-test', { published: true } as never)
+    expect(result).toEqual({ collection: baseCollection })
+    expect(db.update).not.toHaveBeenCalled()
+    expect(revalidateDashboard).not.toHaveBeenCalled()
+  })
+
   it('never writes published or publishedAt, even if a caller passes published', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'owner' })
     updateReturning.mockResolvedValue([baseCollection])

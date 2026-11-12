@@ -36,8 +36,10 @@ describe('drizzle migration journal', () => {
 
 describe('migration 0024_unpublish_views', () => {
   it('follows 0023 in the journal, dated the day it was written', () => {
-    expect(core.map((e) => e.tag).slice(-2)).toEqual(['0023_view_published', '0024_unpublish_views'])
-    expect(core.at(-1)).toEqual({ idx: 24, version: '7', when: Date.UTC(2026, 10, 12), tag: '0024_unpublish_views', breakpoints: true })
+    const at = core.findIndex((e) => e.tag === '0024_unpublish_views')
+    expect(at).toBeGreaterThan(0)
+    expect(core[at - 1].tag).toBe('0023_view_published')
+    expect(core[at]).toEqual({ idx: 24, version: '7', when: Date.UTC(2026, 10, 12), tag: '0024_unpublish_views', breakpoints: true })
   })
 
   it('unpublishes every view and changes nothing else', () => {

@@ -1125,47 +1125,21 @@ describe('create_view tool', () => {
     expect(result.isError).toBe(true)
   })
 
-  it('infers groupBy from the first select field of the collection schema for kanban views', async () => {
+  it('leaves kanban group_by inference to createView, without reading the collection here', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
-    vi.mocked(collectionService.getCollection).mockResolvedValue({
-      id: 1,
-      name: 'Tasks',
-      slug: 'tasks',
-      schema: {
-        fields: [
-          { name: 'title', type: 'text', inferred: true, position: 0, hidden: false },
-          { name: 'status', type: 'select', inferred: true, position: 1, hidden: false, options: ['todo', 'done'] },
-          { name: 'priority', type: 'select', inferred: true, position: 2, hidden: false, options: ['low', 'high'] },
-        ],
-        version: 1,
-        lastInferredAt: new Date().toISOString(),
-      },
-    } as never)
     vi.mocked(createView).mockResolvedValue({ view: { id: 1, name: 'Kanban' } } as never)
 
     await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'kanban' })
 
-    expect(createView).toHaveBeenCalledWith('tasks', 'user-1', expect.objectContaining({
-      type: 'kanban',
-      groupBy: 'status',
-    }))
+    expect(createView).toHaveBeenCalledWith('tasks', 'user-1', expect.objectContaining({ type: 'kanban', inferGroupBy: true }))
+    expect(vi.mocked(createView).mock.calls[0][2]).not.toHaveProperty('groupBy')
+    // getCollection counts every record; the service already has the schema.
+    expect(collectionService.getCollection).not.toHaveBeenCalled()
   })
 
-  it('returns isError mentioning group_by when kanban requested but collection has no select fields', async () => {
+  it('returns isError mentioning group_by when createView finds no select field to group by', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
-    vi.mocked(collectionService.getCollection).mockResolvedValue({
-      id: 1,
-      name: 'Tasks',
-      slug: 'tasks',
-      schema: {
-        fields: [
-          { name: 'title', type: 'text', inferred: true, position: 0, hidden: false },
-          { name: 'count', type: 'number', inferred: true, position: 1, hidden: false },
-        ],
-        version: 1,
-        lastInferredAt: new Date().toISOString(),
-      },
-    } as never)
+    vi.mocked(createView).mockResolvedValue({ error: 'Cannot infer a field to group by: the collection has no visible select field.', status: 400, code: 'no_group_field' } as never)
 
     const result = await registeredTools.get('hutch_create_view')!({ slug: 'tasks', type: 'kanban' }) as {
       isError?: boolean
@@ -1173,8 +1147,19 @@ describe('create_view tool', () => {
     }
 
     expect(result.isError).toBe(true)
-    expect(result.content[0].text).toMatch(/group_by/)
-    expect(createView).not.toHaveBeenCalled()
+    expect(result.content[0].text).toBe("Cannot infer a field to group by: the collection has no visible select field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'.")
+  })
+
+  it('adds tool hints to view service errors by code, and leaves other errors as they are', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const text = async (error: Record<string, unknown>) => {
+      vi.mocked(updateView).mockResolvedValue(error as never)
+      return ((await registeredTools.get('hutch_update_view')!({ slug: 'tasks', view: 1, published: true })) as { content: { text: string }[] }).content[0].text
+    }
+    expect(await text({ error: 'No fields.', status: 400, code: 'no_publishable_fields' })).toBe('No fields. Save the schema with hutch_infer_schema, or unhide a field with hutch_update_schema.')
+    expect(await text({ error: 'Bad columns.', status: 400, code: 'invalid_columns' })).toBe('Bad columns. hutch_get_collection lists the saved schema fields and which are hidden.')
+    expect(await text({ error: "Only the collection's owner can publish a view or change a published one.", status: 403, code: 'owner_only' })).toBe("Only the collection's owner can publish a view or change a published one.")
+    expect(await text({ error: 'Plain.', status: 400 })).toBe('Plain.')
   })
 
   it('forwards an explicit group_by for kanban without consulting the schema', async () => {
@@ -1216,6 +1201,7 @@ describe('create_view tool', () => {
     const shape = (registeredConfigs.get('hutch_create_view')!.inputSchema as { shape: Record<string, { description?: string }> }).shape
     expect(shape.published.description).toMatch(/public read-only page/)
     expect(shape.published.description).toMatch(/Needs columns/)
+    expect(shape.published.description).toMatch(/Only the collection's owner can publish/)
     expect(shape.published.description).toMatch(/Default false/)
     expect(shape.group_by.description).toMatch(/kanban only/i)
   })
@@ -1316,6 +1302,7 @@ describe('update_view tool', () => {
     expect(config.description).toMatch(/Example:/)
     expect(config.description).toMatch(/public read-only page/)
     expect(config.description).toMatch(/Publishing needs columns/)
+    expect(config.description).toMatch(/Only the collection's owner can publish a view or change a published one; anyone who can edit it may unpublish it/)
     expect((config.annotations as { destructiveHint?: boolean }).destructiveHint).toBe(true)
   })
 })
@@ -1383,12 +1370,13 @@ describe('server instructions mention view management', () => {
     expect(instructions).toMatch(/published/)
   })
 
-  it('says only views are published, showing only their columns, and that columns are required', async () => {
+  it('says what a published view shows, who can publish, and that columns must include the layout field', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
     const instructions = McpServer.lastOptions?.instructions ?? ''
-    expect(instructions).toMatch(/shows only the view's columns, and only the records its filter matches/)
-    expect(instructions).toMatch(/To publish a view, set its columns/)
+    expect(instructions).toMatch(/It shows the collection's name and description, the view's name and description, the view's columns, and the records its filter matches/)
+    expect(instructions).toMatch(/Only the collection's owner can publish a view/)
+    expect(instructions).toMatch(/including the field the layout uses/)
     expect(instructions).toMatch(/Collections cannot be published/)
     expect(instructions).not.toMatch(/hutch_update_collection with published/)
   })
@@ -1412,6 +1400,16 @@ describe('update_collection tool', () => {
     expect(result.isError).toBeFalsy()
     expect(collectionService.updateCollection).toHaveBeenCalledWith('n', 'user-1', { name: undefined, description: 'd', unique_key: undefined })
     expect(vi.mocked(collectionService.updateCollection).mock.calls[0][2]).not.toHaveProperty('published')
+  })
+
+  it('returns an error pointing to views when nothing is given to update, without calling the service', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const result = await registeredTools.get('hutch_update_collection')!({ slug: 'n' }) as ToolResult
+    expect(result.isError).toBe(true)
+    expect(result.content[0].text).toBe("Nothing to update. Collections can't be published; to share data publicly, publish a view with hutch_update_view (published: true, columns: [...]).")
+    // An older client's published: true alone is the same: nothing to update.
+    await registeredTools.get('hutch_update_collection')!({ slug: 'n', published: true })
+    expect(collectionService.updateCollection).not.toHaveBeenCalled()
   })
 
   it('does not mention publishing in its description', () => {
