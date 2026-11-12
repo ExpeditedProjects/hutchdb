@@ -129,6 +129,38 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     for (const r of imported.results as { record: unknown }[]) expectNoInternalKeys(r.record);
   });
 
+  it("hutch_update_collection never publishes the collection, and collections carry no published flag", async () => {
+    const stored = json(await call("hutch_store_records", { collection: "Output Private", data: { title: "x" } }));
+    const slug = (stored.collection as { slug: string }).slug;
+    // An older client may still send published: the handler drops it.
+    const updated = json(await call("hutch_update_collection", { slug, description: "d", published: true }));
+    expect(updated.description).toBe("d");
+    for (const out of [updated, json(await call("hutch_get_collection", { slug }))]) {
+      expect(out).not.toHaveProperty("published");
+      expect(out).not.toHaveProperty("publishedAt");
+    }
+    const listed = JSON.parse((await call("hutch_list_collections", {}) as ToolResult).content[0].text) as Record<string, unknown>[];
+    expect(listed.find((c) => c.slug === slug)).not.toHaveProperty("published");
+    const row = await testPool.query("SELECT published, published_at FROM collections WHERE slug = $1", [slug]);
+    expect(row.rows[0]).toEqual({ published: false, published_at: null });
+  });
+
+  it("hutch_update_collection with nothing to update returns an error and writes nothing", async () => {
+    const stored = json(await call("hutch_store_records", { collection: "Output Untouched", data: { title: "x" } }));
+    const slug = (stored.collection as { slug: string }).slug;
+    await testPool.query("UPDATE collections SET updated_at = '2020-01-01T00:00:00Z' WHERE slug = $1", [slug]);
+    for (const params of [{ slug }, { slug, published: true }]) {
+      const result = await call("hutch_update_collection", params) as ToolResult;
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toMatch(/^Nothing to update\. Collections can't be published; to share data publicly, publish a view with hutch_update_view/);
+    }
+    // The service itself writes nothing either when given nothing to change.
+    const { updateCollection } = await import("@/lib/services/collections");
+    expect(await updateCollection(slug, USER_ID, {})).toEqual({ collection: expect.objectContaining({ slug }) });
+    const row = await testPool.query("SELECT published, updated_at FROM collections WHERE slug = $1", [slug]);
+    expect(row.rows[0]).toEqual({ published: false, updated_at: new Date("2020-01-01T00:00:00Z") });
+  });
+
   it("a single-record store (data:) leaves out internal keys on its top-level record", async () => {
     const single = json(await call("hutch_store_records", { collection: "Output Single", data: { title: "x", source: "mine" } }));
     const record = single.record as Record<string, unknown>;

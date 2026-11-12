@@ -4,8 +4,8 @@ const insertReturning = vi.fn()
 const updateReturning = vi.fn()
 const selectLimit = vi.fn()
 
-vi.mock('@/lib/db', () => ({
-  db: {
+vi.mock('@/lib/db', () => {
+  const db = {
     insert: vi.fn(() => ({
       values: vi.fn(() => ({ returning: insertReturning })),
     })),
@@ -14,13 +14,17 @@ vi.mock('@/lib/db', () => ({
         where: vi.fn(() => ({ returning: updateReturning })),
       })),
     })),
+    // View changes read the row with .limit(1).for("update").
     select: vi.fn(() => ({
       from: vi.fn(() => ({
-        where: vi.fn(() => ({ limit: selectLimit })),
+        where: vi.fn(() => ({ limit: vi.fn(() => ({ for: selectLimit })) })),
       })),
     })),
-  },
-}))
+    // The transaction runs on the same mocks.
+    transaction: vi.fn((fn: (tx: unknown) => unknown) => fn(db)),
+  }
+  return { db }
+})
 
 vi.mock('@/lib/db/queries', () => ({
   findAccessibleCollectionBySlug: vi.fn(),
@@ -40,7 +44,7 @@ vi.mock('@/lib/revalidation', () => ({
   revalidateDashboard: vi.fn(),
 }))
 
-import { createView, renameView, updateViewConfig, seedAutoViews } from './views'
+import { createView, renameView, updateView, updateViewConfig, seedAutoViews, MAX_PUBLISHED_COLUMNS } from './views'
 import { findAccessibleCollectionBySlug } from '@/lib/db/queries'
 import { db } from '@/lib/db'
 import { revalidateDashboard } from '@/lib/revalidation'
@@ -184,6 +188,311 @@ describe('createView with explicit name and groupBy', () => {
     const valuesCall = vi.mocked(db.insert).mock.results[0].value.values
     const inserted = valuesCall.mock.calls[0][0]
     expect(inserted.config).toEqual({ groupByField: 'status', cardTitle: 'title' })
+  })
+})
+
+describe('publishing a view', () => {
+  // A published view shows only its columns, so they must be distinct visible
+  // fields of the saved schema and include the field the layout uses; only
+  // the collection's owner may publish or change a published view.
+  const schema = {
+    fields: [
+      { name: 'title', type: 'text', inferred: true, position: 0, hidden: false },
+      { name: 'status', type: 'select', inferred: true, position: 1, hidden: false },
+      { name: 'priority', type: 'select', inferred: true, position: 2, hidden: false },
+      { name: 'due', type: 'date', inferred: true, position: 3, hidden: false },
+      { name: 'cover', type: 'image_url', inferred: true, position: 4, hidden: false },
+      { name: 'secret', type: 'select', inferred: true, position: 5, hidden: true },
+    ],
+    version: 1,
+    lastInferredAt: '',
+  }
+  const VALID = 'Valid fields: title, status, priority, due, cover.'
+  const OWNER_ONLY = { error: "Only the collection's owner can publish a view or change a published one.", status: 403, code: 'owner_only' }
+  const as = (role: 'owner' | 'editor', s: unknown = schema) => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: { ...collectionRow, schema: s }, role } as never)
+    insertReturning.mockResolvedValue([{ id: 1 }])
+    updateReturning.mockResolvedValue([{ id: 7 }])
+  }
+  const inserted = () => vi.mocked(db.insert).mock.results[0].value.values.mock.calls[0][0]
+  const updateSet = () => vi.mocked(db.update).mock.results[0].value.set.mock.calls[0][0]
+  const stored = (view: Record<string, unknown>) =>
+    selectLimit.mockResolvedValue([{ id: 7, type: 'table', columns: [], config: {}, published: false, ...view }])
+
+  describe('createView', () => {
+    it('refuses to publish for an editor, and inserts nothing', async () => {
+      as('editor')
+      expect(await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title'] })).toEqual(OWNER_ONLY)
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('refuses to publish without columns, listing the valid fields', async () => {
+      as('owner')
+      expect(await createView('bookmarks', 'user-test', { type: 'table', published: true })).toEqual({
+        error: `Set columns before publishing: a published view shows only the fields listed in its columns. ${VALID}`,
+        status: 400,
+        code: 'invalid_columns',
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('refuses hidden, unknown and non-string columns, naming them', async () => {
+      as('owner')
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title', 'secret', 'nope', 5, { a: 1 }] as never })
+      expect(result).toEqual({
+        error: `These columns are hidden or not in the collection's saved schema, so they cannot be published: secret, nope, 5, {"a":1}. ${VALID}`,
+        status: 400,
+        code: 'invalid_columns',
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('echoes at most 50 invalid names, each cut to 100 characters', async () => {
+      as('owner')
+      const long = Array.from({ length: 60 }, (_, i) => `${String(i).padStart(2, '0')}${'x'.repeat(200)}`)
+      const { error } = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: long }) as { error: string }
+      expect(error).toContain(`${'00'}${'x'.repeat(98)}…, `)
+      expect(error).not.toContain('x'.repeat(99))
+      expect(error).toContain(`49${'x'.repeat(98)}…, and 10 more. ${VALID}`)
+      expect(error).not.toContain('50x')
+    })
+
+    it('refuses duplicate columns', async () => {
+      as('owner')
+      expect(await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title', 'due', 'title'] })).toEqual({
+        error: 'These columns are listed more than once: title. List each field once.',
+        status: 400,
+      })
+    })
+
+    it(`refuses more than ${MAX_PUBLISHED_COLUMNS} columns`, async () => {
+      as('owner')
+      const columns = Array.from({ length: MAX_PUBLISHED_COLUMNS + 1 }, () => 'title')
+      expect(await createView('bookmarks', 'user-test', { type: 'table', published: true, columns })).toEqual({
+        error: `A published view can have at most ${MAX_PUBLISHED_COLUMNS} columns; this one has ${MAX_PUBLISHED_COLUMNS + 1}.`,
+        status: 400,
+      })
+    })
+
+    it('says when the collection has no visible saved schema fields, without naming MCP tools', async () => {
+      for (const s of [null, { fields: [] }, { fields: [{ name: 'secret', type: 'text', hidden: true }] }]) {
+        as('owner', s)
+        expect(await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['title'] })).toEqual({
+          error: 'This collection has no saved schema fields yet (or all of them are hidden), so its views cannot be published. Save its schema or unhide a field, then pick the columns.',
+          status: 400,
+          code: 'no_publishable_fields',
+        })
+      }
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+
+    it('publishes distinct visible columns as given', async () => {
+      as('owner')
+      const result = await createView('bookmarks', 'user-test', { type: 'table', published: true, columns: ['due', 'title'] })
+      expect(result).not.toHaveProperty('error')
+      expect(inserted()).toEqual(expect.objectContaining({ published: true, columns: ['due', 'title'] }))
+    })
+
+    it('does not check the columns of an unpublished view, for an editor either', async () => {
+      as('editor', null)
+      await createView('bookmarks', 'user-test', { type: 'kanban', columns: ['anything'], groupBy: 'nope' })
+      expect(inserted()).toEqual(expect.objectContaining({ published: false, columns: ['anything'] }))
+    })
+
+    it.each([
+      ['kanban', { groupBy: 'status' }, 'groups by "status"', 'status'],
+      ['kanban', { config: { groupByField: 'status' } }, 'groups by "status"', 'status'],
+      ['kanban', { config: { groupField: 'priority' } }, 'groups by "priority"', 'priority'],
+      ['kanban', { config: { groupField: 'priority', groupByField: 'status' } }, 'groups by "priority"', 'priority'],
+      ['calendar', { config: { dateField: 'due' } }, 'places records by the date in "due"', 'due'],
+      ['timeline', { config: { dateField: 'due' } }, 'places records by the date in "due"', 'due'],
+      ['gallery', { config: { imageField: 'cover' } }, 'shows the images in "cover"', 'cover'],
+    ])('requires a published %s view (%j) to list its layout field', async (type, extra, uses, field) => {
+      as('owner')
+      expect(await createView('bookmarks', 'user-test', { type, published: true, columns: ['title'], ...extra })).toEqual({
+        error: `This ${type} view ${uses}, so "${field}" must be one of its columns before it can be published.`,
+        status: 400,
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+      await createView('bookmarks', 'user-test', { type, published: true, columns: ['title', field], ...extra })
+      expect(inserted().columns).toEqual(['title', field])
+    })
+
+    it.each(['secret', 'nope'])('refuses a layout field that is hidden or unknown (%s)', async (field) => {
+      as('owner')
+      expect(await createView('bookmarks', 'user-test', { type: 'gallery', published: true, columns: ['title'], config: { imageField: field } })).toEqual({
+        error: `This gallery view shows the images in "${field}", which is hidden or not in the collection's saved schema, so the view cannot be published.`,
+        status: 400,
+        code: 'invalid_columns',
+      })
+    })
+
+    it('does not crash on a view type that names an Object.prototype key', async () => {
+      as('owner')
+      for (const type of ['constructor', '__proto__', 'toString']) {
+        vi.mocked(db.insert).mockClear()
+        const result = await createView('bookmarks', 'user-test', { type, published: true, columns: ['title'], config: { dateField: 'nope' } })
+        expect(result).not.toHaveProperty('error')
+        expect(inserted().columns).toEqual(['title'])
+      }
+    })
+
+    it('drops a stale dashboard groupField when group_by is given', async () => {
+      as('owner')
+      await createView('bookmarks', 'user-test', { type: 'kanban', groupBy: 'status', config: { groupField: 'priority' } })
+      expect(inserted().config).toEqual({ groupByField: 'status' })
+    })
+
+    it('infers a kanban grouping from the first visible select field when asked', async () => {
+      as('owner', { fields: [{ name: 'secret', type: 'select', hidden: true }, { name: 'title', type: 'text' }, { name: 'status', type: 'select', hidden: false }] })
+      await createView('bookmarks', 'user-test', { type: 'kanban', inferGroupBy: true })
+      expect(inserted().config).toEqual({ groupByField: 'status' })
+    })
+
+    it('does not infer a grouping unless asked, or when config already names one', async () => {
+      as('owner')
+      await createView('bookmarks', 'user-test', { type: 'kanban' })
+      expect(inserted().config).toEqual({})
+      vi.mocked(db.insert).mockClear()
+      await createView('bookmarks', 'user-test', { type: 'kanban', inferGroupBy: true, config: { groupField: 'priority' } })
+      expect(inserted().config).toEqual({ groupField: 'priority' })
+    })
+
+    it('fails when asked to infer a grouping and no visible select field exists', async () => {
+      as('owner', { fields: [{ name: 'secret', type: 'select', hidden: true }, { name: 'title', type: 'text' }] })
+      expect(await createView('bookmarks', 'user-test', { type: 'kanban', inferGroupBy: true })).toEqual({
+        error: 'Cannot infer a field to group by: the collection has no visible select field.',
+        status: 400,
+        code: 'no_group_field',
+      })
+      expect(db.insert).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('updateView', () => {
+    it('locks the view row while it reads and writes', async () => {
+      as('owner')
+      stored({ columns: ['title'] })
+      await updateView('bookmarks', 7, 'user-test', { published: true })
+      expect(db.transaction).toHaveBeenCalledTimes(1)
+      expect(selectLimit).toHaveBeenCalledWith('update')
+    })
+
+    it.each([
+      ['publish', {}, { published: true, columns: ['title'] }],
+      ['rename a published view', { published: true }, { name: 'New' }],
+      ['refilter a published view', { published: true }, { filter: { status: 'open' } }],
+      ['resort a published view', { published: true }, { sort: '-due' }],
+      ['change the columns of a published view', { published: true }, { columns: ['title', 'due'] }],
+      ['change the config of a published view', { published: true }, { config: { cardTitle: 'title' } }],
+      ['regroup a published view', { published: true, type: 'kanban' }, { groupBy: 'status' }],
+      ['re-publish a published view', { published: true }, { published: true }],
+    ])('refuses an editor to %s, writing nothing', async (_, view, patch) => {
+      as('editor')
+      stored({ columns: ['title'], ...view })
+      expect(await updateView('bookmarks', 7, 'user-test', patch)).toEqual(OWNER_ONLY)
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it.each([
+      ['unpublish a published view', { published: true }, { published: false }],
+      ['unpublish and change a view in one call', { published: true, type: 'kanban' }, { published: false, groupBy: 'priority', columns: [] }],
+      ['change an unpublished view', {}, { name: 'New', columns: ['anything'] }],
+    ])('lets an editor %s', async (_, view, patch) => {
+      as('editor')
+      stored({ columns: ['title'], ...view })
+      const result = await updateView('bookmarks', 7, 'user-test', patch)
+      expect(result).not.toHaveProperty('error')
+      expect(db.update).toHaveBeenCalled()
+    })
+
+    it('refuses to publish a view whose stored columns are empty or not strings', async () => {
+      as('owner')
+      for (const columns of [[], ['title', 3], null]) {
+        stored({ columns })
+        expect(await updateView('bookmarks', 7, 'user-test', { published: true })).toEqual(expect.objectContaining({ status: 400, code: 'invalid_columns' }))
+      }
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('writes the checked columns whenever the check runs', async () => {
+      as('owner')
+      stored({ columns: ['title', 'due'] })
+      await updateView('bookmarks', 7, 'user-test', { published: true })
+      expect(updateSet()).toEqual(expect.objectContaining({ published: true, columns: ['title', 'due'] }))
+    })
+
+    it('refuses to clear or break the columns of a published view', async () => {
+      as('owner')
+      stored({ columns: ['title'], published: true })
+      expect(await updateView('bookmarks', 7, 'user-test', { columns: [] })).toEqual(expect.objectContaining({ status: 400, error: expect.stringMatching(/^Set columns before publishing/) }))
+      expect(await updateView('bookmarks', 7, 'user-test', { columns: ['title', 'nope'] })).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('cannot be published: nope.') }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('checks a published view whose config changes, even with the same columns', async () => {
+      as('owner')
+      stored({ columns: ['title', 'secret'], published: true })
+      expect(await updateView('bookmarks', 7, 'user-test', { config: { cardTitle: 'title' } })).toEqual(expect.objectContaining({ status: 400, code: 'invalid_columns' }))
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('lets a published kanban regroup only to a field among its columns', async () => {
+      as('owner')
+      stored({ type: 'kanban', columns: ['title', 'status', 'priority'], config: { groupByField: 'status' }, published: true })
+      expect(await updateView('bookmarks', 7, 'user-test', { groupBy: 'due' })).toEqual({
+        error: 'This kanban view groups by "due", so "due" must be one of its columns before it can be published.',
+        status: 400,
+      })
+      expect(db.update).not.toHaveBeenCalled()
+      await updateView('bookmarks', 7, 'user-test', { groupBy: 'priority' })
+      expect(updateSet()).toEqual(expect.objectContaining({ config: { groupByField: 'priority' }, columns: ['title', 'status', 'priority'] }))
+    })
+
+    it('lets a view be unpublished and regrouped in one call without a check', async () => {
+      as('owner')
+      stored({ type: 'kanban', columns: ['title'], config: { groupByField: 'status' }, published: true })
+      const result = await updateView('bookmarks', 7, 'user-test', { published: false, groupBy: 'nope' })
+      expect(result).not.toHaveProperty('error')
+      expect(updateSet()).toEqual({ published: false, config: { groupByField: 'nope' }, updatedAt: expect.any(Date) })
+    })
+
+    it('does not check an unpublished view that stays unpublished', async () => {
+      as('owner', null)
+      stored({ columns: ['title'] })
+      await updateView('bookmarks', 7, 'user-test', { columns: ['anything'] })
+      expect(updateSet()).toEqual({ columns: ['anything'], updatedAt: expect.any(Date) })
+    })
+  })
+
+  describe('updateViewConfig and renameView', () => {
+    it('refuse an editor on a published view, writing nothing', async () => {
+      as('editor')
+      stored({ type: 'kanban', columns: ['title', 'status'], config: { groupByField: 'status' }, published: true })
+      expect(await updateViewConfig('bookmarks', 7, 'user-test', { cardTitle: 'title' })).toEqual(OWNER_ONLY)
+      expect(await renameView('bookmarks', 7, 'user-test', 'New')).toEqual(OWNER_ONLY)
+      expect(db.update).not.toHaveBeenCalled()
+    })
+
+    it('let an editor change an unpublished view', async () => {
+      as('editor')
+      stored({ type: 'calendar', columns: ['title'] })
+      expect(await updateViewConfig('bookmarks', 7, 'user-test', { dateField: 'due' })).toEqual({ view: { id: 7 } })
+      expect(updateSet()).toEqual({ config: { dateField: 'due' }, updatedAt: expect.any(Date) })
+      expect(await renameView('bookmarks', 7, 'user-test', 'New')).toEqual({ view: { id: 7 } })
+    })
+
+    it('updateViewConfig requires a published view\'s new layout field to be one of its columns', async () => {
+      as('owner')
+      stored({ type: 'kanban', columns: ['title', 'status'], config: { groupByField: 'status' }, published: true })
+      expect(await updateViewConfig('bookmarks', 7, 'user-test', { groupField: 'priority' })).toEqual({
+        error: 'This kanban view groups by "priority", so "priority" must be one of its columns before it can be published.',
+        status: 400,
+      })
+      expect(db.update).not.toHaveBeenCalled()
+      await updateViewConfig('bookmarks', 7, 'user-test', { groupField: 'status' })
+      expect(updateSet()).toEqual(expect.objectContaining({ config: { groupByField: 'status', groupField: 'status' }, columns: ['title', 'status'] }))
+    })
   })
 })
 

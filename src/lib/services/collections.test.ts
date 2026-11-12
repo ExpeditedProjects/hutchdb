@@ -153,18 +153,24 @@ describe('createCollection', () => {
     expect(call.name).toBe('Bookmarks')
   })
 
-  it('passes through schema, unique_key, and published', async () => {
+  it('passes through schema and unique_key', async () => {
     vi.mocked(createCollectionWithOwner).mockResolvedValue(baseCollection)
     await createCollection('user-test', 'org-test', {
       name: 'Bookmarks',
       schema: { fields: [{ name: 'url', type: 'text' }] },
       unique_key: ['url'],
-      published: true,
     })
     const call = vi.mocked(createCollectionWithOwner).mock.calls[0][0]
     expect(call.schema).toEqual({ fields: [{ name: 'url', type: 'text' }] })
     expect(call.uniqueKey).toEqual(['url'])
-    expect(call.published).toBe(true)
+  })
+
+  it('never creates a published collection, even if a caller passes published', async () => {
+    vi.mocked(createCollectionWithOwner).mockResolvedValue(baseCollection)
+    await createCollection('user-test', 'org-test', { name: 'Bookmarks', published: true } as never)
+    const call = vi.mocked(createCollectionWithOwner).mock.calls[0][0]
+    expect(call).not.toHaveProperty('published')
+    expect(call).not.toHaveProperty('publishedAt')
   })
 
   it('does NOT call seedAutoViews when no schema is supplied', async () => {
@@ -216,25 +222,27 @@ describe('updateCollection', () => {
     expect(result).toEqual(expect.objectContaining({ status: 404 }))
   })
 
-  it('stamps publishedAt the first time published flips true', async () => {
+  it('writes and revalidates nothing when there is nothing to update', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'owner' })
-    updateReturning.mockResolvedValue([{ ...baseCollection, published: true }])
-    await updateCollection('bookmarks', 'user-test', { published: true })
-    // Inspect the last db.update().set(...) call
-    const setMock = (await import('@/lib/db')).db.update as unknown as ReturnType<typeof vi.fn>
-    const setArgs = setMock.mock.results[0].value.set.mock.calls[0][0]
-    expect(setArgs.published).toBe(true)
-    expect(setArgs.publishedAt).toBeInstanceOf(Date)
+    const { db } = await import('@/lib/db')
+    const { revalidateDashboard } = await import('@/lib/revalidation')
+    // published is not an update: collections are never published.
+    const result = await updateCollection('bookmarks', 'user-test', { published: true } as never)
+    expect(result).toEqual({ collection: baseCollection })
+    expect(db.update).not.toHaveBeenCalled()
+    expect(revalidateDashboard).not.toHaveBeenCalled()
   })
 
-  it('does not re-stamp publishedAt when already published', async () => {
-    const alreadyPublished = { ...baseCollection, publishedAt: new Date('2025-01-01') }
-    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: alreadyPublished, role: 'owner' })
-    updateReturning.mockResolvedValue([alreadyPublished])
-    await updateCollection('bookmarks', 'user-test', { published: true })
+  it('never writes published or publishedAt, even if a caller passes published', async () => {
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'owner' })
+    updateReturning.mockResolvedValue([baseCollection])
+    await updateCollection('bookmarks', 'user-test', { name: 'Links', published: true } as never)
+    // Inspect the db.update().set(...) call
     const setMock = (await import('@/lib/db')).db.update as unknown as ReturnType<typeof vi.fn>
     const setArgs = setMock.mock.results[0].value.set.mock.calls[0][0]
-    expect(setArgs.publishedAt).toBeUndefined()
+    expect(setArgs.name).toBe('Links')
+    expect(setArgs).not.toHaveProperty('published')
+    expect(setArgs).not.toHaveProperty('publishedAt')
   })
 })
 

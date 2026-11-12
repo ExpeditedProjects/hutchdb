@@ -36,7 +36,7 @@ Use hutch_collection_stats for a quick overview of a collection's size and field
 
 For deduplication: set unique_key via hutch_update_collection, then hutch_store_records honors on_conflict (default: replace).
 
-Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A view marked published appears as a tab on the collection's public page once the collection is published.
+Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A published view is a public read-only page on Hutch Cloud. It shows the collection's name and description, the view's name and description, the view's columns, and the records its filter matches. Only the collection's owner can publish a view. To publish, set columns to visible fields of the collection's saved schema, including the field the layout uses (kanban group, calendar or timeline date, gallery image). Collections cannot be published; publish a view instead.
 
 This is the headless single-user Core. Multi-user sharing, organizations, invitations, and published dashboards live in Hutch Cloud (app.hutchdb.com), not here.`;
 
@@ -69,7 +69,22 @@ const FILTER_DESCRIPTION =
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
 
 // Shared by hutch_create_view and hutch_update_view.
-const PUBLISHED_VIEW_DESCRIPTION = "Show this view as a tab on the collection's public page (only matters when the collection is published). Default false.";
+const PUBLISHED_VIEW_DESCRIPTION = "Publish this view as a public read-only page (on Hutch Cloud) showing the collection's and the view's names and descriptions, the view's columns, and the records its filter matches. Needs columns: visible fields of the collection's saved schema, including the field the layout uses. Only the collection's owner can publish. Default false.";
+
+/**
+ * Tool hints for view service errors. The service's messages name no tools
+ * (the Cloud dashboard shows them as they are), so the MCP tools add these.
+ */
+const VIEW_ERROR_HINTS: Record<string, string> = {
+  no_publishable_fields: "Save the schema with hutch_infer_schema, or unhide a field with hutch_update_schema.",
+  invalid_columns: "hutch_get_collection lists the saved schema fields and which are hidden.",
+  no_group_field: "Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'.",
+};
+
+function viewErrorResponse(result: { error: string; code?: string }): McpToolResponse {
+  const hint = result.code ? VIEW_ERROR_HINTS[result.code] : undefined;
+  return errorResponse(hint ? `${result.error} ${hint}` : result.error);
+}
 
 // Field paging shared by hutch_describe_collection and hutch_get_collection.
 const FIELDS_OFFSET_DESCRIPTION = `Skip this many fields (default 0): each call lists at most ${DESCRIBE_FIELDS_PAGE}; pass the response's fields_next_offset for the next page.`;
@@ -146,8 +161,11 @@ function trimRecordResults(result: object): object {
   };
 }
 
-/** The tenant id is the account's internal key, not collection data. */
-const INTERNAL_COLLECTION_KEYS = ["organizationId"] as const;
+/**
+ * Not collection data: the tenant id is the account's internal key, and
+ * published/publishedAt are unused columns (only views can be published).
+ */
+const INTERNAL_COLLECTION_KEYS = ["organizationId", "published", "publishedAt"] as const;
 
 function viewNotFound(slug: string, view: ViewRef): McpToolResponse {
   return errorResponse(
@@ -262,7 +280,6 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
           slug: c.slug,
           description: c.description,
           uniqueKey: c.uniqueKey,
-          published: c.published,
           recordCount: c.recordCount,
           lastRecordAt: c.lastRecordAt,
           updatedAt: c.updatedAt,
@@ -497,21 +514,22 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_collection",
     {
       title: "Update Collection",
-      description: "Update a collection's name, description, unique_key (for upsert dedup), or published flag. Only the fields you pass change; each replaces the current value. published: true makes the collection, and its views marked published, viewable by anyone as a read-only web page; published: false makes it private again. Example: use when the user wants to publish a collection or set a dedup key.",
+      description: "Update a collection's name, description, or unique_key (for upsert dedup). Only the fields you pass change; each replaces the current value. Example: use when the user wants to rename a collection or set a dedup key.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         name: z.string().optional().describe("New collection name"),
         description: z.string().optional().describe("Collection description"),
         unique_key: z.array(z.string()).optional().describe("Fields that form the unique key for upsert (e.g. [\"url\"] or [\"email\", \"date\"])"),
-        published: z.boolean().optional().describe("Whether the collection is publicly viewable"),
       }),
-      // Destructive: overwrites name/description/unique_key. Open world:
-      // `published: true` exposes the collection on the public web.
-      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: true },
+      // Destructive: overwrites name/description/unique_key. Not open world:
+      // nothing it sets is public (only views can be published).
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async (params) => {
-      const { slug, ...updates } = params;
-      const result = await collectionService.updateCollection(slug, userId, updates);
+    async ({ slug, name, description, unique_key }) => {
+      if (name === undefined && description === undefined && unique_key === undefined) {
+        return errorResponse("Nothing to update. Collections can't be published; to share data publicly, publish a view with hutch_update_view (published: true, columns: [...]).");
+      }
+      const result = await collectionService.updateCollection(slug, userId, { name, description, unique_key });
       if ('error' in result) return errorResponse(result.error!);
       return jsonResponse({ ...withoutInternalKeys(result.collection, INTERNAL_COLLECTION_KEYS), url: collectionUrl((result.collection as { slug?: string }).slug ?? slug) });
     }
@@ -668,12 +686,12 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_create_view",
     {
       title: "Create View",
-      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first select field if omitted. Each call creates a new view, so a retry adds another. With published: true on a published collection, the view is publicly viewable right away.",
+      description: "Create a saved view on a collection (table, kanban, calendar, gallery, etc). Example: use when the user says 'show this as a kanban grouped by status'. For kanban, group_by is auto-inferred to the first visible select field if omitted. Each call creates a new view, so a retry adds another. With published: true the view is a public read-only page right away, so pass columns too (visible fields of the collection's saved schema, including the group, date or image field the layout uses) or the call fails. Only the collection's owner can publish.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         type: z.enum(VIEW_TYPES).optional().default("table"),
         name: z.string().optional().describe("View name (defaults to the type label)"),
-        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban only: any other type returns an error. If omitted on kanban, the first select field is inferred."),
+        group_by: z.string().min(1).max(200).optional().describe("Field name to group by, e.g. \"status\". Kanban only: any other type returns an error. If omitted on kanban, the first visible select field is inferred."),
         config: z.record(z.string(), z.unknown()).optional().describe("View-type-specific settings (e.g. {\"dateField\": \"due_date\"} for calendar, {\"imageField\": \"cover\"} for gallery)"),
         filter: z.record(z.string(), z.unknown()).optional().describe("JSONB containment filter applied by the view (e.g. {\"status\": \"active\"})"),
         sort: z.string().optional().describe("Sort field, prefix with - for descending (e.g. \"-created_at\")"),
@@ -681,24 +699,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         published: z.boolean().optional().describe(PUBLISHED_VIEW_DESCRIPTION),
       }),
       // Not destructive: it only adds a view. Open world: `published: true`
-      // on an already-published collection shows the view publicly.
+      // shows the view publicly.
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
     },
     async (params) => {
-      let groupBy: string | undefined = params.group_by;
-      if (params.type === "kanban" && !groupBy) {
-        const coll = await collectionService.getCollection(params.slug, userId);
-        if (!coll) return collectionNotFound(params.slug);
-        const fields = (coll.schema as { fields?: { name: string; type?: string }[] } | null)?.fields ?? [];
-        const selectField = fields.find((f) => f.type === "select");
-        if (!selectField) {
-          return errorResponse(
-            "Cannot infer group_by: collection has no select-type field. Pass group_by explicitly, or first call hutch_update_schema to make a field of type 'select'."
-          );
-        }
-        groupBy = selectField.name;
-      }
-
       const result = await createView(params.slug, userId, {
         type: params.type,
         config: params.config as Record<string, unknown> | undefined,
@@ -706,11 +710,13 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
         sort: params.sort,
         columns: params.columns,
         ...(params.name !== undefined ? { name: params.name } : {}),
-        ...(groupBy !== undefined ? { groupBy } : {}),
+        ...(params.group_by !== undefined ? { groupBy: params.group_by } : {}),
+        // Kanban without group_by groups by the first visible select field.
+        inferGroupBy: true,
         published: params.published,
       });
       if (!result) return collectionNotFound(params.slug);
-      if ("error" in result) return errorResponse(result.error as string);
+      if ("error" in result) return viewErrorResponse(result);
       return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
     }
   );
@@ -726,7 +732,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_view",
     {
       title: "Update View",
-      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or mark it published so it shows as a tab on the collection's public page. Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants a view shown on the public page (published: true), or regrouped/renamed.",
+      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or publish it. A published view is a public read-only page showing the collection's and the view's names and descriptions, the view's columns, and the records its filter matches. Publishing needs columns that are visible fields of the collection's saved schema, including the field the layout uses; the same holds when a published view's columns or config change. Only the collection's owner can publish a view or change a published one; anyone who can edit it may unpublish it (published: false). Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants to share a view publicly (published: true with columns), or regroup or rename it.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         view: viewRefSchema,
@@ -746,7 +752,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const ref = viewRef(view);
       const result = await updateView(slug, ref, userId, { ...patch, groupBy: group_by });
       if (!result) return viewNotFound(slug, ref);
-      if ("error" in result) return errorResponse(result.error as string);
+      if ("error" in result) return viewErrorResponse(result);
       return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
     }
   );

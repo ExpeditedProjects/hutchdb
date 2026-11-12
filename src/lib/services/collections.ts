@@ -177,7 +177,6 @@ export async function listCollections(userId: string, organizationId?: string) {
       description: collections.description,
       schema: collections.schema,
       uniqueKey: collections.uniqueKey,
-      published: collections.published,
       createdAt: collections.createdAt,
       updatedAt: collections.updatedAt,
       role: collectionMembers.role,
@@ -204,9 +203,8 @@ export async function createCollection(userId: string, organizationId: string, p
   description?: string;
   schema?: unknown;
   unique_key?: unknown;
-  published?: boolean;
 }) {
-  const { name, description, schema: schemaVal, unique_key, published } = params;
+  const { name, description, schema: schemaVal, unique_key } = params;
 
   const slug = uniqueSlug(name);
 
@@ -218,7 +216,6 @@ export async function createCollection(userId: string, organizationId: string, p
     description: description || null,
     schema: schemaVal ?? { fields: [] },
     uniqueKey: unique_key ?? [],
-    published: published ?? false,
   });
 
   if (schemaVal && (schemaVal as CollectionSchema)?.fields?.length) {
@@ -257,28 +254,31 @@ export async function getCollection(slug: string, userId: string, page?: FieldPa
   };
 }
 
-export async function updateCollection(slug: string, userId: string, updates: Record<string, unknown>) {
+/**
+ * Collections are never published (only views are), so there is no
+ * `published` update. With nothing to change it writes nothing and returns
+ * the collection as it is.
+ */
+export async function updateCollection(slug: string, userId: string, updates: {
+  name?: string;
+  description?: string;
+  unique_key?: unknown;
+}) {
   const access = await findAccessibleCollection(slug, userId, "owner");
   if (!access) return { error: "Collection not found", status: 404 };
   // The argument may be the collection's name; continue with its slug.
   slug = access.collection.slug;
   const collection = access.collection;
 
-  const dbUpdates: Record<string, unknown> = { updatedAt: new Date() };
+  const dbUpdates: Record<string, unknown> = {};
   if (updates.name !== undefined) dbUpdates.name = updates.name;
   if (updates.description !== undefined) dbUpdates.description = updates.description;
-  if (updates.schema !== undefined) dbUpdates.schema = updates.schema;
   if (updates.unique_key !== undefined) dbUpdates.uniqueKey = updates.unique_key;
-  if (updates.published !== undefined) {
-    dbUpdates.published = updates.published;
-    if (updates.published && !collection.publishedAt) {
-      dbUpdates.publishedAt = new Date();
-    }
-  }
+  if (Object.keys(dbUpdates).length === 0) return { collection };
 
   const [updated] = await db
     .update(collections)
-    .set(dbUpdates)
+    .set({ ...dbUpdates, updatedAt: new Date() })
     .where(eq(collections.id, collection.id))
     .returning();
 

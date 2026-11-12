@@ -138,6 +138,8 @@ export const collections = pgTable("collections", {
   description: text("description"),
   schema: jsonb("schema").default({ fields: [] }),
   uniqueKey: jsonb("unique_key").default([]),
+  // Unused: collections are never published any more (only views are; see
+  // views.published). Kept until a later migration drops them.
   published: boolean("published").default(false),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   visibility: text("visibility").notNull().default("private"),
@@ -251,7 +253,10 @@ export const views = pgTable("views", {
   sort: text("sort"),
   columns: jsonb("columns").default([]),
   config: jsonb("config").default({}),
-  // Shown as a tab on the collection's public page (when the collection is published).
+  // A published view is a public read-only page (served by Hutch Cloud)
+  // showing only its columns and the records its filter matches. Views are
+  // the only thing that can be published; services/views.ts requires
+  // columns to be visible fields of the collection's saved schema.
   published: boolean("published").notNull().default(false),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),

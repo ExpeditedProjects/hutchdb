@@ -238,15 +238,6 @@ export async function findUserByEmail(email: string): Promise<{ id: string; name
   return row;
 }
 
-export async function findPublishedCollectionBySlug(slug: string) {
-  const [collection] = await db
-    .select()
-    .from(collections)
-    .where(and(eq(collections.slug, slug), eq(collections.published, true)))
-    .limit(1);
-  return collection;
-}
-
 export type QueryParams = {
   collectionId: number;
   filter?: Record<string, unknown>;
