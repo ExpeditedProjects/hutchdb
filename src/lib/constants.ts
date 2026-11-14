@@ -16,7 +16,7 @@ export const MAX_RECORD_SIZE = 1_000_000; // 1MB — enforced at the route and s
 
 export const FIELD_NAME_RE = /^[a-zA-Z0-9_]+$/;
 export const MAX_FIELD_NAME_LENGTH = 64;
-/** hutch_transform_records: most field names one call may list, and the longest new name. */
+/** hutch_transform_records: most fields one call may rename, remove and set, and the longest new name. */
 export const MAX_TRANSFORM_FIELDS = 100;
 export const MAX_TRANSFORM_FIELD_NAME_LENGTH = 255;
 

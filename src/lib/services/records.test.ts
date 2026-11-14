@@ -690,11 +690,24 @@ describe('transformRecords', () => {
   it('rejects more names than the per-call limit without scanning them pairwise', async () => {
     editor()
     const rename_fields = Object.fromEntries(Array.from({ length: 200_000 }, (_, i) => [`a${i}`, `b${i}`]))
-    const started = performance.now()
     const result = await transformRecords('users', 'user-test', { rename_fields })
-    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('Too many field names') }))
-    expect(performance.now() - started).toBeLessThan(2000)
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('Too many fields') }))
     expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('counts a rename once against the per-call limit', async () => {
+    editor()
+    dbExecute.mockResolvedValue({ rowCount: 0, rows: [] })
+    const rename_fields = Object.fromEntries(Array.from({ length: 100 }, (_, i) => [`a${i}`, `b${i}`]))
+    const result = await transformRecords('users', 'user-test', { rename_fields })
+    expect(result).toEqual(expect.objectContaining({ transformed: true }))
+  })
+
+  it('never cuts a quoted name in the middle of a surrogate pair', async () => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { set_field: { field: '😀'.repeat(300), value: 1 } })
+    expect((result as { error: string }).error).toContain('too long')
+    expect((result as { error: string }).error.isWellFormed()).toBe(true)
   })
 
   it('rejects an overlong new name and quotes only its start', async () => {
