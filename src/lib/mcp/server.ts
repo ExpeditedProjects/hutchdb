@@ -577,10 +577,10 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Changes are written to the stored records in place. Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
-        rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"}). Names are top-level fields taken literally (spaces allowed), not dotted paths; a new name cannot contain a dot"),
+        rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"}). Names are top-level fields taken literally (spaces allowed), not dotted paths; a new name cannot be a dotted path (\"a.b\") or start with $"),
         remove_fields: z.array(z.string()).optional().describe("Top-level fields to remove from all records, named literally (e.g. [\"legacy_id\", \"Old notes\"]); not dotted paths"),
         set_field: z.object({
-          field: z.string().describe("Top-level field to set, named literally (spaces allowed, no dots)"),
+          field: z.string().describe("Top-level field to set, named literally (spaces allowed); not a dotted path"),
           value: z.unknown().describe("New value"),
           filter: z.record(z.string(), z.unknown()).optional().describe("Only update records matching this filter, same syntax as hutch_query_records (e.g. {\"status\": \"active\"} or {\"score\": {\"$gt\": 10}})"),
         }).optional().describe("Set a field value, optionally on filtered records"),

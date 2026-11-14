@@ -631,7 +631,7 @@ describe('transformRecords', () => {
   it('rejects renaming a field to itself, which would delete it', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
     const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'note' } })
-    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('both an old and a new name') }))
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('more than once') }))
     expect(dbExecute).not.toHaveBeenCalled()
   })
 
@@ -657,17 +657,32 @@ describe('transformRecords', () => {
   ])('rejects a dotted new name in %s: it would be a top-level key no filter can reach', async (_label, params) => {
     editor()
     const result = await transformRecords('users', 'user-test', params)
-    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('top-level') }))
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('nested path') }))
     expect(dbExecute).not.toHaveBeenCalled()
   })
 
   it.each([
     ['a swap', { a: 'b', b: 'a' }],
     ['a chain', { a: 'b', b: 'c' }],
+    ['two fields renamed to one name', { first: 'name', last: 'name' }],
   ])('rejects %s in rename_fields, which would lose a value', async (_label, rename_fields) => {
     editor()
     const result = await transformRecords('users', 'user-test', { rename_fields })
-    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('both') }))
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('more than once') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('rejects a field that is both removed and renamed', async () => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { remove_fields: ['status'], rename_fields: { status: 'state' } })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('more than once') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('rejects a new name a filter would read as an operator', async () => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { set_field: { field: '$or', value: 1 } })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('operator') }))
     expect(dbExecute).not.toHaveBeenCalled()
   })
 

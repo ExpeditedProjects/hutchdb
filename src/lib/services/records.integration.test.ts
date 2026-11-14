@@ -314,6 +314,14 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(await rawData(slug)).toEqual([{ address: { city: "A" }, city_flat: "lit" }]);
     });
 
+    it("a new name with a dot that is not a path is set, and a filter finds it", async () => {
+      const slug = await seed("transform_dot_literal", [{ cost: 5 }, { cost: 9 }]);
+      ok(await recordsSvc.transformRecords(slug, USER_ID, { rename_fields: { cost: "Approx. cost" } }));
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { set_field: { field: "big", value: true, filter: { "Approx. cost": 9 } } }));
+      expect(result.updated).toBe(1);
+      expect(await rawData(slug)).toEqual([{ "Approx. cost": 5 }, { "Approx. cost": 9, big: true }]);
+    });
+
     it("a name that looks like SQL is only ever a key", async () => {
       const slug = await seed("transform_sql_name", [{ "x'; DROP TABLE collections;--": 1, keep: 2 }]);
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["x'; DROP TABLE collections;--"] }));

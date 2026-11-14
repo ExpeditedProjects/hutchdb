@@ -751,21 +751,32 @@ export async function transformRecords(slug: string, userId: string, params: {
       status: 400,
     };
   }
-  // A new name with a dot would be written as one top-level key that
-  // filters, which read dots as nested paths, could never match.
-  const dotted = [...renames.map(([, newName]) => newName), ...(set_field ? [set_field.field] : [])].find((f) => f.includes("."));
-  if (dotted !== undefined) {
+  const newNames = [...renames.map(([, newName]) => newName), ...(set_field ? [set_field.field] : [])];
+  // Filters read "a.b" as the nested path a -> b and a top-level "$..." key
+  // as an operator, so a field written under such a name could never be
+  // matched. "Approx. cost" is not a path (filters take it literally): fine.
+  const unreachable = newNames.find((f) => f.startsWith("$") || /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)+$/.test(f));
+  if (unreachable !== undefined) {
     return {
-      error: `Invalid new field name ${JSON.stringify(dotted)}: transforms write top-level fields, so a new name cannot contain a dot (nested paths are not supported here)`,
+      error: unreachable.startsWith("$")
+        ? `Invalid new field name ${JSON.stringify(unreachable)}: a new name cannot start with "$" (filters read it as an operator)`
+        : `Invalid new field name ${JSON.stringify(unreachable)}: transforms write top-level fields, and filters would read this name as a nested path (nested paths are not supported here)`,
       status: 400,
     };
   }
-  // Renames run one after another: a name that is both renamed from and
-  // renamed to (itself, a swap, a chain) would overwrite or delete a value.
-  const reused = renames.map(([, newName]) => newName).find((newName) => Object.hasOwn(rename_fields ?? {}, newName));
-  if (reused !== undefined) {
+  // The statements run one after another (removes, then each rename), so a
+  // name used twice would overwrite or delete a value: a field renamed to
+  // itself, a swap, a chain, two fields renamed to one name, or a field
+  // both removed and renamed.
+  const oldNames = new Set(renames.map(([oldName]) => oldName));
+  const targets = renames.map(([, newName]) => newName);
+  const clash =
+    targets.find((newName) => oldNames.has(newName)) ??
+    targets.find((newName, i) => targets.indexOf(newName) !== i) ??
+    (remove_fields ?? []).find((f) => oldNames.has(f));
+  if (clash !== undefined) {
     return {
-      error: `rename_fields uses ${JSON.stringify(reused)} as both an old and a new name: rename it in a separate call`,
+      error: `Field ${JSON.stringify(clash)} is used more than once across rename_fields and remove_fields (as an old name, a new name, or a removed field): the operations run in order and would overwrite or delete its values. Split them into separate calls`,
       status: 400,
     };
   }
