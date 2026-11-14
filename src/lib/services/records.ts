@@ -8,7 +8,7 @@ import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, Collect
 import { seedAutoViews } from "./views";
 import { findAccessibleCollection } from "./resolve";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
-import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
+import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
 import { isReady, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
@@ -735,15 +735,50 @@ export async function transformRecords(slug: string, userId: string, params: {
     };
   }
 
-  const fieldNames = [
+  // A field name here is a top-level key of the record, taken literally
+  // (spaces and punctuation included), never a dotted path.
+  const renames = Object.entries(rename_fields ?? {});
+  const fieldNames: unknown[] = [
     ...(remove_fields ?? []),
-    ...Object.entries(rename_fields ?? {}).flat(),
+    ...renames.flat(),
     ...(set_field ? [set_field.field] : []),
   ];
-  // Field names are validated by FIELD_NAME_RE (alphanumeric + underscore
-  // only) before any statement runs.
-  if (!fieldNames.every((f) => FIELD_NAME_RE.test(f))) {
-    return { error: "Invalid field name", status: 400 };
+  // \p{Cs}: a lone surrogate, which Postgres would store as a different name.
+  const badIndex = fieldNames.findIndex((f) => typeof f !== "string" || f.length === 0 || /\u0000|\p{Cs}/u.test(f));
+  if (badIndex !== -1) {
+    return {
+      error: `Invalid field name ${JSON.stringify(fieldNames[badIndex]) ?? "undefined"}: a field name must be a non-empty string of valid Unicode without null characters`,
+      status: 400,
+    };
+  }
+  const newNames = [...renames.map(([, newName]) => newName), ...(set_field ? [set_field.field] : [])];
+  // Filters read "a.b" as the nested path a -> b and a top-level "$..." key
+  // as an operator, so a field written under such a name could never be
+  // matched. "Approx. cost" is not a path (filters take it literally): fine.
+  const unreachable = newNames.find((f) => f.startsWith("$") || /^[a-zA-Z0-9_]+(\.[a-zA-Z0-9_]+)+$/.test(f));
+  if (unreachable !== undefined) {
+    return {
+      error: unreachable.startsWith("$")
+        ? `Invalid new field name ${JSON.stringify(unreachable)}: a new name cannot start with "$" (filters read it as an operator)`
+        : `Invalid new field name ${JSON.stringify(unreachable)}: transforms write top-level fields, and filters would read this name as a nested path (nested paths are not supported here)`,
+      status: 400,
+    };
+  }
+  // The statements run one after another (removes, then each rename), so a
+  // name used twice would overwrite or delete a value: a field renamed to
+  // itself, a swap, a chain, two fields renamed to one name, or a field
+  // both removed and renamed.
+  const oldNames = new Set(renames.map(([oldName]) => oldName));
+  const targets = renames.map(([, newName]) => newName);
+  const clash =
+    targets.find((newName) => oldNames.has(newName)) ??
+    targets.find((newName, i) => targets.indexOf(newName) !== i) ??
+    (remove_fields ?? []).find((f) => oldNames.has(f));
+  if (clash !== undefined) {
+    return {
+      error: `Field ${JSON.stringify(clash)} is used more than once across rename_fields and remove_fields (as an old name, a new name, or a removed field): the operations run in order and would overwrite or delete its values. Split them into separate calls`,
+      status: 400,
+    };
   }
   if (set_field) {
     const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");
