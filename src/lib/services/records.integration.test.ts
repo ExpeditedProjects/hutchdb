@@ -285,6 +285,35 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(data[3]).toEqual({ untouched: true });
     });
 
+    it("accepts field names with spaces and punctuation in every operation", async () => {
+      const slug = await seed("transform_odd_names", [
+        { "Submission type": "form", "a,b": 1, a: 2, b: 3, 'q"uote': 4, "{brace}": 5, "back\\slash": 6 },
+        { "Submission type": "email", a: 7 },
+      ]);
+
+      const result = ok(
+        await recordsSvc.transformRecords(slug, USER_ID, {
+          rename_fields: { "Submission type": "Größe, 'new' name" },
+          remove_fields: ["a,b", 'q"uote', "{brace}", "back\\slash"],
+          set_field: { field: "Deal Stage", value: "won", filter: { a: 7 } },
+        }),
+      );
+      expect(result.updated).toBe(2);
+
+      // "a,b" is one field: removing it leaves "a" and "b" alone.
+      expect(await rawData(slug)).toEqual([
+        { "Größe, 'new' name": "form", a: 2, b: 3 },
+        { "Größe, 'new' name": "email", a: 7, "Deal Stage": "won" },
+      ]);
+    });
+
+    it("a name that looks like SQL is only ever a key", async () => {
+      const slug = await seed("transform_sql_name", [{ "x'; DROP TABLE collections;--": 1, keep: 2 }]);
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["x'; DROP TABLE collections;--"] }));
+      expect(result.updated).toBe(1);
+      expect(await rawData(slug)).toEqual([{ keep: 2 }]);
+    });
+
     it("rejects a transform with no operations (regression: silent no-op success)", async () => {
       const slug = await seed("transform_empty", [{ a: 1 }]);
       const result = await recordsSvc.transformRecords(slug, USER_ID, {});

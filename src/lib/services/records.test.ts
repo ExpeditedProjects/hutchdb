@@ -612,22 +612,25 @@ describe('updateRecord', () => {
 })
 
 describe('transformRecords', () => {
-  it('rejects field names with invalid characters', async () => {
+  it('rejects an empty field name and names the problem', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    const result = await transformRecords('users', 'user-test', { remove_fields: ['name; DROP TABLE users--'] })
-    expect(result).toEqual(expect.objectContaining({ status: 400 }))
+    const result = await transformRecords('users', 'user-test', { remove_fields: ['ok', ''] })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('non-empty') }))
+    expect(dbExecute).not.toHaveBeenCalled()
   })
 
-  it('rejects rename targets with invalid characters', async () => {
+  it('rejects a rename target holding a null character', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    const result = await transformRecords('users', 'user-test', { rename_fields: { good: 'bad name' } })
+    const result = await transformRecords('users', 'user-test', { rename_fields: { good: 'bad\u0000name' } })
     expect(result).toEqual(expect.objectContaining({ status: 400 }))
+    expect(dbExecute).not.toHaveBeenCalled()
   })
 
-  it('rejects set_field with invalid field name', async () => {
+  it('rejects renaming a field to itself, which would delete it', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
-    const result = await transformRecords('users', 'user-test', { set_field: { field: 'bad-name', value: 1 } })
-    expect(result).toEqual(expect.objectContaining({ status: 400 }))
+    const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'note' } })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('to itself') }))
+    expect(dbExecute).not.toHaveBeenCalled()
   })
 
   it('rejects a call with no operations instead of silently succeeding', async () => {

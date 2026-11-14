@@ -316,9 +316,9 @@ export class TransformStepError extends Error {
 /**
  * hutch_transform_records' statements: remove fields, then each rename,
  * then set_field. They run in one transaction (a savepoint inside a passed
- * `tx`), so a failure leaves none of them applied. Field names must already
- * be validated (FIELD_NAME_RE: letters, digits, underscore), since they go
- * into a Postgres array literal. Projection columns are generated from data
+ * `tx`), so a failure leaves none of them applied. Field names are only ever
+ * bound parameters, so any JSON key works (spaces, commas, quotes, braces).
+ * Projection columns are generated from data
  * and the unwind triggers fire on data changes, so both stay in sync.
  */
 export async function transformRows(
@@ -329,7 +329,9 @@ export async function transformRows(
   const { remove_fields, set_field, setFilter } = ops;
   const renames = Object.entries(ops.rename_fields ?? {});
   const target = table(collectionId);
-  const textArray = (names: string[]) => sql`${`{${names.join(",")}}`}::text[]`;
+  // One JSON bind param turned into text[]: a hand-built `{a,b}` array
+  // literal splits a name on its commas and breaks on quotes and braces.
+  const textArray = (names: string[]) => sql`ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(names)}::jsonb))`;
 
   return ex.transaction(async (tx) => {
     const step = async (name: string, query: SQL) => {

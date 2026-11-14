@@ -8,7 +8,7 @@ import { inferSchema, mergeSchema, detectNewFields, inferSchemaFromData, Collect
 import { seedAutoViews } from "./views";
 import { findAccessibleCollection } from "./resolve";
 import { beforeCreateRecord, QuotaExceededError } from "@/lib/quota";
-import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE, FIELD_NAME_RE } from "@/lib/constants";
+import { RECORD_STATUSES, REINFER_COOLDOWN_MS, MAX_RECORD_SIZE } from "@/lib/constants";
 import { recordsToCsv, csvToRecords, type ExportRow } from "@/lib/csv";
 import { isPlainObject } from "@/lib/validation";
 import { isReady, readRegistry, type StorageRegistry } from "@/lib/storage/registry";
@@ -735,15 +735,24 @@ export async function transformRecords(slug: string, userId: string, params: {
     };
   }
 
+  // Any key a stored record can have is a valid field name here (spaces,
+  // punctuation, non-ASCII): the row helper only binds names as parameters.
   const fieldNames = [
     ...(remove_fields ?? []),
     ...Object.entries(rename_fields ?? {}).flat(),
     ...(set_field ? [set_field.field] : []),
   ];
-  // Field names are validated by FIELD_NAME_RE (alphanumeric + underscore
-  // only) before any statement runs.
-  if (!fieldNames.every((f) => FIELD_NAME_RE.test(f))) {
-    return { error: "Invalid field name", status: 400 };
+  const badName = fieldNames.find((f) => typeof f !== "string" || f.length === 0 || f.includes("\u0000"));
+  if (badName !== undefined) {
+    return {
+      error: `Invalid field name ${JSON.stringify(badName)}: a field name must be a non-empty string without null characters`,
+      status: 400,
+    };
+  }
+  // Renaming a field to itself would add it and then remove it.
+  const sameName = Object.entries(rename_fields ?? {}).find(([oldName, newName]) => oldName === newName);
+  if (sameName) {
+    return { error: `rename_fields maps ${JSON.stringify(sameName[0])} to itself: give it a different new name or leave it out`, status: 400 };
   }
   if (set_field) {
     const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");

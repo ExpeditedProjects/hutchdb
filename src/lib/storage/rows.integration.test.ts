@@ -185,6 +185,19 @@ describe.skipIf(!TEST_DB_URL)("row helpers with and without a transaction", () =
     expect(none).toEqual({ touched: [], before: [], after: [] });
   });
 
+  it("transformRows measure: names with commas and spaces are one field each", async () => {
+    await rows.insertRecords(COLLECTION_ID, [{ "a,b": 1, a: 2 }, { "Old name": 3 }, { a: 4 }]);
+    const result = await rows.transformRows(
+      COLLECTION_ID,
+      { rename_fields: { "Old name": "New, name" }, remove_fields: ["a,b"] },
+      { measure: true },
+    );
+    // The third record has "a" but not "a,b": it is neither locked nor touched.
+    expect(result.before?.map((r) => r.data)).toEqual([{ "a,b": 1, a: 2 }, { "Old name": 3 }]);
+    expect(result.touched).toHaveLength(2);
+    expect(await live()).toEqual([{ a: 2 }, { "New, name": 3 }, { a: 4 }]);
+  });
+
   it("transformRows: a failing statement leaves none applied, inside a caller's tx too", async () => {
     await rows.insertRecords(COLLECTION_ID, [{ k: "a", n: 1 }]);
     const bad = sql`(t.data->>'k')::int = 1`; // 'a' is not an integer
