@@ -284,6 +284,22 @@ describe('response fields', () => {
     vi.mocked(createView).mockResolvedValue({ view: { id: 2, collectionId: 3, name: 'T' }, slug: 'n' } as never)
     expect(parse(await registeredTools.get('hutch_create_view')!({ slug: 'n', type: 'table' }))).toEqual({ id: 2, name: 'T', url: 'https://example.test/c/n' })
   })
+
+  it('views leave out publishedBy (a user id) and keep publishedAt', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const view = { id: 2, collectionId: 3, name: 'T', published: true, publishedBy: 'user-1', publishedAt: 'p' }
+    const publicView = { id: 2, name: 'T', published: true, publishedAt: 'p', url: 'https://example.test/c/n' }
+
+    vi.mocked(createView).mockResolvedValue({ view, slug: 'n' } as never)
+    expect(parse(await registeredTools.get('hutch_create_view')!({ slug: 'n', type: 'table', published: true, columns: ['title'] }))).toEqual(publicView)
+
+    vi.mocked(updateView).mockResolvedValue({ view, slug: 'n' } as never)
+    expect(parse(await registeredTools.get('hutch_update_view')!({ slug: 'n', view: 2, published: true }))).toEqual(publicView)
+
+    vi.mocked(collectionService.getCollection).mockResolvedValue({ id: 3, name: 'N', slug: 'n' } as never)
+    vi.mocked(listViews).mockResolvedValue([view] as never)
+    expect(parse(await registeredTools.get('hutch_get_collection')!({ slug: 'n' })).views).toEqual([{ id: 2, name: 'T', published: true, publishedAt: 'p' }])
+  })
 })
 
 describe('tool surface snapshot', () => {

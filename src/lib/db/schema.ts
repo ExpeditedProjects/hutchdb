@@ -1,4 +1,5 @@
 import { pgTable, serial, text, boolean, timestamp, integer, jsonb, index, uniqueIndex, primaryKey } from "drizzle-orm/pg-core";
+import { sql } from "drizzle-orm";
 
 // ── Better Auth tables ───────────────────────────────────────────────────────
 
@@ -258,8 +259,14 @@ export const views = pgTable("views", {
   // the only thing that can be published; services/views.ts requires
   // columns to be visible fields of the collection's saved schema.
   published: boolean("published").notNull().default(false),
+  // Who published the view and when: set when it goes from unpublished to
+  // published, cleared when it is unpublished (services/views.ts).
+  publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
+  publishedAt: timestamp("published_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
   uniqueIndex("idx_views_collection_slug").on(table.collectionId, table.slug),
+  // Deleting a user sets their views' published_by to NULL; this keeps that off a full scan.
+  index("idx_views_published_by").on(table.publishedBy).where(sql`${table.publishedBy} IS NOT NULL`),
 ]);

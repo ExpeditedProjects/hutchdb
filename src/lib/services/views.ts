@@ -127,6 +127,15 @@ function firstVisibleSelectField(schema: unknown): string | undefined {
   return field?.name as string | undefined;
 }
 
+/**
+ * Who published a view and when, written as it goes from unpublished to
+ * published (or is published again with no publisher on record); kept while
+ * it stays published, cleared on unpublish.
+ */
+function publishStamp(userId: string): Pick<ViewChange, "publishedBy" | "publishedAt"> {
+  return { publishedBy: userId, publishedAt: new Date() };
+}
+
 export async function createView(collectionSlug: string, userId: string, params: {
   type?: string;
   name?: string;
@@ -187,6 +196,7 @@ export async function createView(collectionSlug: string, userId: string, params:
     columns,
     config,
     published: params.published ?? false,
+    ...(params.published ? publishStamp(userId) : {}),
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
@@ -385,6 +395,13 @@ export async function updateView(
     if (patch.sort !== undefined) set.sort = patch.sort;
     if (patch.filter !== undefined) set.filter = patch.filter;
     if (patch.published !== undefined) set.published = patch.published;
+    // A view published with no publisher on record (a team view from before
+    // 0025, or its publisher's account deleted) gets one when published again.
+    if (patch.published === true && (!view.published || view.publishedBy === null)) Object.assign(set, publishStamp(userId));
+    if (patch.published === false) {
+      set.publishedBy = null;
+      set.publishedAt = null;
+    }
     if (Object.keys(config).length > 0 || groupBy !== undefined) {
       const merged: Record<string, unknown> = { ...((view.config as Record<string, unknown>) ?? {}), ...config };
       if (groupBy !== undefined) {
@@ -428,7 +445,7 @@ export async function listViews(collectionSlug: string, userId: string) {
   return db
     .select({
       id: views.id, name: views.name, slug: views.slug, type: views.type, published: views.published,
-      columns: views.columns, sort: views.sort, filter: views.filter, config: views.config,
+      publishedAt: views.publishedAt, columns: views.columns, sort: views.sort, filter: views.filter, config: views.config,
     })
     .from(views)
     .where(eq(views.collectionId, access.collection.id))
