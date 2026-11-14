@@ -735,6 +735,17 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       expect(await publisherOf(view.id)).toEqual({ publishedBy: OWNER_ID, publishedAt: at });
     });
 
+    it("is recorded when a published view with no publisher on record is published again", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      await testDb.update(schema.views).set({ publishedBy: null, publishedAt: new Date("2026-01-02T03:04:05Z") }).where(eq(schema.views.id, view.id));
+      const before = Date.now();
+      expect(await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true })).not.toHaveProperty("error");
+      const { publishedBy, publishedAt } = await publisherOf(view.id);
+      expect(publishedBy).toBe(OWNER_ID);
+      expect(publishedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+    });
+
     it("becomes NULL when the publisher's account is deleted", async () => {
       const { slug } = await makeCollection("Tasks");
       const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
@@ -836,6 +847,8 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       ]).onConflictDoNothing();
       onTestFinished(async () => {
         await testDb.delete(schema.organizationMembers).where(sql`${schema.organizationMembers.userId} IN ('views-early', 'views-late')`);
+        await testDb.delete(schema.collections).where(eq(schema.collections.organizationId, TEAM_ORG_ID));
+        await testDb.delete(schema.organizations).where(eq(schema.organizations.id, TEAM_ORG_ID));
       });
       await testDb.insert(schema.organizations).values({ id: TEAM_ORG_ID, slug: "views-team", name: "Team" }).onConflictDoNothing();
       await testDb.insert(schema.organizationMembers).values({ organizationId: TEAM_ORG_ID, userId: OWNER_ID, role: "admin" }).onConflictDoNothing();

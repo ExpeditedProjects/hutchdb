@@ -6,7 +6,7 @@ ALTER TABLE "views" ADD CONSTRAINT "views_published_by_user_id_fk" FOREIGN KEY (
 CREATE INDEX "idx_views_published_by" ON "views" USING btree ("published_by") WHERE "views"."published_by" IS NOT NULL;--> statement-breakpoint
 -- Backfill views published now: published when last changed, by the owner
 -- of a personal org (team orgs stay NULL; no record says which admin did it).
-UPDATE "views" SET "published_at" = "updated_at" WHERE "published";--> statement-breakpoint
+UPDATE "views" SET "published_at" = COALESCE("updated_at", now()) WHERE "published";--> statement-breakpoint
 -- Cloud shares this file but marks a personal org with
 -- organizations.personal_for_user_id; Core has a `personal` flag and the
 -- owner as the org's admin member. PL/pgSQL plans a statement only when it

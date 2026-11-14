@@ -129,7 +129,8 @@ function firstVisibleSelectField(schema: unknown): string | undefined {
 
 /**
  * Who published a view and when, written as it goes from unpublished to
- * published; kept while it stays published, cleared on unpublish.
+ * published (or is published again with no publisher on record); kept while
+ * it stays published, cleared on unpublish.
  */
 function publishStamp(userId: string): Pick<ViewChange, "publishedBy" | "publishedAt"> {
   return { publishedBy: userId, publishedAt: new Date() };
@@ -394,7 +395,9 @@ export async function updateView(
     if (patch.sort !== undefined) set.sort = patch.sort;
     if (patch.filter !== undefined) set.filter = patch.filter;
     if (patch.published !== undefined) set.published = patch.published;
-    if (patch.published === true && !view.published) Object.assign(set, publishStamp(userId));
+    // A view published with no publisher on record (a team view from before
+    // 0025, or its publisher's account deleted) gets one when published again.
+    if (patch.published === true && (!view.published || view.publishedBy === null)) Object.assign(set, publishStamp(userId));
     if (patch.published === false) {
       set.publishedBy = null;
       set.publishedAt = null;
