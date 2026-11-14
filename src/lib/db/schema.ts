@@ -260,7 +260,9 @@ export const views = pgTable("views", {
   // columns to be visible fields of the collection's saved schema.
   published: boolean("published").notNull().default(false),
   // Who published the view and when: set when it goes from unpublished to
-  // published, cleared when it is unpublished (services/views.ts).
+  // published (or is published again with none on record), cleared when it
+  // is unpublished (services/views.ts). Hutch Cloud shows the publisher's
+  // name on the public page.
   publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
   publishedAt: timestamp("published_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
