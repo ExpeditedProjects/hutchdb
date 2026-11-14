@@ -743,16 +743,19 @@ export async function transformRecords(slug: string, userId: string, params: {
     ...renames.flat(),
     ...(set_field ? [set_field.field] : []),
   ];
-  if (fieldNames.length > MAX_TRANSFORM_FIELDS) {
+  // One rename counts once, so a 60-column rename is 60, not 120.
+  const fieldCount = (remove_fields?.length ?? 0) + renames.length + (set_field ? 1 : 0);
+  if (fieldCount > MAX_TRANSFORM_FIELDS) {
     return {
-      error: `Too many field names in one transform (${fieldNames.length}; the limit is ${MAX_TRANSFORM_FIELDS} across rename_fields, remove_fields and set_field): split it into several calls`,
+      error: `Too many fields in one transform (${fieldCount}: renames plus removals plus set_field; the limit is ${MAX_TRANSFORM_FIELDS}): split it into several calls`,
       status: 400,
     };
   }
   // Error messages quote at most the start of a name.
   const quote = (name: unknown) => {
     const text = JSON.stringify(name) ?? "undefined";
-    return text.length > 80 ? `${text.slice(0, 80)}… (${text.length} characters)` : text;
+    // Never end the cut on half of a surrogate pair.
+    return text.length > 80 ? `${text.slice(0, 80).replace(/[\uD800-\uDBFF]$/, "")}… (${text.length} characters)` : text;
   };
   // \p{Cs}: a lone surrogate, which Postgres would store as a different name.
   const badIndex = fieldNames.findIndex((f) => typeof f !== "string" || f.length === 0 || /\u0000|\p{Cs}/u.test(f));

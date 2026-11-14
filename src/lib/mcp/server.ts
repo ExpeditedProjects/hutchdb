@@ -574,7 +574,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_transform_records",
     {
       title: "Transform Records",
-      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Changes are written to the stored records in place. Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'. One call takes at most 100 field names.",
+      description: "Bulk rename or remove fields across all records in a collection, or set a field on all records or only on those matching set_field.filter (the same filter syntax as hutch_query_records: operators, dotted paths, array elements). Changes are written to the stored records in place. Example: use when the user says 'rename status to state across all tasks', 'clear the legacy field' or 'mark every answer with score over 10 as featured'. One call renames, removes and sets at most 100 fields in total.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         rename_fields: z.record(z.string(), z.string()).optional().describe("Rename fields: {old_name: new_name} (e.g. {\"status\": \"state\"}). Names are top-level fields taken literally (spaces allowed), not dotted paths; a new name cannot be a dotted path (\"a.b\") or start with $"),
