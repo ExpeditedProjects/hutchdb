@@ -129,6 +129,32 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     for (const r of imported.results as { record: unknown }[]) expectNoInternalKeys(r.record);
   });
 
+  it("published views leave out publishedBy (the publisher's user id) and keep publishedAt", async () => {
+    const stored = json(await call("hutch_store_records", { collection: "Output Published", records: [{ title: "a" }] }));
+    const slug = (stored.collection as { slug: string }).slug;
+    await testPool.query(
+      `UPDATE collections SET schema = $1 WHERE slug = $2`,
+      [JSON.stringify({ fields: [{ name: "title", type: "text", inferred: true, position: 0, hidden: false }], version: 1 }), slug],
+    );
+
+    const created = json(await call("hutch_create_view", { slug, type: "table", name: "Public", published: true, columns: ["title"] }));
+    expect(created.published).toBe(true);
+    expect(created).not.toHaveProperty("publishedBy");
+    expect(typeof created.publishedAt).toBe("string");
+
+    const draft = json(await call("hutch_create_view", { slug, type: "table", name: "Draft", columns: ["title"] }));
+    const published = json(await call("hutch_update_view", { slug, view: draft.id, published: true }));
+    expect(published).not.toHaveProperty("publishedBy");
+    expect(typeof published.publishedAt).toBe("string");
+
+    // The column is set underneath: the output drops it, not the write.
+    const { rows } = await testPool.query(`SELECT published_by FROM views WHERE id = ANY($1)`, [[created.id, draft.id]]);
+    expect(rows.map((r) => r.published_by)).toEqual([USER_ID, USER_ID]);
+
+    const coll = json(await call("hutch_get_collection", { slug }));
+    for (const v of coll.views as Record<string, unknown>[]) expect(v).not.toHaveProperty("publishedBy");
+  });
+
   it("hutch_update_collection never publishes the collection, and collections carry no published flag", async () => {
     const stored = json(await call("hutch_store_records", { collection: "Output Private", data: { title: "x" } }));
     const slug = (stored.collection as { slug: string }).slug;

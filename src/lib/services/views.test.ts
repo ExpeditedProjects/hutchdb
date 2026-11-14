@@ -454,7 +454,7 @@ describe('publishing a view', () => {
       stored({ type: 'kanban', columns: ['title'], config: { groupByField: 'status' }, published: true })
       const result = await updateView('bookmarks', 7, 'user-test', { published: false, groupBy: 'nope' })
       expect(result).not.toHaveProperty('error')
-      expect(updateSet()).toEqual({ published: false, config: { groupByField: 'nope' }, updatedAt: expect.any(Date) })
+      expect(updateSet()).toEqual({ published: false, publishedBy: null, publishedAt: null, config: { groupByField: 'nope' }, updatedAt: expect.any(Date) })
     })
 
     it('does not check an unpublished view that stays unpublished', async () => {

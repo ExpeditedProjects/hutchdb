@@ -187,6 +187,7 @@ export async function createView(collectionSlug: string, userId: string, params:
     columns,
     config,
     published: params.published ?? false,
+    ...(params.published ? { publishedBy: userId, publishedAt: new Date() } : {}),
   }).returning();
 
   revalidateDashboard(collectionSlug, "views");
@@ -385,6 +386,10 @@ export async function updateView(
     if (patch.sort !== undefined) set.sort = patch.sort;
     if (patch.filter !== undefined) set.filter = patch.filter;
     if (patch.published !== undefined) set.published = patch.published;
+    // Who published and when: set on the change to published, kept while it
+    // stays published (re-publishing included), cleared when unpublished.
+    if (patch.published === true && !view.published) Object.assign(set, { publishedBy: userId, publishedAt: new Date() });
+    if (patch.published === false) Object.assign(set, { publishedBy: null, publishedAt: null });
     if (Object.keys(config).length > 0 || groupBy !== undefined) {
       const merged: Record<string, unknown> = { ...((view.config as Record<string, unknown>) ?? {}), ...config };
       if (groupBy !== undefined) {

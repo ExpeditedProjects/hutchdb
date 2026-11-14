@@ -138,6 +138,12 @@ function withoutInternalKeys<T>(value: T, keys: readonly string[] = INTERNAL_REC
   return copy as T;
 }
 
+/**
+ * A view row as tool output: the record bookkeeping, plus publishedBy (the
+ * publisher's internal user id; publishedAt stays).
+ */
+const INTERNAL_VIEW_KEYS = [...INTERNAL_RECORD_KEYS, "publishedBy"] as const;
+
 /** Records in a query result (`records`), a write result (`results[].record`) or a search group. */
 function trimRecordList(list: unknown): unknown {
   return Array.isArray(list) ? list.map((r) => withoutInternalKeys(r)) : list;
@@ -308,7 +314,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       if (!result) return collectionNotFound(slug);
       return jsonResponse({
         ...withoutInternalKeys(result, INTERNAL_COLLECTION_KEYS),
-        views: (collectionViews ?? []).map((v) => withoutInternalKeys(v)),
+        views: (collectionViews ?? []).map((v) => withoutInternalKeys(v, INTERNAL_VIEW_KEYS)),
       });
     }
   );
@@ -717,7 +723,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       });
       if (!result) return collectionNotFound(params.slug);
       if ("error" in result) return viewErrorResponse(result);
-      return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.view, INTERNAL_VIEW_KEYS), url: collectionUrl(result.slug) });
     }
   );
 
@@ -753,7 +759,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
       const result = await updateView(slug, ref, userId, { ...patch, groupBy: group_by });
       if (!result) return viewNotFound(slug, ref);
       if ("error" in result) return viewErrorResponse(result);
-      return jsonResponse({ ...withoutInternalKeys(result.view), url: collectionUrl(result.slug) });
+      return jsonResponse({ ...withoutInternalKeys(result.view, INTERNAL_VIEW_KEYS), url: collectionUrl(result.slug) });
     }
   );
 

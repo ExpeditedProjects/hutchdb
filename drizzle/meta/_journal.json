@@ -176,6 +176,13 @@
       "when": 1794441600000,
       "tag": "0024_unpublish_views",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1794614400000,
+      "tag": "0025_view_publisher",
+      "breakpoints": true
     }
   ]
 }

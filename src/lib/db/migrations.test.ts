@@ -46,3 +46,12 @@ describe('migration 0024_unpublish_views', () => {
     expect(statements('0024_unpublish_views')).toEqual(['UPDATE "views" SET "published" = false WHERE "published";'])
   })
 })
+
+describe('migration 0025_view_publisher', () => {
+  it('follows 0024 in the journal, dated the day it was written', () => {
+    const at = core.findIndex((e) => e.tag === '0025_view_publisher')
+    expect(at).toBeGreaterThan(0)
+    expect(core[at - 1].tag).toBe('0024_unpublish_views')
+    expect(core[at]).toEqual({ idx: 25, version: '7', when: Date.UTC(2026, 10, 14), tag: '0025_view_publisher', breakpoints: true })
+  })
+})

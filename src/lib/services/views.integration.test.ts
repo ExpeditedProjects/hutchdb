@@ -655,6 +655,82 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     });
   });
 
+  describe("who published the view, and when", () => {
+    async function publisherOf(id: number) {
+      const row = await rawView(id);
+      return { publishedBy: row.publishedBy, publishedAt: row.publishedAt };
+    }
+
+    it("is recorded when a view is created published, and not when created private", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const before = Date.now();
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      const { publishedBy, publishedAt } = await publisherOf(view.id);
+      expect(publishedBy).toBe(OWNER_ID);
+      expect(publishedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+      expect(await publisherOf((await makeView(slug, { type: "table" })).id)).toEqual({ publishedBy: null, publishedAt: null });
+    });
+
+    it("is recorded when a private view is published later", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", columns: ["title"] });
+      expect(await publisherOf(view.id)).toEqual({ publishedBy: null, publishedAt: null });
+      const result = await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true });
+      expect(result).toEqual(expect.objectContaining({ view: expect.objectContaining({ publishedBy: OWNER_ID }) }));
+      const { publishedBy, publishedAt } = await publisherOf(view.id);
+      expect(publishedBy).toBe(OWNER_ID);
+      expect(publishedAt).toBeInstanceOf(Date);
+    });
+
+    it("is cleared when the view is unpublished", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: false });
+      expect(await publisherOf(view.id)).toEqual({ publishedBy: null, publishedAt: null });
+    });
+
+    it("is cleared when an editor unpublishes the owner's view", async () => {
+      const made = await makeCollection("Tasks");
+      await grantViewer(made.id, "editor");
+      const view = await makeView(made.slug, { type: "table", published: true, columns: ["title"] });
+      expect(await viewsSvc.updateView(made.slug, view.id, VIEWER_ID, { published: false })).not.toHaveProperty("error");
+      expect(await publisherOf(view.id)).toEqual({ publishedBy: null, publishedAt: null });
+    });
+
+    it("is kept when a published view's name, columns, config, sort or filter change, through each entry point", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "kanban", groupBy: "status", published: true, columns: ["title", "status"] });
+      const at = new Date("2026-01-02T03:04:05Z");
+      await testDb.update(schema.views).set({ publishedAt: at }).where(eq(schema.views.id, view.id));
+      for (const result of [
+        await viewsSvc.updateView(slug, view.id, OWNER_ID, { name: "Board", columns: ["title", "status", "priority"], sort: "-due", filter: { status: "open" } }),
+        await viewsSvc.updateView(slug, view.id, OWNER_ID, { groupBy: "priority" }),
+        await viewsSvc.updateViewConfig(slug, view.id, OWNER_ID, { cardTitle: "title" }),
+        await viewsSvc.renameView(slug, view.id, OWNER_ID, "Renamed"),
+      ]) expect(result).not.toHaveProperty("error");
+      expect(await rawView(view.id)).toEqual(expect.objectContaining({ name: "Renamed", published: true, publishedBy: OWNER_ID, publishedAt: at }));
+    });
+
+    it("is kept when an already published view is published again", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      const at = new Date("2026-01-02T03:04:05Z");
+      await testDb.update(schema.views).set({ publishedAt: at }).where(eq(schema.views.id, view.id));
+      expect(await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true, name: "Again" })).not.toHaveProperty("error");
+      expect(await publisherOf(view.id)).toEqual({ publishedBy: OWNER_ID, publishedAt: at });
+    });
+
+    it("becomes NULL when the publisher's account is deleted", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      await testDb.insert(schema.user).values({ id: "views-gone", email: "views-gone@hutch.test", name: "Gone" }).onConflictDoNothing();
+      await testDb.update(schema.views).set({ publishedBy: "views-gone" }).where(eq(schema.views.id, view.id));
+      await testDb.delete(schema.user).where(eq(schema.user.id, "views-gone"));
+      expect((await rawView(view.id)).publishedBy).toBeNull();
+      expect((await rawView(view.id)).published).toBe(true);
+    });
+  });
+
   describe("row lock", () => {
     // A publish that commits while a column change is in flight: the change
     // must see the published row, not the one it would have read before.
@@ -719,6 +795,42 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       }));
       expect((await rawView(two.id)).columns).toEqual(["due"]);
       expect((await rawView(draft.id)).published).toBe(false);
+    });
+  });
+
+  describe("migration 0025 backfill", () => {
+    const TEAM_ORG_ID = "views-team-org";
+
+    /** The migration's statements after its ALTERs: the UPDATE and the DO block. */
+    function backfillStatements(): string[] {
+      const file = readFileSync(`${MIGRATIONS}/0025_view_publisher.sql`, "utf8");
+      const stmts = file.split("--> statement-breakpoint").map((s) => s.replace(/^--.*$/gm, "").trim()).filter((s) => /^(UPDATE|DO)\b/i.test(s));
+      expect(stmts).toHaveLength(2);
+      return stmts;
+    }
+
+    it("credits published views of a personal org to its owner at their last change, and leaves team orgs and private views NULL", async () => {
+      await testDb.insert(schema.organizations).values({ id: TEAM_ORG_ID, slug: "views-team", name: "Team" }).onConflictDoNothing();
+      await testDb.insert(schema.organizationMembers).values({ organizationId: TEAM_ORG_ID, userId: OWNER_ID, role: "admin" }).onConflictDoNothing();
+      const mine = await makeCollection("Mine");
+      const team = await makeCollection("Team");
+      await testDb.update(schema.collections).set({ organizationId: TEAM_ORG_ID }).where(eq(schema.collections.id, team.id));
+      const views = {
+        mine: await makeView(mine.slug, { type: "table", columns: ["title"] }),
+        team: await makeView(team.slug, { type: "table", columns: ["title"] }),
+        draft: await makeView(mine.slug, { type: "table" }),
+      };
+      // As they were before the migration: published, with no publisher yet.
+      await testDb.update(schema.views).set({ published: true }).where(sql`${schema.views.id} IN (${views.mine.id}, ${views.team.id})`);
+      await ageView(views.mine.id);
+      await ageView(views.team.id);
+
+      for (const stmt of backfillStatements()) await testDb.execute(sql.raw(stmt));
+
+      const aged = new Date("2020-01-01T00:00:00Z");
+      expect(await rawView(views.mine.id)).toEqual(expect.objectContaining({ publishedBy: OWNER_ID, publishedAt: aged, updatedAt: aged }));
+      expect(await rawView(views.team.id)).toEqual(expect.objectContaining({ publishedBy: null, publishedAt: aged }));
+      expect(await rawView(views.draft.id)).toEqual(expect.objectContaining({ publishedBy: null, publishedAt: null }));
     });
   });
 });

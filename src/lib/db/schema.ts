@@ -258,6 +258,10 @@ export const views = pgTable("views", {
   // the only thing that can be published; services/views.ts requires
   // columns to be visible fields of the collection's saved schema.
   published: boolean("published").notNull().default(false),
+  // Who published the view and when: set when it goes from unpublished to
+  // published, cleared when it is unpublished (services/views.ts).
+  publishedBy: text("published_by").references(() => user.id, { onDelete: "set null" }),
+  publishedAt: timestamp("published_at", { withTimezone: true }),
   createdAt: timestamp("created_at", { withTimezone: true }).defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).defaultNow(),
 }, (table) => [
