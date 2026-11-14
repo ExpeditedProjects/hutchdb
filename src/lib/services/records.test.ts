@@ -58,7 +58,9 @@ vi.mock('@/lib/storage/apply', () => ({
   updateRegistry: vi.fn().mockResolvedValue({}),
 }))
 
-vi.mock('@/lib/storage/ddl', () => ({
+vi.mock('@/lib/storage/ddl', async (importOriginal) => ({
+  // The real quoting: transformRows binds field names through it.
+  toTextArrayLiteral: (await importOriginal<typeof import('@/lib/storage/ddl')>()).toTextArrayLiteral,
   collectionTableExists: vi.fn().mockResolvedValue(true),
   createCollectionTable: vi.fn().mockResolvedValue(undefined),
   setUniqueKey: vi.fn().mockResolvedValue(undefined),
@@ -629,7 +631,43 @@ describe('transformRecords', () => {
   it('rejects renaming a field to itself, which would delete it', async () => {
     vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
     const result = await transformRecords('users', 'user-test', { rename_fields: { note: 'note' } })
-    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('to itself') }))
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('both an old and a new name') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  const editor = () =>
+    vi.mocked(findAccessibleCollectionBySlug).mockResolvedValue({ organization: mockOrg, collection: baseCollection, role: 'editor' })
+
+  it.each([
+    ['set_field with an empty name', { set_field: { field: '', value: 1 } }],
+    ['a rename from an empty name', { rename_fields: { '': 'x' } }],
+    ['a missing remove_fields element', { remove_fields: [undefined] }],
+    ['a non-string rename target', { rename_fields: { a: 1 } }],
+    ['a lone surrogate, which Postgres would store as another name', { rename_fields: { '\ud800': '\ud801' } }],
+  ])('rejects %s before any statement runs', async (_label, params) => {
+    editor()
+    const result = await transformRecords('users', 'user-test', params as never)
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('Invalid field name') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['set_field', { set_field: { field: 'address.city', value: 'X' } }],
+    ['a rename target', { rename_fields: { city: 'address.city' } }],
+  ])('rejects a dotted new name in %s: it would be a top-level key no filter can reach', async (_label, params) => {
+    editor()
+    const result = await transformRecords('users', 'user-test', params)
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('top-level') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ['a swap', { a: 'b', b: 'a' }],
+    ['a chain', { a: 'b', b: 'c' }],
+  ])('rejects %s in rename_fields, which would lose a value', async (_label, rename_fields) => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { rename_fields })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('both') }))
     expect(dbExecute).not.toHaveBeenCalled()
   })
 

@@ -329,9 +329,9 @@ export async function transformRows(
   const { remove_fields, set_field, setFilter } = ops;
   const renames = Object.entries(ops.rename_fields ?? {});
   const target = table(collectionId);
-  // One JSON bind param turned into text[]: a hand-built `{a,b}` array
-  // literal splits a name on its commas and breaks on quotes and braces.
-  const textArray = (names: string[]) => sql`ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(names)}::jsonb))`;
+  // toTextArrayLiteral quotes each name: an unquoted `{a,b}` splits a name
+  // on its commas and breaks on quotes and braces.
+  const textArray = (names: string[]) => sql`${toTextArrayLiteral(names)}::text[]`;
 
   return ex.transaction(async (tx) => {
     const step = async (name: string, query: SQL) => {

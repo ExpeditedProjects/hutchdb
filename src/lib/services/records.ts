@@ -735,24 +735,39 @@ export async function transformRecords(slug: string, userId: string, params: {
     };
   }
 
-  // Any key a stored record can have is a valid field name here (spaces,
-  // punctuation, non-ASCII): the row helper only binds names as parameters.
-  const fieldNames = [
+  // A field name here is a top-level key of the record, taken literally
+  // (spaces and punctuation included), never a dotted path.
+  const renames = Object.entries(rename_fields ?? {});
+  const fieldNames: unknown[] = [
     ...(remove_fields ?? []),
-    ...Object.entries(rename_fields ?? {}).flat(),
+    ...renames.flat(),
     ...(set_field ? [set_field.field] : []),
   ];
-  const badName = fieldNames.find((f) => typeof f !== "string" || f.length === 0 || f.includes("\u0000"));
-  if (badName !== undefined) {
+  // \p{Cs}: a lone surrogate, which Postgres would store as a different name.
+  const badIndex = fieldNames.findIndex((f) => typeof f !== "string" || f.length === 0 || /\u0000|\p{Cs}/u.test(f));
+  if (badIndex !== -1) {
     return {
-      error: `Invalid field name ${JSON.stringify(badName)}: a field name must be a non-empty string without null characters`,
+      error: `Invalid field name ${JSON.stringify(fieldNames[badIndex]) ?? "undefined"}: a field name must be a non-empty string of valid Unicode without null characters`,
       status: 400,
     };
   }
-  // Renaming a field to itself would add it and then remove it.
-  const sameName = Object.entries(rename_fields ?? {}).find(([oldName, newName]) => oldName === newName);
-  if (sameName) {
-    return { error: `rename_fields maps ${JSON.stringify(sameName[0])} to itself: give it a different new name or leave it out`, status: 400 };
+  // A new name with a dot would be written as one top-level key that
+  // filters, which read dots as nested paths, could never match.
+  const dotted = [...renames.map(([, newName]) => newName), ...(set_field ? [set_field.field] : [])].find((f) => f.includes("."));
+  if (dotted !== undefined) {
+    return {
+      error: `Invalid new field name ${JSON.stringify(dotted)}: transforms write top-level fields, so a new name cannot contain a dot (nested paths are not supported here)`,
+      status: 400,
+    };
+  }
+  // Renames run one after another: a name that is both renamed from and
+  // renamed to (itself, a swap, a chain) would overwrite or delete a value.
+  const reused = renames.map(([, newName]) => newName).find((newName) => Object.hasOwn(rename_fields ?? {}, newName));
+  if (reused !== undefined) {
+    return {
+      error: `rename_fields uses ${JSON.stringify(reused)} as both an old and a new name: rename it in a separate call`,
+      status: 400,
+    };
   }
   if (set_field) {
     const truncated = rejectTruncatedValues([{ [set_field.field]: set_field.value }], () => " (set_field.value)");

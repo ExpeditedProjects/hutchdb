@@ -307,6 +307,13 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       ]);
     });
 
+    it("a dotted name is a literal top-level key: removing it leaves the nested value alone", async () => {
+      const slug = await seed("transform_dotted", [{ address: { city: "A" }, "address.city": "lit" }]);
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { rename_fields: { "address.city": "city_flat" } }));
+      expect(result.updated).toBe(1);
+      expect(await rawData(slug)).toEqual([{ address: { city: "A" }, city_flat: "lit" }]);
+    });
+
     it("a name that looks like SQL is only ever a key", async () => {
       const slug = await seed("transform_sql_name", [{ "x'; DROP TABLE collections;--": 1, keep: 2 }]);
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["x'; DROP TABLE collections;--"] }));
