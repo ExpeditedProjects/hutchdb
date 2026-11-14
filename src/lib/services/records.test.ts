@@ -643,7 +643,8 @@ describe('transformRecords', () => {
     ['a rename from an empty name', { rename_fields: { '': 'x' } }],
     ['a missing remove_fields element', { remove_fields: [undefined] }],
     ['a non-string rename target', { rename_fields: { a: 1 } }],
-    ['a lone surrogate, which Postgres would store as another name', { rename_fields: { '\ud800': '\ud801' } }],
+    ['a lone surrogate as an old name, which Postgres would store as another name', { rename_fields: { '\ud800': 'ok' } }],
+    ['a lone surrogate as a new name', { rename_fields: { ok: 'x\ud801' } }],
   ])('rejects %s before any statement runs', async (_label, params) => {
     editor()
     const result = await transformRecords('users', 'user-test', params as never)
@@ -706,6 +707,8 @@ describe('transformRecords', () => {
 
   it('rejects a new name a filter would read as an operator', async () => {
     editor()
+    const renamed = await transformRecords('users', 'user-test', { rename_fields: { a: '$a' } })
+    expect(renamed).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('operator') }))
     const result = await transformRecords('users', 'user-test', { set_field: { field: '$or', value: 1 } })
     expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('operator') }))
     expect(dbExecute).not.toHaveBeenCalled()
