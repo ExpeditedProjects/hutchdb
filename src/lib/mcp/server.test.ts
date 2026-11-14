@@ -1386,11 +1386,23 @@ describe('server instructions mention view management', () => {
     expect(instructions).toMatch(/published/)
   })
 
+  it('discloses that a published view names who shared it', async () => {
+    createMcpServer('user-1', 'org-test', 'https://example.test')
+    const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
+    const discloses = /who shared it \(the publisher's account name, or the organization's name\)/
+    expect(McpServer.lastOptions?.instructions ?? '').toMatch(discloses)
+    expect(registeredConfigs.get('hutch_update_view')!.description as string).toMatch(discloses)
+    for (const tool of ['hutch_create_view', 'hutch_update_view']) {
+      const shape = (registeredConfigs.get(tool)!.inputSchema as { shape: Record<string, { description?: string }> }).shape
+      expect(shape.published.description ?? '').toMatch(discloses)
+    }
+  })
+
   it('says what a published view shows, who can publish, and that columns must include the layout field', async () => {
     createMcpServer('user-1', 'org-test', 'https://example.test')
     const { McpServer } = await import('@modelcontextprotocol/server') as unknown as { McpServer: { lastOptions?: { instructions?: string } } }
     const instructions = McpServer.lastOptions?.instructions ?? ''
-    expect(instructions).toMatch(/It shows the collection's name and description, the view's name and description, the view's columns, and the records its filter matches/)
+    expect(instructions).toMatch(/It shows the collection's name and description, the view's name and description, who shared it \(the publisher's account name, or the organization's name\), the view's columns, and the records its filter matches/)
     expect(instructions).toMatch(/Only the collection's owner can publish a view/)
     expect(instructions).toMatch(/including the field the layout uses/)
     expect(instructions).toMatch(/Collections cannot be published/)

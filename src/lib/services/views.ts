@@ -30,7 +30,8 @@ const NO_GROUP_FIELD: ViewError = {
 // ── Publishing ────────────────────────────────────────────────────────────────
 //
 // A published view is a public read-only page showing the collection's and
-// the view's names and descriptions, the view's columns, and the records its
+// the view's names and descriptions, who shared it (the publisher's account
+// name, or the organization's name), the view's columns, and the records its
 // filter matches. Only the collection's owner may publish a view or change a
 // published one (anyone who can edit may unpublish it). Its columns must be
 // distinct visible fields of the saved schema and include the field its

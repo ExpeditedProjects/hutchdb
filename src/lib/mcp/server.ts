@@ -36,7 +36,7 @@ Use hutch_collection_stats for a quick overview of a collection's size and field
 
 For deduplication: set unique_key via hutch_update_collection, then hutch_store_records honors on_conflict (default: replace).
 
-Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A published view is a public read-only page on Hutch Cloud. It shows the collection's name and description, the view's name and description, the view's columns, and the records its filter matches. Only the collection's owner can publish a view. To publish, set columns to visible fields of the collection's saved schema, including the field the layout uses (kanban group, calendar or timeline date, gallery image). Collections cannot be published; publish a view instead.
+Views (hutch_create_view, hutch_update_view, hutch_delete_view) save a table/kanban/gallery configuration on a collection so subsequent queries can reuse it; hutch_get_collection lists them. A published view is a public read-only page on Hutch Cloud. It shows the collection's name and description, the view's name and description, who shared it (the publisher's account name, or the organization's name), the view's columns, and the records its filter matches. Only the collection's owner can publish a view. To publish, set columns to visible fields of the collection's saved schema, including the field the layout uses (kanban group, calendar or timeline date, gallery image). Collections cannot be published; publish a view instead.
 
 This is the headless single-user Core. Multi-user sharing, organizations, invitations, and published dashboards live in Hutch Cloud (app.hutchdb.com), not here.`;
 
@@ -69,7 +69,7 @@ const FILTER_DESCRIPTION =
   "Example: {\"price\": {\"$gte\": 10, \"$lt\": 100}, \"status\": {\"$in\": [\"active\", \"pending\"]}}";
 
 // Shared by hutch_create_view and hutch_update_view.
-const PUBLISHED_VIEW_DESCRIPTION = "Publish this view as a public read-only page (on Hutch Cloud) showing the collection's and the view's names and descriptions, the view's columns, and the records its filter matches. Needs columns: visible fields of the collection's saved schema, including the field the layout uses. Only the collection's owner can publish. Default false.";
+const PUBLISHED_VIEW_DESCRIPTION = "Publish this view as a public read-only page (on Hutch Cloud) showing the collection's and the view's names and descriptions, who shared it (the publisher's account name, or the organization's name), the view's columns, and the records its filter matches. Needs columns: visible fields of the collection's saved schema, including the field the layout uses. Only the collection's owner can publish. Default false.";
 
 /**
  * Tool hints for view service errors. The service's messages name no tools
@@ -738,7 +738,7 @@ export function createMcpServer(userId: string, organizationId: string, baseUrl:
     "hutch_update_view",
     {
       title: "Update View",
-      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or publish it. A published view is a public read-only page showing the collection's and the view's names and descriptions, the view's columns, and the records its filter matches. Publishing needs columns that are visible fields of the collection's saved schema, including the field the layout uses; the same holds when a published view's columns or config change. Only the collection's owner can publish a view or change a published one; anyone who can edit it may unpublish it (published: false). Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants to share a view publicly (published: true with columns), or regroup or rename it.",
+      description: "Change a saved view on a collection: rename it, set its columns, sort, filter, config or kanban group_by, or publish it. A published view is a public read-only page showing the collection's and the view's names and descriptions, who shared it (the publisher's account name, or the organization's name), the view's columns, and the records its filter matches. Publishing needs columns that are visible fields of the collection's saved schema, including the field the layout uses; the same holds when a published view's columns or config change. Only the collection's owner can publish a view or change a published one; anyone who can edit it may unpublish it (published: false). Only the fields you pass change; config keys are merged into the existing config. Find view ids and slugs with hutch_get_collection. Example: use when the user wants to share a view publicly (published: true with columns), or regroup or rename it.",
       inputSchema: z.object({
         slug: z.string().describe(slugDescription),
         view: viewRefSchema,
