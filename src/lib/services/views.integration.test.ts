@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, beforeEach, onTestFinished } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Pool } from "pg";
@@ -377,7 +377,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const viewer = await viewsSvc.listViews(a.slug, VIEWER_ID);
       expect(viewer!.map((v) => v.id)).toEqual([first.id, second.id]);
       expect(Object.keys(viewer![0]).sort()).toEqual(
-        ["columns", "config", "filter", "id", "name", "published", "slug", "sort", "type"],
+        ["columns", "config", "filter", "id", "name", "published", "publishedAt", "slug", "sort", "type"],
       );
     });
 
@@ -668,6 +668,7 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const { publishedBy, publishedAt } = await publisherOf(view.id);
       expect(publishedBy).toBe(OWNER_ID);
       expect(publishedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+      expect(publishedAt!.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
       expect(await publisherOf((await makeView(slug, { type: "table" })).id)).toEqual({ publishedBy: null, publishedAt: null });
     });
 
@@ -675,11 +676,25 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
       const { slug } = await makeCollection("Tasks");
       const view = await makeView(slug, { type: "table", columns: ["title"] });
       expect(await publisherOf(view.id)).toEqual({ publishedBy: null, publishedAt: null });
+      const before = Date.now();
       const result = await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true });
       expect(result).toEqual(expect.objectContaining({ view: expect.objectContaining({ publishedBy: OWNER_ID }) }));
       const { publishedBy, publishedAt } = await publisherOf(view.id);
       expect(publishedBy).toBe(OWNER_ID);
-      expect(publishedAt).toBeInstanceOf(Date);
+      expect(publishedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
+      expect(publishedAt!.getTime()).toBeLessThanOrEqual(Date.now() + 1000);
+    });
+
+    it("is recorded afresh when an unpublished view is published again", async () => {
+      const { slug } = await makeCollection("Tasks");
+      const view = await makeView(slug, { type: "table", published: true, columns: ["title"] });
+      await testDb.update(schema.views).set({ publishedAt: new Date("2026-01-02T03:04:05Z") }).where(eq(schema.views.id, view.id));
+      await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: false });
+      const before = Date.now();
+      expect(await viewsSvc.updateView(slug, view.id, OWNER_ID, { published: true })).not.toHaveProperty("error");
+      const { publishedBy, publishedAt } = await publisherOf(view.id);
+      expect(publishedBy).toBe(OWNER_ID);
+      expect(publishedAt!.getTime()).toBeGreaterThanOrEqual(before - 1000);
     });
 
     it("is cleared when the view is unpublished", async () => {
@@ -810,6 +825,18 @@ describe.skipIf(!TEST_DB_URL)("views service, real Postgres", () => {
     }
 
     it("credits published views of a personal org to its owner at their last change, and leaves team orgs and private views NULL", async () => {
+      // The owner is the personal org's earliest admin: an earlier non-admin member and a later admin are not.
+      await testDb.insert(schema.user).values([
+        { id: "views-early", email: "views-early@hutch.test", name: "Early" },
+        { id: "views-late", email: "views-late@hutch.test", name: "Late" },
+      ]).onConflictDoNothing();
+      await testDb.insert(schema.organizationMembers).values([
+        { organizationId: ORG_ID, userId: "views-early", role: "member", createdAt: new Date("2000-01-01T00:00:00Z") },
+        { organizationId: ORG_ID, userId: "views-late", role: "admin", createdAt: new Date("2999-01-01T00:00:00Z") },
+      ]).onConflictDoNothing();
+      onTestFinished(async () => {
+        await testDb.delete(schema.organizationMembers).where(sql`${schema.organizationMembers.userId} IN ('views-early', 'views-late')`);
+      });
       await testDb.insert(schema.organizations).values({ id: TEAM_ORG_ID, slug: "views-team", name: "Team" }).onConflictDoNothing();
       await testDb.insert(schema.organizationMembers).values({ organizationId: TEAM_ORG_ID, userId: OWNER_ID, role: "admin" }).onConflictDoNothing();
       const mine = await makeCollection("Mine");

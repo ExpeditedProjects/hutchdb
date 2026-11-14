@@ -1722,6 +1722,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_views_published_by": {
+          "name": "idx_views_published_by",
+          "columns": [
+            {
+              "expression": "published_by",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"views\".\"published_by\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {

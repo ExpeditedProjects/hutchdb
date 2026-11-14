@@ -3,6 +3,7 @@
 ALTER TABLE "views" ADD COLUMN "published_by" text;--> statement-breakpoint
 ALTER TABLE "views" ADD COLUMN "published_at" timestamp with time zone;--> statement-breakpoint
 ALTER TABLE "views" ADD CONSTRAINT "views_published_by_user_id_fk" FOREIGN KEY ("published_by") REFERENCES "public"."user"("id") ON DELETE set null ON UPDATE no action;--> statement-breakpoint
+CREATE INDEX "idx_views_published_by" ON "views" USING btree ("published_by") WHERE "views"."published_by" IS NOT NULL;--> statement-breakpoint
 -- Backfill views published now: published when last changed, by the owner
 -- of a personal org (team orgs stay NULL; no record says which admin did it).
 UPDATE "views" SET "published_at" = "updated_at" WHERE "published";--> statement-breakpoint

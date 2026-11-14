@@ -152,7 +152,12 @@ describe.skipIf(!TEST_DB_URL)("MCP tool output fields, real Postgres", () => {
     expect(rows.map((r) => r.published_by)).toEqual([USER_ID, USER_ID]);
 
     const coll = json(await call("hutch_get_collection", { slug }));
-    for (const v of coll.views as Record<string, unknown>[]) expect(v).not.toHaveProperty("publishedBy");
+    const listed = (coll.views as Record<string, unknown>[]).filter((v) => v.id === created.id || v.id === draft.id);
+    expect(listed).toHaveLength(2);
+    for (const v of listed) {
+      expect(v).not.toHaveProperty("publishedBy");
+      expect(typeof v.publishedAt).toBe("string");
+    }
   });
 
   it("hutch_update_collection never publishes the collection, and collections carry no published flag", async () => {
