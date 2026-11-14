@@ -322,6 +322,16 @@ describe.skipIf(!TEST_DB_URL)("services against real Postgres", () => {
       expect(await rawData(slug)).toEqual([{ "Approx. cost": 5 }, { "Approx. cost": 9, big: true }]);
     });
 
+    it("accepts an emoji name and keeps removed-name leniency for $ and dotted names", async () => {
+      const slug = await seed("transform_emoji", [{ a: 1, $x: 2, "address.city": 3, address: { city: "A" } }]);
+      const result = ok(await recordsSvc.transformRecords(slug, USER_ID, {
+        rename_fields: { a: "😀 mood" },
+        remove_fields: ["$x", "address.city"],
+      }));
+      expect(result.updated).toBe(1);
+      expect(await rawData(slug)).toEqual([{ "😀 mood": 1, address: { city: "A" } }]);
+    });
+
     it("a name that looks like SQL is only ever a key", async () => {
       const slug = await seed("transform_sql_name", [{ "x'; DROP TABLE collections;--": 1, keep: 2 }]);
       const result = ok(await recordsSvc.transformRecords(slug, USER_ID, { remove_fields: ["x'; DROP TABLE collections;--"] }));

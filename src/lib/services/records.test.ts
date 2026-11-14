@@ -643,7 +643,8 @@ describe('transformRecords', () => {
     ['a rename from an empty name', { rename_fields: { '': 'x' } }],
     ['a missing remove_fields element', { remove_fields: [undefined] }],
     ['a non-string rename target', { rename_fields: { a: 1 } }],
-    ['a lone surrogate, which Postgres would store as another name', { rename_fields: { '\ud800': '\ud801' } }],
+    ['a lone surrogate as an old name, which Postgres would store as another name', { rename_fields: { '\ud800': 'ok' } }],
+    ['a lone surrogate as a new name', { rename_fields: { ok: 'x\ud801' } }],
   ])('rejects %s before any statement runs', async (_label, params) => {
     editor()
     const result = await transformRecords('users', 'user-test', params as never)
@@ -679,8 +680,35 @@ describe('transformRecords', () => {
     expect(dbExecute).not.toHaveBeenCalled()
   })
 
+  it('rejects set_field on a rename target, which would overwrite the renamed values', async () => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { rename_fields: { status: 'state' }, set_field: { field: 'state', value: 'x' } })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('more than once') }))
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('rejects more names than the per-call limit without scanning them pairwise', async () => {
+    editor()
+    const rename_fields = Object.fromEntries(Array.from({ length: 200_000 }, (_, i) => [`a${i}`, `b${i}`]))
+    const started = performance.now()
+    const result = await transformRecords('users', 'user-test', { rename_fields })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('Too many field names') }))
+    expect(performance.now() - started).toBeLessThan(2000)
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
+  it('rejects an overlong new name and quotes only its start', async () => {
+    editor()
+    const result = await transformRecords('users', 'user-test', { set_field: { field: 'x'.repeat(5000), value: 1 } })
+    expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('too long') }))
+    expect((result as { error: string }).error.length).toBeLessThan(300)
+    expect(dbExecute).not.toHaveBeenCalled()
+  })
+
   it('rejects a new name a filter would read as an operator', async () => {
     editor()
+    const renamed = await transformRecords('users', 'user-test', { rename_fields: { a: '$a' } })
+    expect(renamed).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('operator') }))
     const result = await transformRecords('users', 'user-test', { set_field: { field: '$or', value: 1 } })
     expect(result).toEqual(expect.objectContaining({ status: 400, error: expect.stringContaining('operator') }))
     expect(dbExecute).not.toHaveBeenCalled()
