@@ -7,7 +7,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Docs-only PRs skip the test suite. A job skipped by its own `if:` still
+  # satisfies the required `test` check; paths-ignore would leave it pending.
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      pull-requests: read
+    outputs:
+      docs_only: ${{ steps.check.outputs.docs_only }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          DOCS_RE: '^(CLAUDE|AGENTS|REVIEW|README|NOTES|DIVERGENCE|CHANGELOG|CONTRIBUTING|CLA)\.md$|^docs/|^\.claude/|^\.agents/|^\.github/[^/]+\.md$'
+        run: |
+          files=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR/files" --paginate --jq '.[].filename') || exit 0
+          if [ -n "$files" ] && ! grep -qvE "$DOCS_RE" <<<"$files"; then
+            echo "Docs-only PR; skipping the test suite."
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
   test:
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
     runs-on: ubuntu-latest
     services:
       postgres:

@@ -56,6 +56,8 @@ Test stack: vitest + @testing-library/react. Run `npm test` (vitest run) or `npm
 
 Changes to the shared Core surface get mirrored into Hutch Cloud (`../hutch-cloud`), whose CI `parity` job compares against this repo's `main`. Merge the Core PR first.
 
+Docs-only PRs skip the `test` job via the `changes` job's `DOCS_RE` in `.github/workflows/test.yml`. If a test or the build starts reading a file under a matched path, update `DOCS_RE`.
+
 Skip TDD for trivial edits (renames, copy changes, removing dead code).
 
 ## Never
